@@ -241,3 +241,66 @@ climbing under load — is already covered by `tests/test_engine.py` and
 `cd dashboard && npm install && npm run build`, then `make dev` and confirm
 the acceptance line directly. Flagging this now rather than silently
 declaring P6 acceptance-tested.
+
+## Stage B — P6 follow-up: Node installed, acceptance line verified
+
+This machine had no Node.js/npm (see above). Installed Node 24 LTS via
+`scoop install nodejs-lts` (only pre-existing package manager on the box);
+added it to `PATH`. `npm install` then surfaced two real config bugs, fixed
+in `dashboard/`:
+
+- `tsconfig.json` referenced `tsconfig.node.json` via TS project references
+  and `tsc -b` — but the referenced project had `noEmit: true`, which
+  TS6310 forbids for a referenced project (it must be able to emit for
+  whatever references it, even though nothing here actually imports from
+  it). Nothing in `src/` needs `vite.config.ts`'s types, so the reference
+  was pure unnecessary coupling. Fix: dropped the `references` array and
+  `-b` build mode entirely; `tsconfig.node.json` is now a standalone,
+  unreferenced config (editor convenience for `vite.config.ts` only).
+  `package.json`'s `build`/`typecheck` scripts now run plain
+  `tsc --noEmit`, not `tsc -b`.
+- The first attempt at the fix above (`tsc -b` with the reference still
+  emitting) wrote `vite.config.js` / `vite.config.d.ts` /
+  `tsconfig.node.tsbuildinfo` straight into `dashboard/` — deleted, and the
+  actual fix (above) stops it from recurring.
+
+**Verified, this session:**
+
+```
+$ npm install         # 172 packages; 1 recharts deprecation notice (2.x EOL'd
+                       # upstream, not a bug here); npm audit's advisory
+                       # endpoint returned 503 (registry outage, not this repo)
+$ npm run typecheck   # tsc --noEmit — clean, no stray output files
+$ npm run build       # vite build — dist/index.html + hashed JS/CSS, ~2.4s
+                       # (one "chunk >500kB" advisory from recharts/d3; not
+                       # chased — not a Stage B concern)
+```
+
+Then ran the actual acceptance line end to end: `python -m triage.app --port
+8000 --seed 42` (real mode, dashboard/dist mounted), opened it in a browser:
+
+- baseline: connection indicator green/"live", P0 p99 138ms, scoreboard
+  green/"within SLA", per-tier latency chart flat.
+- `POST /control/rate {"rate": 20000}`: within ~8s the P0 scoreboard flipped
+  to red/"SLA BREACHED" (10.87s, climbing), latency chart trending up.
+  Watched further: P0/P1/P2 latency converged to ~45-51s and the three
+  lines overlapped on the chart — correct, not a rendering bug: Stage B has
+  no priority queue, so under sustained overload every tier suffers the
+  same FIFO wait. That convergence *is* "the baseline we are about to beat"
+  the prompt names — Stage C's scheduler is what will pull P0 back out of
+  it. Cross-checked against the raw frame over the socket directly
+  (`latency_p99 P0=45374ms P1=45179ms P2=45558ms`) — the chart was drawing
+  real numbers, not stuck.
+- `/health` stayed responsive (200) throughout, even with `in_queue` at
+  17k+ — the event loop was never blocked.
+- Reset to `{"rate": 16.65}` afterward; server stopped cleanly.
+
+**Acceptance line: now genuinely verified**, not just plausible. Full
+backend suite re-run after the config fix: `64 passed`. (One transient
+failure of the 150 u/s timing test appeared mid-session while Node/npm/the
+demo server were all competing for CPU; reran clean three times once that
+load cleared — not a regression, see P5's notes on why that test is
+wall-clock sensitive.)
+
+Committed `dashboard/package-lock.json` for reproducible installs going
+forward.

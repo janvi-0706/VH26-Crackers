@@ -35,7 +35,7 @@ must be demoable at each one.
 - [x] `classifier.py`: assigns seq, idempotency_key, cost, deadline
 - [x] `sink.py`: terminal write
 - [x] `app.py`: FastAPI + WebSocket metrics at 4 Hz + static dashboard mount
-- [ ] `dashboard/`: real UI against the frozen MetricsFrame
+- [x] `dashboard/`: real UI against the frozen MetricsFrame
 - [x] `make dev` runs the whole slice end to end
 
 ## Stage C — First demoable state (H4–7) — Round 1
