@@ -520,10 +520,11 @@ def test_live_pipeline_never_defers_p0_even_under_a_real_spike():
     assert p0_rows == [], f"P0 event(s) reached the ledger under a real spike: {p0_rows}"
 
 
-def test_deferred_events_are_never_lost_across_a_real_spike_and_reset():
-    """The literal acceptance line: after a 30s spike and a reset, the
-    number of events ever deferred equals the number ever drained, and the
-    backlog reaches exactly zero. Uses deltas from a captured baseline
+def test_deferred_count_in_equals_count_out_after_a_full_drain():
+    """Stage G's own claim, verbatim in the test's name: after a 30s spike
+    and a reset, the number of events ever deferred equals the number ever
+    drained, and the backlog reaches exactly zero. Uses deltas from a
+    captured baseline
     (not deferral's raw totals) because the default store is process-wide
     and shared across tests — see deferral.py's own module docstring on
     why it is ambient rather than per-Engine.
@@ -593,8 +594,9 @@ def test_deferred_events_are_never_lost_across_a_real_spike_and_reset():
 # --------------------------------------------------------------------------
 
 
-def test_weighted_click_count_converges_to_true_click_count_after_a_real_spike():
-    """Deliberately NOT checked mid-spike, and deliberately NOT using
+def test_weighted_click_count_is_within_5_percent_of_true_click_count_under_sampling():
+    """Stage G's own claim, verbatim in the test's name. Deliberately NOT
+    checked mid-spike, and deliberately NOT using
     /control/reset. Two real findings shaped this test, not guesses:
 
     1. A real sustained spike drives pressure to roughly 0.6-0.8 for most

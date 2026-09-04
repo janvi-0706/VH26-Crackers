@@ -39,6 +39,11 @@ config:
 test:
 	$(PY) -m pytest -q
 
-# Headless benchmark: adaptive vs naive (Lane D, Stage G)
+# Headless benchmark: four configs (naive/adaptive x baseline/spike, 90s
+# each) plus a 5x/10x/20x/40x sensitivity sweep. ~10.5 real minutes.
+# Writes bench/report.md and bench/report.html. PYTHONPATH=src is already
+# exported above, but bench/run.py also inserts src/ itself so `python
+# bench/run.py` works standalone, outside make, too.
 bench:
-	@echo "bench: not implemented yet"
+	@echo "Using interpreter: $(PY)"
+	$(PY) bench/run.py
