@@ -9,7 +9,10 @@ import time
 import pytest
 
 from triage.contracts import Decision, Event, EventType, Tier
+from triage import decision
 from triage.decision import (
+    DEFAULT_PRESSURE_WEIGHTS,
+    DEFAULT_SCORE_WEIGHTS,
     PressureSignals,
     PressureWeights,
     ScoreWeights,
@@ -17,8 +20,10 @@ from triage.decision import (
     batch_size,
     decide,
     est_service_time,
+    get_weights,
     pressure,
     score,
+    set_weights,
     slack,
 )
 
@@ -285,3 +290,72 @@ def test_batch_cost_can_exceed_individual_cost_below_b_min():
     against it in practice."""
     one_log = [0.3]
     assert batch_cost(one_log) > sum(one_log)
+
+
+# --------------------------------------------------------------------------
+# Live weights — Stage D dashboard sliders (GET/POST /control/weights)
+# --------------------------------------------------------------------------
+
+
+def setup_function() -> None:
+    decision.current_score_weights = DEFAULT_SCORE_WEIGHTS
+    decision.current_pressure_weights = DEFAULT_PRESSURE_WEIGHTS
+
+
+def teardown_function() -> None:
+    decision.current_score_weights = DEFAULT_SCORE_WEIGHTS
+    decision.current_pressure_weights = DEFAULT_PRESSURE_WEIGHTS
+
+
+def test_get_weights_reports_the_defaults_initially():
+    assert get_weights() == {"w1": 0.7, "w2": 0.3, "a": 0.35, "b": 0.35, "c": 0.2, "d": 0.1}
+
+
+def test_set_weights_updates_only_the_named_fields():
+    result = set_weights(w1=0.2, w2=0.8)
+    assert result["w1"] == pytest.approx(0.2)
+    assert result["w2"] == pytest.approx(0.8)
+    # the untouched pressure group stays exactly at its previous values
+    assert result["a"] == pytest.approx(0.35)
+    assert result["b"] == pytest.approx(0.35)
+    assert result["c"] == pytest.approx(0.2)
+    assert result["d"] == pytest.approx(0.1)
+
+
+def test_set_weights_renormalises_the_touched_group_to_sum_to_one():
+    result = set_weights(a=0.9)
+    assert sum(result[k] for k in ("a", "b", "c", "d")) == pytest.approx(1.0)
+    # a's share of the new total (0.9 + 0.35 + 0.2 + 0.1 = 1.55)
+    assert result["a"] == pytest.approx(0.9 / 1.55)
+
+
+def test_set_weights_persists_across_calls_as_the_new_live_baseline():
+    first = set_weights(a=0.9)
+    # a second, unrelated update must renormalise against the *previous*
+    # call's already-renormalised a (first["a"]), not against the raw 0.9
+    # or against DEFAULT_PRESSURE_WEIGHTS — "live" means every call builds
+    # on the last one, not on some fixed starting point.
+    result = set_weights(b=0.9)
+    total = first["a"] + 0.9 + first["c"] + first["d"]
+    assert result["a"] == pytest.approx(first["a"] / total)
+    assert result["b"] == pytest.approx(0.9 / total)
+
+
+def test_set_weights_actually_moves_the_live_dataclasses_score_and_pressure_read():
+    set_weights(w1=0.9, w2=0.1, a=0.9)
+    assert decision.current_score_weights.w1 == pytest.approx(0.9)
+    assert decision.current_pressure_weights.a == pytest.approx(0.9 / 1.55)
+
+
+def test_set_weights_rejects_a_negative_value_without_mutating_state():
+    before = get_weights()
+    with pytest.raises(ValueError):
+        set_weights(c=-0.5)
+    assert get_weights() == before
+
+
+def test_set_weights_rejects_a_group_summing_to_zero_without_mutating_state():
+    before = get_weights()
+    with pytest.raises(ValueError):
+        set_weights(a=0, b=0, c=0, d=0)
+    assert get_weights() == before

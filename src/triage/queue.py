@@ -281,7 +281,8 @@ class EventQueue:
             return
         capacity = self.config.worker_capacity_ups
         merged = self._settled[tier] + self._pending[tier]
-        merged.sort(key=lambda e: (decision.score(e, now, capacity), -e.seq))
+        weights = decision.current_score_weights
+        merged.sort(key=lambda e: (decision.score(e, now, capacity, weights), -e.seq))
         self._settled[tier] = merged
         self._pending[tier] = []
         self._resort_ts[tier] = now
@@ -298,6 +299,7 @@ class EventQueue:
         now = time.time()
         self._maybe_resort(tier, now)
         capacity = self.config.worker_capacity_ups
+        weights = decision.current_score_weights
 
         settled = self._settled[tier]
         pending = self._pending[tier]
@@ -305,7 +307,7 @@ class EventQueue:
         best_pending: Event | None = None
         best_pending_score = -1.0
         for candidate in pending:
-            candidate_score = decision.score(candidate, now, capacity)
+            candidate_score = decision.score(candidate, now, capacity, weights)
             if best_pending is None or candidate_score > best_pending_score or (
                 candidate_score == best_pending_score and candidate.seq < best_pending.seq
             ):
@@ -317,7 +319,7 @@ class EventQueue:
             pending.remove(best_pending)
             return best_pending
 
-        settled_score = decision.score(settled[-1], now, capacity)
+        settled_score = decision.score(settled[-1], now, capacity, weights)
         if best_pending_score > settled_score or (
             best_pending_score == settled_score and best_pending.seq < settled[-1].seq
         ):

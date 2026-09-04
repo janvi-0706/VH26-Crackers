@@ -287,6 +287,96 @@ def batch_size(pressure_value: float, b_min: int = B_MIN, b_max: int = B_MAX) ->
     return max(b_min, min(b_max, round(raw)))
 
 
+# --------------------------------------------------------------------------
+# LIVE WEIGHTS — Stage D dashboard sliders.
+#
+# score() and pressure() are pure and take weights as an explicit argument,
+# on purpose (see the module docstring) — nothing above this section needs
+# to change for the dashboard to be able to tune them live. What's needed is
+# somewhere for "live" to actually live: one process-wide current value per
+# weight, read by queue.py (for score) and metrics.py (for pressure) at
+# every call, and written by app.py's /control/weights endpoint.
+#
+# Not locked: every reader and writer runs on the single asyncio event loop
+# (CLAUDE.md hard rule 1), so there is no concurrent-thread hazard to guard
+# against — the same reasoning metrics.py already relies on for its own
+# module-level counters.
+# --------------------------------------------------------------------------
+
+current_score_weights: ScoreWeights = DEFAULT_SCORE_WEIGHTS
+current_pressure_weights: PressureWeights = DEFAULT_PRESSURE_WEIGHTS
+
+
+def get_weights() -> dict[str, float]:
+    """The six live weights, flat, for the dashboard's sliders and for
+    GET /control/weights to report back verbatim."""
+    return {
+        "w1": current_score_weights.w1,
+        "w2": current_score_weights.w2,
+        "a": current_pressure_weights.a,
+        "b": current_pressure_weights.b,
+        "c": current_pressure_weights.c,
+        "d": current_pressure_weights.d,
+    }
+
+
+def _normalized(values: dict[str, float]) -> dict[str, float]:
+    total = sum(values.values())
+    if total <= 0:
+        raise ValueError("weights in one group cannot all be zero")
+    return {k: v / total for k, v in values.items()}
+
+
+def set_weights(
+    *,
+    w1: float | None = None,
+    w2: float | None = None,
+    a: float | None = None,
+    b: float | None = None,
+    c: float | None = None,
+    d: float | None = None,
+) -> dict[str, float]:
+    """Merge any subset of the six weights into the live values, then
+    renormalise each group (score: w1/w2, pressure: a/b/c/d) to sum to 1.0.
+
+    Renormalising rather than requiring the caller to submit a pre-balanced
+    set is deliberate: it is what makes a single dashboard slider usable at
+    all. A slider only ever reports one number at a time — if moving w1
+    required also recomputing w2 in the browser to keep the pair summing to
+    1.0, either the UI would have to smuggle in a second implicit write per
+    drag, or PressureWeights's own sum-to-1 invariant (enforced in its
+    __post_init__ specifically so a broken formula can't silently pass —
+    see that class's docstring) would start rejecting every single-slider
+    request. Normalising server-side keeps that invariant real while still
+    letting one slider move on its own.
+    """
+    global current_score_weights, current_pressure_weights
+
+    updates = {"w1": w1, "w2": w2, "a": a, "b": b, "c": c, "d": d}
+    for name, value in updates.items():
+        if value is not None and value < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}")
+
+    score = {"w1": current_score_weights.w1, "w2": current_score_weights.w2}
+    pressure_w = {
+        "a": current_pressure_weights.a,
+        "b": current_pressure_weights.b,
+        "c": current_pressure_weights.c,
+        "d": current_pressure_weights.d,
+    }
+    for name, value in updates.items():
+        if value is None:
+            continue
+        (score if name in score else pressure_w)[name] = value
+
+    score = _normalized(score)
+    pressure_w = _normalized(pressure_w)
+
+    current_score_weights = ScoreWeights(**score)
+    current_pressure_weights = PressureWeights(**pressure_w)
+    return get_weights()
+
+
 def batch_cost(costs: list[float]) -> float:
     """sum(costs) * 0.4 + 0.5 — a batch is charged 60% of its members'
     combined cost plus one fixed 0.5u overhead, instead of each member's

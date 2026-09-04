@@ -538,7 +538,7 @@ def _compute_pressure(config: Config, now: float) -> float:
         sla_reference=sla_reference,
         worker_util=worker_util,
     )
-    return decision.pressure(signals)
+    return decision.pressure(signals, decision.current_pressure_weights)
 
 
 # --------------------------------------------------------------------------

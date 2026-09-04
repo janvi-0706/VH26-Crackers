@@ -105,3 +105,11 @@ export interface MetricsFrame {
  * here deliberately, the same way the TS types duplicate contracts.py:
  * the dashboard should not need a live config fetch just to draw one line. */
 export const P0_LATENCY_TARGET_MS = 200;
+
+/** decision.decide()'s own pressure bands (src/triage/decision.py):
+ * P < STREAM_MAX -> STREAM_NOW, [STREAM_MAX, BATCH_MAX) -> MICRO_BATCH,
+ * >= BATCH_MAX -> DEFER. Duplicated here for the same reason as the target
+ * above — the gauge and the per-tier mode panel both need these thresholds
+ * to draw their own bands and labels without a live config fetch. */
+export const PRESSURE_STREAM_MAX = 0.4;
+export const PRESSURE_BATCH_MAX = 0.75;

@@ -841,3 +841,140 @@ degrading under heavy concurrent test load elsewhere in the same
 process, documented since Stage C/P5. Not caused by anything in this
 prompt's changes; re-confirmed by running it standalone after every
 change here.
+
+## Stage D — dashboard: pressure, mode, backlog, live weight sliders
+
+Dashboard-focused, per the prompt, plus the one backend addition the
+prompt itself asked for: `GET`/`POST /control/weights`.
+
+**Backend — `decision.py`/`queue.py`/`metrics.py`/`app.py`**
+
+- `decision.score()` and `decision.pressure()` were already pure functions
+  taking weights as an explicit argument (Stage D's original design) — they
+  needed no change. What was missing was somewhere for "live" to actually
+  live: `decision.current_score_weights` / `current_pressure_weights`,
+  process-wide current values, read fresh by `queue.py`'s three call sites
+  and by `metrics._compute_pressure()` on every call, written by the new
+  endpoint. Not locked — everything runs on the single asyncio event loop
+  (CLAUDE.md hard rule 1), the same reasoning `metrics.py`'s own
+  module-level counters already rely on.
+- `decision.set_weights(**updates)` — a partial update (any subset of
+  `w1/w2/a/b/c/d`), merged into the live values then **renormalised per
+  group** (`w1+w2`, `a+b+c+d`) back to summing to 1.0. This is what makes a
+  single dashboard slider usable at all: a slider only ever reports the one
+  value it moved, and `PressureWeights.__post_init__`'s own sum-to-1
+  invariant (Stage D's own hard rule, there specifically so a broken
+  formula can't silently pass) would reject every single-slider request
+  otherwise. Rejects a negative value or an all-zero group with
+  `ValueError` *before* mutating any live state — verified directly
+  (`test_set_weights_rejects_..._without_mutating_state`).
+- `app.py` — `GET /control/weights` (no fake-mode guard: reading the
+  current weights is harmless in either mode, and the dashboard needs an
+  initial value before the first drag) and `POST /control/weights` (409 in
+  `--fake`, 422 on a negative value or an all-zero group, mapped from
+  `decision.set_weights()`'s `ValueError`).
+
+**Dashboard — four new panels, `dashboard/src/components/panels/`**
+
+- `PressureGaugePanel.tsx` — `pressure` (already real since the original
+  Stage D prompt) as one bar, 0.0 to 1.0, with the two threshold ticks
+  drawn at `decide()`'s own 0.40/0.75 bands and a color/label that steps
+  with them (green/stream, amber/micro-batch, red/defer).
+- `ModeByTierPanel.tsx` — "current mode per tier": recomputes `decide()`'s
+  own public rule client-side from the live `pressure` value already on
+  the wire (P0 always `STREAM`, unconditionally; P1/P2 step through the
+  same bands the gauge uses). Stage D does not publish a per-event
+  decision feed, so this reads as "what would happen to an event of this
+  tier admitted right now," not a log of what already happened to one —
+  documented as such in the component so a future stage doesn't confuse
+  the two.
+- `DeferredBacklogPanel.tsx` — area chart of `deferred_pending` (real since
+  P11's drainer) over the rolling window — the number the acceptance line
+  names directly.
+- `WeightsPanel.tsx` — the six sliders. Each drag posts only the one
+  changed value, throttled to at most one request per 80ms so a fast drag
+  doesn't flood the backend; the response (the whole renormalised group)
+  is what the panel then renders, so dragging `w1` is visibly also a drag
+  on `w2` the instant the reply lands — no client-side copy of the
+  sum-to-1 math, on purpose (see the component's own docstring for why
+  duplicating it would be exactly the two-copies-of-one-rule bug this
+  project has otherwise avoided).
+- `App.tsx`/`lib/api.ts`/`types/metrics.ts` — wired the four panels into
+  the grid, added `getWeights()`/`setWeights()`, and added the
+  `PRESSURE_STREAM_MAX`/`PRESSURE_BATCH_MAX` constants both new panels
+  read.
+
+**A real, found-live bug: `dashboard/node_modules` was missing its own
+`typescript` package** (present in `.bin/tsc` as a dangling shim, but the
+actual `typescript/` package directory was gone) — `npm run typecheck`
+failed with `MODULE_NOT_FOUND` before any of this prompt's code was even
+checked. Not caused by this prompt; fixed by `npm install` (11 packages
+restored, `package-lock.json` unchanged), then re-verified `typecheck` and
+`build` both clean.
+
+**Tests — 14 new (396 total)**
+
+- `tests/test_decision.py` — 8 new: defaults, partial update leaving the
+  untouched group alone, renormalisation summing to 1.0, renormalisation
+  building on the *previous* live call (not a fixed baseline — the
+  arithmetic is spelled out in the test itself since it is easy to get
+  wrong by hand), the update actually landing on the live dataclasses
+  `queue.py`/`metrics.py` read, and both rejection cases leaving state
+  untouched.
+- `tests/test_app.py` — 6 new: `GET` reporting the defaults, `POST`
+  renormalising and actually reaching `decision.current_pressure_weights`
+  (not just the response body), both 422 rejections, 409 in `--fake` mode,
+  and `GET` working in `--fake` mode specifically (the one `/control/*`
+  read with no mode guard). Added a `_reset_live_weights()` helper to
+  `test_app.py`'s existing `setup_function`/`teardown_function` pattern —
+  without it, a test that drags a weight would leak it into every test run
+  afterward in the same process.
+
+**Verified live, in a browser, against the real backend**
+
+```
+GET  /control/weights                     {"w1":0.7,"w2":0.3,"a":0.35,"b":0.35,"c":0.2,"d":0.1}
+POST /control/weights {"a": 0.9}          {"a":0.5806...,"b":0.2258...,"c":0.1290...,"d":0.0645...}
+                                           (0.9/1.55, 0.35/1.55, 0.2/1.55, 0.1/1.55 — exact)
+```
+
+Drove the acceptance line end to end over `/ws` and in the rendered page:
+
+- **spike -> pressure climbs**: `POST /control/spike`, sustained ~5s:
+  pressure `0.68 -> 0.72`, comfortably inside the `[0.40, 0.75)` band.
+- **mode steps to micro-batch**: `Mode by tier` panel showed P1/P2 flip to
+  `MICRO-BATCH` the instant pressure crossed 0.40 on screen (screenshotted
+  at pressure=0.40 exactly, P1/P2 both reading `MICRO-BATCH`, P0 reading
+  `STREAM`).
+- **P0 stays flat**: p99 held at 218-219ms across the same window (within
+  the existing worker-contention floor documented since Stage C/P8/D),
+  never breaching the 200ms scoreboard by more than the pre-existing
+  floor, never climbing with the spike the way P2 does.
+- **backlog rises**: `deferred_pending` 2577 -> 2821 over the same window,
+  visible as the `Deferred backlog` panel's line climbing.
+- **reset -> backlog drains to zero**: `POST /control/reset`, then polled
+  `/ws`: `deferred_pending` fell steadily (6746 -> 6271 over 19 sampled
+  ticks at the drainer's own rate-limited pace, pressure staying under
+  0.20 throughout — never re-saturating itself) — the same monotonic
+  drain-to-zero the existing `test_reset_..._drains_the_backlog_to_zero`
+  test already proves end to end; not re-run to full completion live here
+  (multiple minutes at the drainer's deliberately-throttled rate) but
+  confirmed moving correctly in the right direction with the dashboard
+  open, then reset cleanly for the next demo run.
+- **Slider live-update, on stage**: dragged the `a` slider to 0.9 in the
+  actual rendered page; `Routing weights` panel updated all four pressure
+  sliders (`a/b/c/d`) to their renormalised values within one throttle
+  tick, and the `Pressure` gauge/`Mode by tier` panel reacted to the
+  changed formula on the very next frame — the "twenty seconds" the prompt
+  asked for, confirmed working, not just wired.
+
+Reset weights back to defaults and the pipeline to a clean baseline
+afterward. Server left running for the user at `http://localhost:8000/`.
+
+**What this prompt deliberately does not do:** no per-event decision feed
+over the wire (`ModeByTierPanel` recomputes `decide()`'s rule client-side
+instead, as documented above — a real per-event trace panel would need a
+backend change this prompt didn't ask for); no persistence of a tuned
+weight set across a process restart (in-memory only, same as every other
+live control this project has); `/control/reset` deliberately leaves
+weights untouched, the same design already applied to `mode`.

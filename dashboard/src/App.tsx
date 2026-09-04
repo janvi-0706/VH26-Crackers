@@ -5,6 +5,10 @@ import { ThroughputPanel } from "./components/panels/ThroughputPanel";
 import { LatencyByTierPanel } from "./components/panels/LatencyByTierPanel";
 import { P0ScoreboardPanel } from "./components/panels/P0ScoreboardPanel";
 import { QueueDepthPanel } from "./components/panels/QueueDepthPanel";
+import { PressureGaugePanel } from "./components/panels/PressureGaugePanel";
+import { ModeByTierPanel } from "./components/panels/ModeByTierPanel";
+import { DeferredBacklogPanel } from "./components/panels/DeferredBacklogPanel";
+import { WeightsPanel } from "./components/panels/WeightsPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
 import * as api from "./lib/api";
 
@@ -32,9 +36,13 @@ export default function App() {
 
       <PanelGrid>
         <P0ScoreboardPanel latest={latest} />
+        <PressureGaugePanel latest={latest} />
+        <ModeByTierPanel latest={latest} />
         <ThroughputPanel history={history} />
         <LatencyByTierPanel history={history} />
         <QueueDepthPanel history={history} />
+        <DeferredBacklogPanel history={history} />
+        <WeightsPanel />
       </PanelGrid>
     </div>
   );

@@ -37,3 +37,28 @@ export async function reset(): Promise<void> {
 export async function setMode(mode: QueueMode): Promise<void> {
   await post("/control/mode", { mode });
 }
+
+/** decision.py's six live weights: score's w1/w2, pressure's a/b/c/d.
+ * Mirrors decision.get_weights()'s flat shape exactly. */
+export interface Weights {
+  w1: number;
+  w2: number;
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+}
+
+export async function getWeights(): Promise<Weights> {
+  const res = await fetch(`${API_BASE}/control/weights`);
+  return (await res.json()) as Weights;
+}
+
+/** Partial on purpose: a dashboard slider only ever reports the one value
+ * it moved. The backend renormalises that value's group (w1+w2, a+b+c+d)
+ * back to summing to 1.0 and returns the resulting full set — the response
+ * is the new source of truth, including for sliders this call didn't name. */
+export async function setWeights(partial: Partial<Weights>): Promise<Weights> {
+  const res = await post("/control/weights", partial);
+  return (await res.json()) as Weights;
+}

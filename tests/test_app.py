@@ -11,21 +11,32 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from triage import deferral, ledger, metrics
+from triage import decision, deferral, ledger, metrics
 from triage.app import SPIKE_EVENTS_PER_MINUTE, SPIKE_RATE_EPS, create_app
 from triage.contracts import Decision, MetricsFrame, Tier
+
+
+def _reset_live_weights() -> None:
+    # decision.set_weights() mutates module-level globals (see decision.py's
+    # own docstring on why: single event loop, no lock needed) -- a test
+    # that drags a weight and doesn't put it back would otherwise leak into
+    # every test that runs after it in the same process.
+    decision.current_score_weights = decision.DEFAULT_SCORE_WEIGHTS
+    decision.current_pressure_weights = decision.DEFAULT_PRESSURE_WEIGHTS
 
 
 def setup_function() -> None:
     metrics.reset()
     ledger.reset()
     deferral.reset_default_store()
+    _reset_live_weights()
 
 
 def teardown_function() -> None:
     metrics.reset()
     ledger.reset()
     deferral.reset_default_store()
+    _reset_live_weights()
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +203,80 @@ def test_control_mode_has_no_effect_in_fake_mode():
     with TestClient(app) as client:
         resp = client.post("/control/mode", json={"mode": "naive"})
     assert resp.status_code == 409
+
+
+# --------------------------------------------------------------------------
+# /control/weights — the dashboard slider endpoints (Stage D)
+# --------------------------------------------------------------------------
+
+
+def test_get_weights_reports_the_defaults_before_any_change():
+    app = create_app(fake=False, seed=14)
+    with TestClient(app) as client:
+        resp = client.get("/control/weights")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"w1": 0.7, "w2": 0.3, "a": 0.35, "b": 0.35, "c": 0.2, "d": 0.1}
+
+
+def test_post_weights_is_a_partial_update_that_renormalises_its_group():
+    app = create_app(fake=False, seed=15)
+    with TestClient(app) as client:
+        resp = client.post("/control/weights", json={"a": 0.9})
+    assert resp.status_code == 200
+    body = resp.json()
+    # a=0.9, b=0.35, c=0.2, d=0.1 renormalised: divide each by their sum (1.55)
+    assert body["a"] == pytest.approx(0.9 / 1.55)
+    assert body["b"] == pytest.approx(0.35 / 1.55)
+    assert body["c"] == pytest.approx(0.2 / 1.55)
+    assert body["d"] == pytest.approx(0.1 / 1.55)
+    assert sum(body[k] for k in ("a", "b", "c", "d")) == pytest.approx(1.0)
+    # the untouched score group (w1/w2) is not disturbed by a pressure update
+    assert body["w1"] == 0.7
+    assert body["w2"] == 0.3
+    # and it actually took effect on the live weights the queue/pressure
+    # code reads, not just on the response body
+    assert decision.current_pressure_weights.a == pytest.approx(0.9 / 1.55)
+
+
+def test_post_weights_actually_changes_what_the_running_queue_reads():
+    app = create_app(fake=False, seed=16)
+    with TestClient(app) as client:
+        client.post("/control/weights", json={"w1": 0.1, "w2": 0.9})
+    assert decision.current_score_weights.w1 == pytest.approx(0.1)
+    assert decision.current_score_weights.w2 == pytest.approx(0.9)
+
+
+def test_post_weights_rejects_a_negative_value():
+    app = create_app(fake=False, seed=17)
+    with TestClient(app) as client:
+        resp = client.post("/control/weights", json={"a": -0.1})
+    assert resp.status_code == 422
+
+
+def test_post_weights_rejects_a_group_that_would_sum_to_zero():
+    app = create_app(fake=False, seed=18)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/control/weights", json={"a": 0, "b": 0, "c": 0, "d": 0}
+        )
+    assert resp.status_code == 422
+
+
+def test_control_weights_post_has_no_effect_in_fake_mode():
+    app = create_app(fake=True)
+    with TestClient(app) as client:
+        resp = client.post("/control/weights", json={"a": 0.9})
+    assert resp.status_code == 409
+
+
+def test_control_weights_get_works_even_in_fake_mode():
+    # Reading the live weights is harmless in either mode -- unlike every
+    # POST /control/* endpoint, GET /control/weights has no fake-mode guard.
+    app = create_app(fake=True)
+    with TestClient(app) as client:
+        resp = client.get("/control/weights")
+    assert resp.status_code == 200
 
 
 # --------------------------------------------------------------------------

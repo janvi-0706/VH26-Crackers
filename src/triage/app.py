@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import deferral, ledger, metrics
+from . import decision, deferral, ledger, metrics
 from .classifier import Classifier
 from .config import Config, load_config
 from .contracts import Event, EventType, MetricsFrame
@@ -190,6 +190,20 @@ class InjectBody(BaseModel):
     partition_key: str | None = None
 
 
+class WeightsBody(BaseModel):
+    """All six fields optional — POST /control/weights is a partial update:
+    a dashboard slider only ever reports the one value it moved. See
+    decision.set_weights() for why the rest are then renormalised rather
+    than left as-is."""
+
+    w1: float | None = None
+    w2: float | None = None
+    a: float | None = None
+    b: float | None = None
+    c: float | None = None
+    d: float | None = None
+
+
 def _fake_mode_error(action: str) -> JSONResponse:
     return JSONResponse(
         {"error": f"{action} has no effect in --fake mode"}, status_code=409
@@ -292,6 +306,28 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
                 "deadline_ts": event.deadline_ts,
             }
         )
+
+    @app.get("/control/weights")
+    async def get_control_weights() -> JSONResponse:
+        """Read the six live decision weights — GET has no fake-mode
+        restriction, unlike every POST /control/* endpoint: reading the
+        current weights is harmless in either mode, and the dashboard's
+        sliders need an initial value to render before the first drag."""
+        return JSONResponse(decision.get_weights())
+
+    @app.post("/control/weights")
+    async def control_weights(body: WeightsBody) -> JSONResponse:
+        """Live-tune score()'s w1/w2 and pressure()'s a/b/c/d. Any subset of
+        the six may be sent; decision.set_weights() renormalises each group
+        (w1+w2, a+b+c+d) back to summing to 1.0, so one slider can move on
+        its own without the caller doing that arithmetic."""
+        if fake:
+            return _fake_mode_error("weight control")
+        try:
+            result = decision.set_weights(**body.model_dump())
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        return JSONResponse(result)
 
     @app.websocket("/ws")
     async def ws_metrics(websocket: WebSocket) -> None:
