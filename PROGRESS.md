@@ -1964,3 +1964,83 @@ flat-zero panel reads as a bug to a judge, not as "not implemented yet."
 
 **Hard stop after this prompt**, per its own last line — no further stage
 started without new instruction.
+
+## Stage H — documentation, no code
+
+Docs-only: `docs/ARCHITECTURE.md`, four new ADRs (0005-0008), and a new
+top-level `README.md`. No source file touched; confirmed via `git status`
+before finishing.
+
+**`docs/ARCHITECTURE.md`** — two mermaid diagrams plus prose, both drawn
+from the actual import graph (`grep -nE "^(import|from) "` across every
+`src/triage/*.py`), not from memory of what the design was supposed to
+be:
+
+- **Component diagram** — every module's real local imports, confirming
+  `contracts.py` has zero project imports and a fan-in from every other
+  module (the leaf CLAUDE.md's own freeze rule depends on), and that
+  `codel.py` is the *other* leaf — zero project imports at all, because
+  "has sojourn been elevated for a sustained interval" never needs to
+  know what an `Event` is.
+- **Control loop** — drawn as a feedback system, not a pipeline: sense
+  (queue depth, service rate, P2 sojourn → `current_pressure()`) feeds
+  two independent loops on different timescales — upstream AIMD
+  admission (all tiers, slow) and in-flight CoDel/ladder escalation
+  (P2-only, fast) — both of which feed back into the same three sensed
+  numbers. Traced through `worker.py`'s actual `_resolve()` order (decide
+  → redefer-trap → escalate, escalate only for P2, only after the
+  redefer-trap has NOT already fired) rather than an idealized version of
+  the control flow.
+- A "why the module boundaries are where they are" section explains six
+  specific boundary decisions (contracts' zero-import rule, codel's
+  total independence, decision/ladder as two files, admission/ladder as
+  two throttle points that never call each other, metrics' wide fan-in as
+  the single reconciliation point, app.py as the only wiring module) —
+  each tied to a concrete consequence, not asserted as good practice in
+  the abstract.
+
+**ADRs 0005-0008** — same format as 0001-0004 (Context / Options
+considered / Decision / Consequences), each grounded in the actual module
+docstring it documents rather than reconstructed from outside:
+
+- **0005** (split ordering/pressure) — includes the actual algebra from
+  `decision.py`'s own docstring for why an additive `score + pressure`
+  term is not just inelegant but *inert*: pressure is one scalar shared
+  by every event compared in the same tick, so it cancels out of every
+  pairwise comparison it's added into — `(score_A + P) > (score_B + P)`
+  reduces to `score_A > score_B` — a false claim of load-awareness this
+  design specifically avoids.
+- **0006** (sojourn AQM over queue-length) — CoDel's actual RFC 8289
+  entry/exit asymmetry (slow confident entry over a full 100ms interval,
+  instant exit), plus the real epoch-scale floating-point bug this design
+  surfaced and how it was fixed (documented already in `codel.py`; cited
+  here, not re-derived).
+- **0007** (sample-with-weight over drop) — why a plain 1-in-N sample
+  still under-reports true volume the same way a drop does, and how
+  `ReservoirSampler`'s `sample_weight` field closes that gap; includes the
+  real window-boundary collision bug found by stress-testing with a
+  frozen clock (anchoring a new window's start to the previous window's
+  own end, not to `now`).
+- **0008** (hash-chained ledger) — the exact canonicalization rule from
+  `ledger.py`'s own docstring, an honest list of what `verify_chain()`
+  does NOT catch (already documented in `docs/DATA_MODEL.md`, repeated
+  here rather than overclaiming "tamper-proof"), and the Stage F
+  reset-semantics reversal (durable-across-reset was tried, then reverted
+  when it broke an existing exact-count test) cited as a consequence, not
+  hidden.
+
+**`README.md`** (new — none existed before this prompt) — setup
+instructions matching the actual `Makefile`/`pyproject.toml` (Python
+3.11 pinned, `make dev`/`fake`/`config`/`test`/`bench` targets, the
+`dashboard/dist`-must-be-built-first caveat `app.py` itself handles by
+returning JSON rather than 500ing). The "what is real vs. simulated"
+section is a table naming every subsystem, with exactly one row marked
+simulated (worker service time) and the same one-sentence answer
+`ADR 0002` already commits to for "is this real": everything is real
+except how long a worker takes to finish one event, which is a fixed,
+disclosed number chosen so the capacity ceiling is identical on any
+machine.
+
+No tests to run for a docs-only prompt; verified instead by grep-checking
+every import claim in the component diagram against the real source
+files before writing the diagram, not after.
