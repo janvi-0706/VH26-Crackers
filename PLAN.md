@@ -19,12 +19,12 @@ must be demoable at each one.
 ---
 
 ## Stage A — Contract lock (H0–1)
-- [ ] `contracts.py`: Event (five identity fields), Decision enum, MetricsFrame with every future field defaulted
-- [ ] `metrics.py`: observe_ingest / observe_dequeue / observe_complete / observe_decision / snapshot; real latency percentiles
-- [ ] `ledger.py`: `record(...)` stub with call sites in place
-- [ ] `config/tiers.yaml`: tier table, mix, worker capacity + loader
-- [ ] `fake_metrics.py`: plausible frames at 4 Hz for the dashboard to build against
-- [ ] `tests/test_contracts.py`: round-trip serialisation
+- [x] `contracts.py`: Event (five identity fields), Decision enum, MetricsFrame with every future field defaulted
+- [x] `metrics.py`: observe_ingest / observe_dequeue / observe_complete / observe_decision / snapshot; real latency percentiles
+- [x] `ledger.py`: `record(...)` stub with call sites in place
+- [x] `config/tiers.yaml`: tier table, mix, worker capacity + loader
+- [x] `fake_metrics.py`: plausible frames at 4 Hz for the dashboard to build against
+- [x] `tests/test_contracts.py`: round-trip serialisation
 - [ ] `docs/DATA_MODEL.md`: identity model, envelope, SQLite DDL, rollups, hash chain, ER diagram
 - [ ] Team review, then **freeze** `contracts.py` and `config/tiers.yaml`
 

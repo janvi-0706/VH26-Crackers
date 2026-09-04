@@ -1,0 +1,76 @@
+# PULSE — tier table, traffic mix, worker capacity.
+#
+# FROZEN at the end of Stage A, together with contracts.py. Changing any number
+# in here changes the shape of the whole demo, so config.load_config() re-checks
+# the three calibration invariants on every load and refuses to start if they
+# no longer hold (CLAUDE.md: "If you change any cost or mix number, re-verify
+# all three").
+#
+# This lives in YAML and not in Python constants on purpose: the tier table is
+# data, an operator should be able to retune it without touching the engine,
+# and the benchmark needs to load two different tables in one process.
+
+schema_version: 1
+
+# value = business value delivered if the event is processed inside its SLA
+# sla_ms = deadline budget, measured from ingest
+# cost   = simulated service time, in work-units (see CLAUDE.md hard rule 2)
+tiers:
+  payment:
+    tier: P0
+    value: 120
+    sla_ms: 200
+    cost: 3.5
+  order:
+    tier: P0
+    value: 100
+    sla_ms: 500
+    cost: 3.0
+  inventory:
+    tier: P1
+    value: 40
+    sla_ms: 5000
+    cost: 2.0
+  click:
+    tier: P2
+    value: 5
+    sla_ms: 30000
+    cost: 0.5
+  log:
+    tier: P2
+    value: 1
+    sla_ms: 60000
+    cost: 0.3
+
+# Fraction of the stream by type. Must sum to 1.0.
+mix:
+  payment: 0.05
+  order: 0.05
+  inventory: 0.10
+  click: 0.50
+  log: 0.30
+
+# 6 workers x 25 work-units/sec = 150 u/s of capacity, fixed and scarce.
+workers:
+  count: 6
+  capacity_units_per_sec: 25
+
+# 16.65 eps baseline, 20x spike -> 333 eps. Spike load is small in absolute
+# terms; the scarcity is deliberate and lives in the cost model, not in the
+# event rate.
+load:
+  baseline_eps: 16.65
+  spike_multiplier: 20
+
+# The three invariants that make the demo work. Checked on load.
+#   weighted cost/event = 0.05*3.5 + 0.05*3.0 + 0.10*2.0 + 0.50*0.5 + 0.30*0.3
+#                       = 0.865 u
+#   P0 cost/event       = 0.05*3.5 + 0.05*3.0 = 0.325 u
+calibration:
+  # P0 alone must fit comfortably under capacity: we can always protect it.
+  p0_demand_at_spike_ups: 108.2
+  # Total must exceed capacity by ~1.9x: triage is forced, not decorative.
+  total_demand_at_spike_ups: 288.0
+  # Baseline must sit far below capacity: everything streams individually.
+  total_demand_at_baseline_ups: 14.4
+  tolerance_ups: 1.0
