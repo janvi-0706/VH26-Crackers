@@ -393,3 +393,164 @@ either hiding it or quietly building ahead into Stage D's scope.
 
 **Open / next:** live spike control in the dashboard UI (a wired button,
 not just `curl`) is part of a later prompt, not this one — left untouched.
+
+## Fix-up: the page wasn't visible, and why (before Stage C P8)
+
+The user reported `localhost:8000` showed nothing. Root cause: **nothing
+was wrong with the app** — no server had been left running (every prior
+session started one for testing, then stopped it), and separately, `make
+dev` would have failed for anyone anyway: this machine's default `python`
+is Anaconda 3.13 with none of our dependencies, `make` itself was not even
+installed, and the Makefile's `PY ?= python` picked up that broken default
+silently.
+
+Fixed both:
+
+- Installed `make` and Node.js LTS via `scoop` (the only package manager
+  already on this machine) — `scoop install make nodejs-lts`.
+- `Makefile`: `PY` now auto-detects `.venv/Scripts/python.exe` /
+  `.venv/bin/python` before falling back to plain `python`, so `make dev`
+  works with zero setup regardless of whose `python` is on PATH. Verified
+  by literally reproducing the broken scenario (`make dev`, no `PY=`
+  override) and confirming it now picks the venv correctly.
+- Left the real backend running for the user this time
+  (`python -m triage.app --port 8000`), reset to a clean baseline —
+  `http://localhost:8000/` should be live now.
+
+## Stage C — P8 controls, per-tier percentile proof, dashboard control bar
+
+**Backend — done**
+
+- `src/triage/app.py` — new `Engine` methods and endpoints:
+  - `POST /control/spike` — instant jump to `20000/min` (`SPIKE_RATE_EPS =
+    20_000/60`, a fixed demo constant, not derived from
+    `config.spike_multiplier`). No ramp: `set_rate()` takes effect on the
+    generator's very next emission.
+  - `POST /control/mode` — `{"mode": "naive"|"adaptive"}`, routed through
+    `Engine.set_mode()` so `metrics`'s reported mode never drifts from
+    what the queue is actually doing.
+  - `POST /control/reset` — walks the pipeline back to a clean baseline
+    (rate, queue, metrics, ledger) without restarting the process; leaves
+    `mode` untouched (a separate, explicit control).
+  - `POST /control/inject` — `{"type": ..., "partition_key": null}`. All
+    four return 409 in `--fake` mode, 422 on bad input.
+- `src/triage/generator.py` — `EventGenerator.emit_single(event_type,
+  partition_key=None)`: the identity half of `inject_event`, sharing
+  `emit()`'s event_id/dedup_key/payload-size machinery so an injected
+  event is structurally identical to an organic one. Tier/value/cost/
+  deadline are never accepted here — only the classifier assigns those,
+  from config, for every event regardless of origin.
+- `src/triage/app.py` — `Engine.inject_event()`: `emit_single` ->
+  `classify` -> `queue.put`. No economics parameters to override with.
+- `src/triage/queue.py` — `EventQueue.clear()`, for `/control/reset`.
+- `src/triage/metrics.py` — per-tier p50/p95/p99 were already real
+  (separate deques per tier since Stage A, never blended) — audited, not
+  rewritten. Added `set_mode`/`get_mode` so `MetricsFrame.mode` mirrors the
+  queue's actual live mode instead of being hardcoded to adaptive.
+- Tests: 27 new (control endpoints in both modes, `emit_single`,
+  `EventQueue.clear`, and `test_a_blown_p0_latency_is_not_hidden_by_many_
+  healthy_p2_samples` — a hundred healthy P2 completions cannot move P0's
+  p99 by a millisecond, in either direction).
+
+**Dashboard — done**
+
+- `dashboard/src/components/ControlBar.tsx` — rate slider, naive/adaptive
+  toggle (reflects the backend's real mode, not local optimistic state),
+  RESET, and a large red SPIKE button (`px-8 py-3 text-base font-black`,
+  hover-scale, shadow) sized and colored to be unmissable next to the
+  other controls.
+- `dashboard/src/lib/api.ts` — thin `fetch` wrapper over `/control/*`,
+  hardcoded to `:8000` like the WS hook (works from the Vite dev server
+  too, no proxy needed).
+
+**Three real bugs found and fixed while verifying the acceptance
+criteria live** — none of them were visible from unit tests alone; all
+three only showed up running the actual app in a browser under load,
+which is exactly why that verification step exists:
+
+1. **RESET could silently kill every worker.** `EventQueue.clear()`
+   originally zeroed `_unfinished` unconditionally. A worker already
+   mid-`serve()` on an item removed from the heap (not visible to
+   `clear()`) would then call `task_done()` in its `finally` block — found
+   nothing outstanding, raised `ValueError`, and that exception is
+   *outside* worker.py's `except Exception` guard, so it killed the
+   worker silently. Every worker in flight at the moment of a reset died
+   the same way. Fixed: `clear()` now decrements `_unfinished` by exactly
+   what it removed from the heaps, leaving in-flight accounting alone.
+   Regression tests: `test_clear_does_not_break_task_done_for_items_
+   already_in_flight` (queue.py) and `test_workers_keep_processing_after_
+   a_reset_under_load` (app.py, drives real load, resets mid-flight,
+   proves `processed` keeps increasing).
+2. **A reset straggler could poison a tier's latency for a very long
+   time.** Even after fixing (1), a worker already serving an item from
+   *before* a reset would finish normally and report that event's real
+   (huge, pre-reset) latency into an otherwise-fresh window — honest, but
+   at low arrival rates that single sample can dominate a tier's p50/p99
+   for tens of minutes before enough fresh samples push it out, silently
+   breaking RESET's "clean slate" promise. Fixed: `Engine.reset()` now
+   restarts the worker pool (`await workers.stop()` before clearing,
+   `workers.start()` after) so nothing in-flight survives a reset.
+   Regression test: `test_reset_discards_stragglers_instead_of_letting_
+   them_pollute_latency`.
+3. **The generator could not actually sustain 333 eps — or even close to
+   it.** Verifying "adaptive + spike" live, `/control/spike` reported
+   `rate: 333.3` but the *measured* ingest rate was only ~200 eps, even in
+   complete isolation with worker.py's Windows timer fix applied.
+   Root cause: pacing via one `asyncio.sleep()` per emitted event pays
+   that call's fixed overhead once per event; at a 60ms interval
+   (baseline, 16.65 eps) that's negligible, but at a ~3ms interval (spike,
+   333 eps) the overhead dominates the budget. Fixed: `events()` now
+   paces against a running schedule and catches up in a no-sleep burst
+   when behind, so one sleep's overhead is amortised across many
+   emissions instead of paid per event (`_MAX_BURST = 500` caps a single
+   catch-up). Measured after the fix: 16.65 eps at 0.1% error, 333.3 eps
+   at 0.1–0.5% error. Regression test:
+   `test_async_generator_sustains_the_spec_spike_rate`.
+4. **With the generator actually hitting 333 eps, a fourth and more
+   serious bug surfaced: P0 itself started climbing under sustained
+   load** — to 30+ seconds p99, the opposite of the acceptance criterion.
+   Raw frames showed why: `queue_depth.P0` had grown to 1000+.
+   `_take_adaptive()`'s aging-guard check ran *before* the P0 check, so
+   the guard could preempt P0, not just P1. Under a brief spike this
+   never mattered (P2 is rarely aged), but under a *sustained* spike — the
+   exact condition the guard exists for — P2 almost always has *some*
+   item past the guard, so the exception doesn't fire occasionally: it
+   fires on **every single dequeue**, and P0 starves completely instead
+   of the opposite. This directly contradicted both CLAUDE.md's hard rule
+   3 (P0 never degraded) and this prompt's own acceptance line. Fixed:
+   P0 is now checked first and absolutely, unconditionally, before the
+   aging guard is even consulted — the guard only ever arbitrates P1 vs
+   P2. Two of the original queue tests asserted the *old* (wrong)
+   behaviour and were rewritten to use P1 as the aging guard's contender
+   instead of P0; two new invariant tests lock the fix in directly:
+   `test_p0_is_never_preempted_by_the_aging_guard_no_matter_how_old_p2_is`
+   and `test_p0_stays_absolute_under_a_sustained_flood_of_aged_p2` (50
+   permanently-aged P2 items in queue; 5 fresh P0 items must all still
+   come out first).
+
+**Acceptance, verified live in a browser, both directions, after all four
+fixes** (raw `/ws` frames cross-checked against the chart, not just eyeballed):
+
+```
+naive + spike (sustained ~10s):
+  t=0.0s  p99 P0=5907ms P1=5726ms P2=5663ms
+  t=8.0s  p99 P0=9219ms P1=9077ms P2=9107ms
+  -> all three climb together, within ~1-2% of each other throughout.
+
+adaptive + spike (sustained ~15s):
+  t=0.0s   qd={P0:0,  P1:338, P2:1694} p99 P0=420ms P1=282ms P2=6347ms
+  t=14.0s  qd={P0:3,  P1:806, P2:3422} p99 P0=397ms P1=282ms P2=12662ms
+  -> queue_depth.P0 stays ~0 throughout; P0 p99 stays flat (~400ms,
+     essentially the cost-model floor under 100% worker utilisation, not
+     climbing); P2 climbs continuously; P0/P2 diverge by nearly two
+     orders of magnitude.
+```
+
+Full backend suite: 111 passed (1 pre-existing wall-clock-sensitive
+timing test occasionally flakes when run as part of the full suite while
+CPU is under load — passes reliably alone; documented since P5, more
+noticeable this session because a real demo server was also running in
+the background throughout verification).
+
+Server left running for the user at `http://localhost:8000/`, reset to a
+clean adaptive baseline.

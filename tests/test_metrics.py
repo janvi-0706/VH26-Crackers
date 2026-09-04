@@ -11,7 +11,7 @@ import time
 import pytest
 
 from triage import ledger, metrics
-from triage.contracts import Decision, Event, EventType, Tier
+from triage.contracts import Decision, Event, EventType, Mode, Tier
 
 
 @pytest.fixture(autouse=True)
@@ -173,3 +173,90 @@ def test_snapshot_is_always_a_valid_frame_even_when_nothing_happened():
     assert frame.ingested == 0
     assert frame.latency_p99["P0"] == 0.0
     assert frame.exactly_once_violations == 0
+
+
+# --------------------------------------------------------------------------
+# mode: mirrored from the queue, so the dashboard's label is never a lie
+# --------------------------------------------------------------------------
+
+
+def test_mode_defaults_to_adaptive():
+    assert metrics.get_mode() is Mode.ADAPTIVE
+    assert metrics.snapshot().mode is Mode.ADAPTIVE
+
+
+def test_set_mode_is_reflected_in_the_next_snapshot():
+    metrics.set_mode(Mode.NAIVE)
+    assert metrics.snapshot().mode is Mode.NAIVE
+    metrics.set_mode(Mode.ADAPTIVE)  # restore: reset() is what tests rely on
+
+
+def test_reset_restores_mode_to_adaptive():
+    """reset() is a full wipe, mode included — Engine.reset() (app.py) is
+    the one place that needs mode preserved across a reset, and it does
+    that itself by re-applying set_mode() right after."""
+    metrics.set_mode(Mode.NAIVE)
+    metrics.reset()
+    assert metrics.get_mode() is Mode.ADAPTIVE
+
+
+# --------------------------------------------------------------------------
+# Stage C acceptance: a blown P0 latency must never be hidden by P2
+# --------------------------------------------------------------------------
+
+
+def test_a_blown_p0_latency_is_not_hidden_by_many_healthy_p2_samples():
+    """The demo's whole premise. If latency were ever pooled across tiers —
+    or if P0's own reading could be dragged down by a flood of good P2
+    numbers — a jury watching the P0 scoreboard could see green while P0 is
+    actually breaching its SLA. Prove the opposite: a hundred healthy P2
+    completions cannot move P0's p99 by a millisecond, in either direction.
+    """
+    base = time.time()
+
+    # A hundred fast, healthy P2 completions (well inside their 30s SLA).
+    for i in range(100):
+        metrics.observe_complete(
+            event(seq=i, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=base, sla=30.0),
+            now=base + 0.010,
+        )
+
+    # One P0 event that has badly blown its 200ms-class SLA.
+    blown = event(seq=999, tier=Tier.P0, etype=EventType.PAYMENT, ingest_ts=base, sla=0.2)
+    metrics.observe_complete(blown, now=base + 5.0)
+
+    frame = metrics.snapshot()
+
+    # P0's own reading reflects the blown event, full stop — not "mostly
+    # fine because most events were fine."
+    assert frame.latency_p50["P0"] == pytest.approx(5000.0, abs=1.0)
+    assert frame.latency_p99["P0"] == pytest.approx(5000.0, abs=1.0)
+
+    # And the flood of P0 badness (if it existed) could not run the other
+    # direction either: P2's reading stays healthy, untouched by P0.
+    assert frame.latency_p99["P2"] < 50.0
+
+    # The SLA miss is independently visible too, not just inferable from a
+    # latency number a dashboard might round away.
+    assert frame.sla_missed["P0"] == 1
+    assert frame.sla_met["P2"] == 100
+
+
+def test_p0_and_p2_percentiles_are_computed_from_disjoint_sample_sets():
+    """A structural guarantee, not just a plausible-looking number: P0's
+    percentile can only ever be computed from P0 samples."""
+    base = time.time()
+    for i in range(20):
+        metrics.observe_complete(
+            event(seq=i, tier=Tier.P2, ingest_ts=base), now=base + 0.005
+        )
+    # No P0 samples at all yet.
+    assert metrics.snapshot().latency_p99["P0"] == 0.0
+
+    metrics.observe_complete(
+        event(seq=100, tier=Tier.P0, etype=EventType.ORDER, ingest_ts=base, sla=0.5),
+        now=base + 2.0,
+    )
+    frame = metrics.snapshot()
+    assert frame.latency_p99["P0"] == pytest.approx(2000.0, abs=1.0)
+    assert frame.latency_p99["P2"] < 50.0  # unmoved by the single P0 sample

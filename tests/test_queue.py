@@ -149,10 +149,12 @@ async def test_priority_is_not_absolute_p0_fully_before_p1_this_is_per_call():
 # --------------------------------------------------------------------------
 
 
-async def test_p2_does_not_starve_forever_behind_continuous_p0_traffic():
+async def test_p2_does_not_starve_forever_behind_continuous_p1_traffic():
     """With a short guard, an old P2 item must eventually come out even
-    while P0 keeps arriving — a starvation *bound*, proven by actually
-    waiting past it, not by inspecting a threshold constant."""
+    while P1 keeps arriving — a starvation *bound* on P1-vs-P2, proven by
+    actually waiting past it, not by inspecting a threshold constant. (P0
+    is deliberately not part of this test: the guard never reaches P0 at
+    all — see the dedicated invariant tests below.)"""
     now = time.time()
     guard = 0.05
     q = EventQueue(aging_guard_seconds=guard)
@@ -162,8 +164,8 @@ async def test_p2_does_not_starve_forever_behind_continuous_p0_traffic():
 
     await asyncio.sleep(guard * 2)  # let the P2 item actually age
 
-    # P0 keeps showing up "at the same time" as the stuck P2 item ages.
-    q.put_nowait(p0(2, ingest_ts=time.time(), sla_seconds=1.0))
+    # P1 keeps showing up "at the same time" as the stuck P2 item ages.
+    q.put_nowait(p1(2, ingest_ts=time.time()))
 
     first = await q.get()
     assert first.event_id == stuck.event_id, "the aged P2 item must jump the queue"
@@ -188,8 +190,8 @@ async def test_aging_guard_serves_one_item_per_call_not_the_whole_backlog_at_onc
 
     await asyncio.sleep(guard * 2)  # both P2 items are now past the guard
 
-    urgent = p0(3, ingest_ts=time.time(), sla_seconds=1.0)
-    q.put_nowait(urgent)
+    waiting_p1 = p1(3, ingest_ts=time.time())
+    q.put_nowait(waiting_p1)
 
     first = await q.get()
     second = await q.get()
@@ -200,27 +202,27 @@ async def test_aging_guard_serves_one_item_per_call_not_the_whole_backlog_at_onc
         "still-aged old_b is exactly as overdue — the exception fires again "
         "on its own merits, it is not a one-shot-per-backlog escape hatch"
     )
-    assert third.event_id == urgent.event_id, (
+    assert third.event_id == waiting_p1.event_id, (
         "priority genuinely resumes once no P2 item is left past the guard"
     )
 
 
-async def test_below_the_guard_p2_does_not_jump_the_queue():
+async def test_below_the_guard_p2_does_not_jump_p1():
     now = time.time()
     q = EventQueue(aging_guard_seconds=10.0)  # far longer than this test runs
     fresh_p2 = p2(1, ingest_ts=now)
-    urgent_p0 = p0(2, ingest_ts=now, sla_seconds=1.0)
+    waiting_p1 = p1(2, ingest_ts=now)
     q.put_nowait(fresh_p2)
-    q.put_nowait(urgent_p0)
+    q.put_nowait(waiting_p1)
 
-    assert (await q.get()).event_id == urgent_p0.event_id
+    assert (await q.get()).event_id == waiting_p1.event_id
     assert (await q.get()).event_id == fresh_p2.event_id
 
 
-async def test_aging_guard_only_ever_affects_p2_not_p1():
-    """The guard is scoped to P2 by design (CLAUDE.md/PROGRESS.md: P1's 5s
-    SLA gives it enough headroom that it doesn't need one yet). An aged P1
-    item must NOT jump ahead of P0."""
+async def test_aging_guard_only_ever_affects_p1_vs_p2_not_p0():
+    """The guard is scoped to P1-vs-P2 by design (CLAUDE.md/PROGRESS.md:
+    P1's 5s SLA gives it enough headroom that it doesn't need one of its
+    own). An aged P1 item must NOT jump ahead of P0."""
     now = time.time()
     q = EventQueue(aging_guard_seconds=0.05)
     old_p1 = p1(1, ingest_ts=now - 5.0)  # far older than the P2 guard
@@ -230,6 +232,48 @@ async def test_aging_guard_only_ever_affects_p2_not_p1():
 
     q.put_nowait(p0(2, ingest_ts=time.time(), sla_seconds=1.0))
     assert (await q.get()).tier is Tier.P0, "P1 has no aging exception in Stage C"
+
+
+async def test_p0_is_never_preempted_by_the_aging_guard_no_matter_how_old_p2_is():
+    """The regression this file actually shipped once, found live while
+    verifying this exact prompt's acceptance criteria: letting the aging
+    guard reach P0 "for symmetry" seems harmless in isolation, but under a
+    *sustained* spike P2 almost always has something past the guard, so a
+    P0-reaching guard doesn't fire occasionally — it wins every single
+    dequeue, and P0 starves completely instead of staying flat. Prove the
+    fix holds even at the extreme: a P2 item ancient enough that any
+    P0-reaching guard would have grabbed it many times over."""
+    now = time.time()
+    q = EventQueue(aging_guard_seconds=0.01)
+    ancient_p2 = p2(1, ingest_ts=now - 3600.0)  # an hour old
+    q.put_nowait(ancient_p2)
+
+    fresh_p0 = p0(2, ingest_ts=now, sla_seconds=1.0)
+    q.put_nowait(fresh_p0)
+
+    assert (await q.get()).event_id == fresh_p0.event_id
+    assert (await q.get()).event_id == ancient_p2.event_id
+
+
+async def test_p0_stays_absolute_under_a_sustained_flood_of_aged_p2():
+    """The exact failure mode from the live regression: P0 must keep being
+    served promptly even while P2 is continuously overloaded and every
+    single P2 item in the queue is already past the guard."""
+    now = time.time()
+    guard = 0.01
+    q = EventQueue(aging_guard_seconds=guard)
+
+    for i in range(50):
+        q.put_nowait(p2(i, ingest_ts=now - 10.0))  # all already past the guard
+    await asyncio.sleep(guard * 2)
+
+    for j in range(50, 55):
+        q.put_nowait(p0(j, ingest_ts=time.time(), sla_seconds=1.0))
+
+    # Every P0 item must come out before a single further P2 item does,
+    # despite 50 permanently-aged P2 items sitting in the queue.
+    served = [(await q.get()).tier for _ in range(5)]
+    assert served == [Tier.P0] * 5
 
 
 # --------------------------------------------------------------------------
@@ -366,6 +410,62 @@ async def test_get_blocks_until_something_is_put_from_another_task():
     q.put_nowait(p2(1))
     await asyncio.wait_for(task, timeout=1.0)
     assert got[0].seq == 1
+
+
+async def test_clear_drops_everything_across_all_three_tiers():
+    now = time.time()
+    q = EventQueue()
+    q.put_nowait(p0(1, ingest_ts=now, sla_seconds=1.0))
+    q.put_nowait(p1(2, ingest_ts=now))
+    q.put_nowait(p2(3, ingest_ts=now))
+    assert q.qsize() == 3
+
+    q.clear()
+
+    assert q.empty()
+    assert q.qsize() == 0
+
+
+async def test_clear_leaves_the_queue_usable_afterward():
+    """/control/reset clears mid-demo, not at shutdown — the queue must
+    keep working immediately after, with no leftover task_done() debt from
+    whatever was dropped."""
+    now = time.time()
+    q = EventQueue()
+    q.put_nowait(p2(1, ingest_ts=now))
+    q.clear()
+
+    # Nothing is owed for the item clear() dropped — task_done() bookkeeping
+    # was reset, not left at 1.
+    with pytest.raises(ValueError):
+        q.task_done()
+
+    q.put_nowait(p0(2, ingest_ts=now, sla_seconds=1.0))
+    assert (await q.get()).seq == 2
+    q.task_done()  # exactly one owed, for the one item put after clear()
+
+
+async def test_clear_does_not_break_task_done_for_items_already_in_flight():
+    """The actual bug this method had: clear() must never touch the
+    accounting for an item a worker already get()'d and is mid-serve on —
+    that item is no longer in any heap, so clear() can't see it, and must
+    not assume it doesn't exist. Getting this wrong meant every worker's
+    task_done() for its in-flight item raised right after a reset, which
+    (per worker.py's finally block, outside its except Exception guard)
+    silently killed every worker in the pool at once."""
+    now = time.time()
+    q = EventQueue()
+    q.put_nowait(p2(1, ingest_ts=now))  # will be in flight
+    q.put_nowait(p2(2, ingest_ts=now))  # will still be queued at clear() time
+
+    in_flight = await q.get()
+    assert in_flight.seq == 1
+
+    q.clear()  # drops the still-queued item (seq 2); must not touch seq 1's count
+
+    q.task_done()  # for the in-flight item (seq 1) — must NOT raise
+    with pytest.raises(ValueError):
+        q.task_done()  # nothing else outstanding
 
 
 async def test_multiple_waiting_workers_each_get_exactly_one_item():

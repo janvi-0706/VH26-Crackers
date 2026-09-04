@@ -41,8 +41,10 @@ must be demoable at each one.
 ## Stage C — First demoable state (H4–7) — Round 1
 - [x] `queue.py`: three heaps, per-tier depth (EDF within P0, bounded P2
       aging guard, naive/adaptive mode switch)
-- [ ] Generator: live spike control (baseline ↔ 20x)
+- [x] Generator: live spike control (baseline ↔ 20x) — `/control/spike`,
+      `/control/mode`, `/control/reset`, `inject_event`
 - [x] Dashboard: per-tier stacked queue depth panel
+- [x] Dashboard: control bar (rate slider, SPIKE, RESET, naive/adaptive)
 - [ ] Round 1 notes in `docs/rounds/`
 
 ## Stage D — Adaptive engine (H7–10)

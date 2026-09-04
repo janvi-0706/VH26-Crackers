@@ -9,22 +9,38 @@ shape.
 
 Selection policy, in order:
 
-1. **Aging guard exception.** If the oldest P2 item's sojourn (now minus its
-   ingest_ts) has crossed ``aging_guard_seconds``, serve that one item and
-   stop — a single ``get()`` call never pulls more than one item, from any
-   tier, ever. The *next* call re-evaluates from scratch: if another P2
-   item is, on its own merits, also past the guard, the exception fires
-   again for it too. That is a deliberately stronger guarantee than
-   "unstick the queue once" — every individual aged item gets its own
-   bounded wait, not just whichever one happened to be found first.
-2. **Otherwise, the highest-priority non-empty tier wins**: P0, then P1,
+1. **P0 is absolute.** If P0 is non-empty, its earliest-deadline item wins,
+   full stop — no exception in this file ever reaches past it. This is not
+   a queue.py invention: CLAUDE.md's hard rule 3 is that P0 is never
+   degraded by anything, and this prompt's own acceptance line ("adaptive +
+   spike: P0 flat") is exactly this property, made visible on a chart.
+2. **Aging guard exception, P1 vs P2 only.** With P0 empty, if the oldest
+   P2 item's sojourn (now minus its ingest_ts) has crossed
+   ``aging_guard_seconds``, serve that one item ahead of P1 and stop — a
+   single ``get()`` call never pulls more than one item, ever. The *next*
+   call re-evaluates from scratch: if another P2 item is, on its own
+   merits, also past the guard, the exception fires again for it too. That
+   is a deliberately stronger guarantee than "unstick the queue once" —
+   every individual aged item gets its own bounded wait, not just
+   whichever one happened to be found first.
+3. **Otherwise, the highest-priority non-empty tier wins**: P0, then P1,
    then P2.
 
-That ordering is deliberately NOT "P0 fully before P1 before P2" as an
-absolute guarantee — it is priority *with a starvation bound*. Read it
+That P1-vs-P2 ordering is deliberately NOT an absolute "P1 fully before P2"
+guarantee — it is priority *with a starvation bound*, scoped to exactly the
+one tier (P2) CLAUDE.md/PROGRESS.md call out as needing one. Read it
 literally: on any call where no P2 item has aged past the guard, tier
-priority alone decides, full stop. The bound only ever pulls one P2 item
-out of turn, never more, and never touches P0/P1's own ordering.
+priority alone decides P1-vs-P2, full stop. The bound only ever pulls one
+P2 item out of turn, never more, and it never reaches P0.
+
+A note for anyone tempted to let the guard reach P0 too, "for symmetry":
+that was this file's actual first draft, and it is a genuine trap. Under
+*sustained* overload — which is exactly when this guard matters — P2
+almost always has *some* item past the guard, so a guard that can preempt
+P0 doesn't fire occasionally: it fires on every single dequeue, and P0
+starves completely instead of the opposite. Caught live while verifying
+this prompt's own acceptance criteria (P0 climbing to 30+ seconds under a
+sustained spike instead of staying flat) — see PROGRESS.md.
 
 Within a tier, ordering is:
 
@@ -173,13 +189,21 @@ class EventQueue:
         return self._take_adaptive()
 
     def _take_adaptive(self) -> Event | None:
+        # P0 is absolute: no exception below this line ever reaches it.
+        if self._p0:
+            return self._pop(Tier.P0)
+
+        # The aging guard only ever arbitrates P1 vs P2 — see the module
+        # docstring for exactly why it must stop here and go no further.
         if self._p2:
-            oldest_seq, oldest_event = self._p2[0]
+            _, oldest_event = self._p2[0]
             if time.time() - oldest_event.ingest_ts >= self.aging_guard_seconds:
                 return self._pop(Tier.P2)
-        for tier in _TIER_PRIORITY:
-            if self._heaps[tier]:
-                return self._pop(tier)
+
+        if self._p1:
+            return self._pop(Tier.P1)
+        if self._p2:
+            return self._pop(Tier.P2)
         return None
 
     def _take_naive(self) -> Event | None:
@@ -222,6 +246,37 @@ class EventQueue:
 
     def empty(self) -> bool:
         return self.qsize() == 0
+
+    def clear(self) -> None:
+        """Drop everything currently *queued* (not yet taken by a worker),
+        across all three tiers.
+
+        For ``/control/reset``: the demo needs to walk back to a clean
+        baseline mid-presentation without restarting the process. This
+        method only owns storage — the call site (``Engine.reset`` in
+        app.py) is responsible for also resetting ``metrics``/``ledger``,
+        so the dropped items don't linger as phantom queue depth.
+
+        Deliberately does NOT touch items a worker has already ``get()``'d
+        and is mid-``serve()`` on — those are not in the heaps any more, so
+        ``clear()`` cannot see them, and must not assume they don't exist.
+        Zeroing ``_unfinished`` unconditionally here was an earlier version
+        of this method's actual bug: a worker's later ``task_done()`` for
+        that in-flight item would then find nothing outstanding and raise,
+        which happens inside worker.py's `finally` block — outside the
+        `except Exception` guard — silently killing that worker. Every
+        worker in flight at the moment of a reset would die the same way.
+        Decrementing by exactly what was dropped keeps in-flight items
+        correctly accounted for.
+        """
+        dropped = len(self._p0) + len(self._p1) + len(self._p2)
+        self._p0.clear()
+        self._p1.clear()
+        self._p2.clear()
+        self._unfinished -= dropped
+        if self._unfinished == 0:
+            self._all_done.set()
+        self._nonempty.clear()
 
     def tier_depth(self, tier: Tier) -> int:
         """Current depth of one tier's heap. metrics.py tracks the same

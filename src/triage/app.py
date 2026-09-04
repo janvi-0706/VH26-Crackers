@@ -32,13 +32,13 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import metrics
+from . import ledger, metrics
 from .classifier import Classifier
 from .config import Config, load_config
-from .contracts import MetricsFrame
+from .contracts import Event, EventType, MetricsFrame
 from .fake_metrics import FakeSource
 from .generator import EventGenerator
-from .queue import EventQueue
+from .queue import EventQueue, Mode as QueueMode
 from .worker import WorkerPool
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,16 @@ DASHBOARD_DIST = REPO_ROOT / "dashboard" / "dist"
 
 SNAPSHOT_HZ = 4.0
 SNAPSHOT_PERIOD = 1.0 / SNAPSHOT_HZ
+
+# The SPIKE button's target rate. A fixed demo constant, not derived from
+# config/tiers.yaml's spike_multiplier — the button has to reproduce the
+# exact same number every time regardless of later tuning, and 20000/min is
+# the literal figure the spec names (it happens to land within 0.1% of
+# config's own calibrated spike_eps of 333.0, which is reassuring, not load
+# bearing). "Instant jump, no ramp": set_rate() takes effect on the very
+# next emission, since the generator reads its rate fresh every loop.
+SPIKE_EVENTS_PER_MINUTE = 20_000
+SPIKE_RATE_EPS = SPIKE_EVENTS_PER_MINUTE / 60.0
 
 
 class Engine:
@@ -70,6 +80,59 @@ class Engine:
     def set_rate(self, rate: float) -> None:
         self.generator.set_rate(rate)
 
+    def spike(self) -> float:
+        """Instant jump to the SPIKE_RATE_EPS step function — no ramp. The
+        very next emission after this call already uses the new rate."""
+        self.set_rate(SPIKE_RATE_EPS)
+        return SPIKE_RATE_EPS
+
+    def set_mode(self, mode: QueueMode) -> None:
+        """The one call site that changes the live queue's selection policy
+        — routed through here (not the queue directly) so metrics.mode
+        never drifts from what the queue is actually doing."""
+        self.queue.set_mode(mode)
+        metrics.set_mode(mode)
+
+    async def reset(self) -> None:
+        """Walk the whole pipeline back to a clean baseline, mid-process —
+        for /control/reset, so a presenter can restart the demo without
+        restarting the server. Deliberately leaves `mode` untouched: it is
+        a separate, explicit control, not a statistic a reset should flip.
+        metrics.reset() resets mode to adaptive as part of its own "clear
+        everything" contract, so the current mode is captured first and
+        reapplied right after.
+
+        Restarts the worker pool rather than only clearing the queue. A
+        worker can already be mid-serve() on an event from before the
+        reset; left alone, it finishes normally and reports that event's
+        real (huge, pre-reset) latency into a now-otherwise-empty window,
+        where it can dominate that tier's p50/p99 for a very long time at
+        low arrival rates — a "clean slate" that silently isn't one.
+        Cancelling in-flight work here is safe: worker.py's `finally:
+        queue.task_done()` still runs on cancellation, so the queue's
+        unfinished-count stays correct either way.
+        """
+        current_mode = self.queue.mode
+        self.generator.set_rate(self.config.baseline_eps)
+        await self.workers.stop()
+        self.queue.clear()
+        metrics.reset()
+        metrics.set_mode(current_mode)
+        ledger.reset()
+        self.workers.start()
+
+    async def inject_event(
+        self, event_type: EventType, partition_key: str | None = None
+    ) -> Event:
+        """Drop one event of `event_type` into the running stream, outside
+        the mix draw. Tier/value/cost/deadline still come from config via
+        the same classifier every generated event goes through — this
+        method accepts no economics of its own to override them with."""
+        raw = self.generator.emit_single(event_type, partition_key)
+        event = self.classifier.classify(raw)
+        await self.queue.put(event)
+        return event
+
     async def start(self) -> None:
         self.workers.start()
         self._ingest_task = asyncio.create_task(self._ingest(), name="pulse-ingest")
@@ -90,6 +153,21 @@ class Engine:
 
 class RateBody(BaseModel):
     rate: float
+
+
+class ModeBody(BaseModel):
+    mode: str
+
+
+class InjectBody(BaseModel):
+    type: str
+    partition_key: str | None = None
+
+
+def _fake_mode_error(action: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": f"{action} has no effect in --fake mode"}, status_code=409
+    )
 
 
 def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
@@ -125,14 +203,69 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
     @app.post("/control/rate")
     async def control_rate(body: RateBody) -> JSONResponse:
         if fake:
-            return JSONResponse(
-                {"error": "rate control has no effect in --fake mode"},
-                status_code=409,
-            )
+            return _fake_mode_error("rate control")
         if body.rate < 0:
             return JSONResponse({"error": "rate must be non-negative"}, status_code=422)
         app.state.engine.set_rate(body.rate)
         return JSONResponse({"rate": body.rate})
+
+    @app.post("/control/spike")
+    async def control_spike() -> JSONResponse:
+        """Instant jump to the SPIKE_RATE_EPS step function. No ramp — the
+        spike is a step function by spec, not a gradual climb."""
+        if fake:
+            return _fake_mode_error("spike control")
+        rate = app.state.engine.spike()
+        return JSONResponse({"rate": rate, "events_per_minute": SPIKE_EVENTS_PER_MINUTE})
+
+    @app.post("/control/mode")
+    async def control_mode(body: ModeBody) -> JSONResponse:
+        if fake:
+            return _fake_mode_error("mode control")
+        try:
+            app.state.engine.set_mode(body.mode)  # type: ignore[arg-type]
+        except ValueError:
+            return JSONResponse(
+                {"error": f"unknown mode: {body.mode!r}; use 'naive' or 'adaptive'"},
+                status_code=422,
+            )
+        return JSONResponse({"mode": body.mode})
+
+    @app.post("/control/reset")
+    async def control_reset() -> JSONResponse:
+        """Walk the pipeline back to a clean baseline without restarting
+        the process — mode is left exactly as it was."""
+        if fake:
+            return _fake_mode_error("reset")
+        await app.state.engine.reset()
+        return JSONResponse({"status": "reset", "rate": app.state.engine.config.baseline_eps})
+
+    @app.post("/control/inject")
+    async def control_inject(body: InjectBody) -> JSONResponse:
+        """Drop one event into the running stream. Only `type` and an
+        optional `partition_key` are accepted — tier/value/cost/deadline
+        always come from config via the classifier, never from the caller."""
+        if fake:
+            return _fake_mode_error("event injection")
+        try:
+            event_type = EventType(body.type)
+        except ValueError:
+            valid = ", ".join(t.value for t in EventType)
+            return JSONResponse(
+                {"error": f"unknown type: {body.type!r}; use one of: {valid}"},
+                status_code=422,
+            )
+        event = await app.state.engine.inject_event(event_type, body.partition_key)
+        return JSONResponse(
+            {
+                "event_id": event.event_id,
+                "type": event.type.value,
+                "tier": event.tier.value,
+                "value": event.value,
+                "cost": event.cost,
+                "deadline_ts": event.deadline_ts,
+            }
+        )
 
     @app.websocket("/ws")
     async def ws_metrics(websocket: WebSocket) -> None:

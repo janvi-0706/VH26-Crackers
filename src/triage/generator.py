@@ -48,6 +48,13 @@ class EventGenerator:
     asynchronous source used by the eventual application loop.
     """
 
+    # A single catch-up burst in events() stops here even if the schedule
+    # says we're further behind than that. At the spec spike rate (333
+    # eps) this is well under a second of backlog to work through in one
+    # go; it exists so a stall or a deliberately absurd rate can't hog the
+    # event loop indefinitely instead of yielding back to workers/`/ws`.
+    _MAX_BURST = 500
+
     def __init__(
         self,
         rate: float | None = None,
@@ -85,7 +92,28 @@ class EventGenerator:
             weights=[self.config.mix[event_type] for event_type in self.config.mix],
             k=1,
         )[0]
-        partition_key = f"customer:{self._rng.randrange(self.customer_count)}"
+        return self.emit_single(event_type)
+
+    def emit_single(
+        self, event_type: EventType, partition_key: str | None = None
+    ) -> GeneratedEvent:
+        """Create one event of a caller-specified type, outside the mix draw.
+
+        This is the identity half of ``inject_event`` (see app.py's
+        ``Engine``): dropping a single event into a running stream — e.g.
+        "watch one huge order jump the queue" — still has to go through the
+        same event_id/dedup_key/payload-size machinery as the mix does, or
+        it would be a structurally different kind of event pretending to be
+        a normal one. What it must NOT do is touch tier/value/cost/deadline
+        — those are classification economics, assigned only by
+        :mod:`triage.classifier`, from config, never by a caller.
+
+        ``partition_key`` defaults to a random customer from the same pool
+        ``emit()`` draws from, so an injected event without an explicit
+        customer looks exactly like an organic one.
+        """
+        if partition_key is None:
+            partition_key = f"customer:{self._rng.randrange(self.customer_count)}"
         business_key = (event_type, partition_key)
         self._business_numbers[business_key] += 1
         self._emission_number += 1
@@ -120,21 +148,54 @@ class EventGenerator:
         )
 
     async def events(self, stop_event: asyncio.Event | None = None) -> AsyncIterator[GeneratedEvent]:
-        """Yield events until ``stop_event`` is set.
+        """Yield events until ``stop_event`` is set, at (close to) ``rate``.
 
-        The interval is measured around the emission itself so a slow consumer
-        does not accidentally create a faster source.  A zero rate remains
-        responsive to control and shutdown without busy-spinning.
+        Paced against a running schedule (``next_emit_time``), not "sleep
+        the nominal interval after every single emission". That distinction
+        matters more than it looks: ``asyncio.sleep()`` has a real fixed
+        overhead per call — even with worker.py's Windows timer-resolution
+        fix, on the order of ~1ms — which is negligible against a 60ms
+        interval (16.65 eps, our baseline) but dominates a 3ms interval
+        (333 eps, our spec spike rate). Sleeping once per event at spike
+        rate was measured to sustain only ~200 eps, not 333 — a generator
+        that silently can't hit its own documented calibration.
+
+        The fix: catch up in a tight, no-sleep burst whenever the schedule
+        says we're behind, and only sleep for whatever time is genuinely
+        left before the next scheduled emission. One sleep call's overhead
+        is then amortised across a whole burst instead of paid per event.
+        ``_MAX_BURST`` caps a single catch-up so an absurd rate (or a long
+        stall) can't monopolise the event loop indefinitely — it degrades
+        by falling further behind rather than starving workers/`/ws`.
+
+        A zero rate remains responsive to control and shutdown without
+        busy-spinning.
         """
+        next_emit_time = time.monotonic()
         while stop_event is None or not stop_event.is_set():
             if self._rate <= 0:
                 await asyncio.sleep(0.05)
+                next_emit_time = time.monotonic()
                 continue
-            started = time.monotonic()
-            yield self.emit()
-            remaining = (1.0 / self._rate) - (time.monotonic() - started)
+
+            interval = 1.0 / self._rate
+            now = time.monotonic()
+            burst = 0
+            while next_emit_time <= now and burst < self._MAX_BURST:
+                yield self.emit()
+                next_emit_time += interval
+                burst += 1
+                now = time.monotonic()
+
+            remaining = next_emit_time - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining)
+            else:
+                # Behind schedule even after a full burst (rate change,
+                # long stall, or an absurd target): yield control once so
+                # the loop stays responsive, then let the next iteration's
+                # burst continue catching up rather than blocking here.
+                await asyncio.sleep(0)
 
     stream = events
     generate = events

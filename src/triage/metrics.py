@@ -80,11 +80,35 @@ _recent_decisions: deque[DecisionTrace] = deque(maxlen=RECENT)
 _recent_sheds: deque[ShedRecord] = deque(maxlen=RECENT)
 _started_at = 0.0
 
+# The queue's live selection policy, mirrored here so the dashboard's mode
+# label is never a lie.
+_current_mode: Mode = Mode.ADAPTIVE
+
+
+def set_mode(mode: Mode) -> None:
+    """Called wherever the queue's mode actually changes (Engine.set_mode,
+    Engine.reset), so snapshot() reports the mode that is truly in effect."""
+    global _current_mode
+    _current_mode = Mode(mode)
+
+
+def get_mode() -> Mode:
+    return _current_mode
+
 
 def reset() -> None:
-    """Clear all state. Called at import, and by tests between cases."""
-    global _value_delivered, _value_shed, _started_at
+    """Clear all state, mode included, back to the module's true default
+    (adaptive). Called at import, and by tests between cases.
 
+    Engine.reset() (app.py) calls this too, for /control/reset — since that
+    endpoint is specified to leave the queue's mode untouched, it captures
+    the mode beforehand and re-applies it with set_mode() right after this
+    returns, rather than this function carving out a mode-shaped exception
+    to its own "clear everything" contract.
+    """
+    global _value_delivered, _value_shed, _started_at, _current_mode
+
+    _current_mode = Mode.ADAPTIVE
     _latency_ms.clear()
     _queue_wait_ms.clear()
     for b in _BUCKETS:
@@ -282,7 +306,7 @@ def snapshot(now: float | None = None) -> MetricsFrame:
 
     return MetricsFrame(
         ts=now,
-        mode=Mode.ADAPTIVE,
+        mode=_current_mode,
         queue_depth=dict(_queue_depth),
         latency_p50=_percentiles(_latency_ms, 0.50),
         latency_p95=_percentiles(_latency_ms, 0.95),

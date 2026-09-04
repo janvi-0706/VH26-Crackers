@@ -24,6 +24,13 @@ interface MetricsSocketState {
   status: ConnectionStatus;
   latest: MetricsFrame | null;
   history: MetricsFrame[];
+  /** Wipe the local rolling window. The backend's /control/reset clears
+   * its own counters instantly, but without this the charts would keep
+   * showing up to 60s of now-stale pre-reset samples — confusing on stage,
+   * where RESET is supposed to mean "clean slate now". Call this from the
+   * same place that calls the reset API, not automatically: only a
+   * deliberate reset should throw away history, never a socket hiccup. */
+  clearHistory: () => void;
 }
 
 /**
@@ -101,5 +108,10 @@ export function useMetricsSocket(): MetricsSocketState {
   // grows; consumers read the array itself, never the tick.
   void historyTick;
 
-  return { status, latest, history: historyRef.current };
+  const clearHistory = () => {
+    historyRef.current = [];
+    setHistoryTick((t) => t + 1);
+  };
+
+  return { status, latest, history: historyRef.current, clearHistory };
 }
