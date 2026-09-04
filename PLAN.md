@@ -45,7 +45,9 @@ must be demoable at each one.
       `/control/mode`, `/control/reset`, `inject_event`
 - [x] Dashboard: per-tier stacked queue depth panel
 - [x] Dashboard: control bar (rate slider, SPIKE, RESET, naive/adaptive)
-- [ ] Round 1 notes in `docs/rounds/`
+- [x] Round 1 notes in `docs/rounds/`
+- [x] ADRs 0001-0004 (in-process asyncio, simulated cost, five-field
+      identity, contract-first freeze) — done early, ahead of Stage G
 
 ## Stage D — Adaptive engine (H7–10)
 - [ ] `decision.py`: split decision function, pressure signal, per-event reason string
@@ -66,7 +68,7 @@ must be demoable at each one.
 
 ## Stage G — Polish, freeze, rehearse (H14–16) — Round 2
 - [ ] Dashboard final layout
-- [ ] `docs/ARCHITECTURE.md` + ADRs
+- [ ] `docs/ARCHITECTURE.md` (ADRs 0001-0004 already done, see Stage C)
 - [ ] Code freeze, demo rehearsal
 - [ ] Round 2 notes in `docs/rounds/`
 

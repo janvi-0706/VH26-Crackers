@@ -554,3 +554,29 @@ the background throughout verification).
 
 Server left running for the user at `http://localhost:8000/`, reset to a
 clean adaptive baseline.
+
+## Documentation: ADRs 0001-0004 and round-1 notes
+
+Documentation only, no code changed.
+
+- `docs/adr/0001-in-process-asyncio-over-kafka.md`
+- `docs/adr/0002-simulated-service-cost.md`
+- `docs/adr/0003-five-field-identity-model.md`
+- `docs/adr/0004-contract-first-freeze.md`
+
+  Each under 300 words, Context/Options considered (≥2 real
+  alternatives)/Decision/Consequences, per the requested format. Done
+  earlier than PLAN.md's Stage G originally scheduled them for, since this
+  prompt asked for them now — PLAN.md updated to reflect that.
+
+- `docs/rounds/round-1.md` — one page: what's built, three demo highlights
+  (the P0-flat/P2-climbing contrast, EDF ordering, the aging-guard bug
+  found and fixed by testing the live demo itself), specifically what's
+  incomplete (no Stage D decision function, no backpressure/ledger yet, and
+  the honest worker-contention latency floor on P0 documented in the P8
+  entry above), and the next 8 hours. `git log --oneline --decorate`
+  appended as evidence, cross-checked against a fresh run rather than
+  copied from memory — 111 tests currently pass (re-verified before
+  writing this number into the round doc; the one wall-clock-sensitive
+  timing test noted since P5 is still occasionally flaky while the demo
+  server runs in the background, not a regression).
