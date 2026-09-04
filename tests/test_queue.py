@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from triage import ledger, metrics
+from triage import deferral, ledger, metrics
 from triage.contracts import Event, EventType, Tier
 from triage.queue import EventQueue
 
@@ -22,9 +22,11 @@ from triage.queue import EventQueue
 def clean_registry():
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
     yield
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
 
 
 def make_event(

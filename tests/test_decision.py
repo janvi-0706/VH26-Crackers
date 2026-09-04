@@ -13,6 +13,8 @@ from triage.decision import (
     PressureSignals,
     PressureWeights,
     ScoreWeights,
+    batch_cost,
+    batch_size,
     decide,
     est_service_time,
     pressure,
@@ -232,3 +234,54 @@ def test_decide_reason_is_a_nonempty_human_string():
     ev = make_event(tier=Tier.P1, ingest_ts=now, sla_seconds=5.0)
     _, reason = decide(ev, 0.5, now, CAPACITY)
     assert isinstance(reason, str) and len(reason) > 0
+
+
+# --------------------------------------------------------------------------
+# batch_size() / batch_cost()
+# --------------------------------------------------------------------------
+
+
+def test_batch_size_grows_with_pressure_between_the_bounds():
+    small = batch_size(0.40, b_min=4, b_max=8)
+    large = batch_size(0.74, b_min=4, b_max=8)
+    assert 4 <= small <= large <= 8
+
+
+def test_batch_size_is_hard_capped_regardless_of_pressure_out_of_range():
+    """B_max is a hard safety bound, not just the natural top of the
+    formula's range — a stale or synthetic pressure outside [0, 1] must not
+    produce an oversized batch."""
+    assert batch_size(5.0, b_min=4, b_max=8) == 8
+    assert batch_size(-3.0, b_min=4, b_max=8) == 4
+
+
+def test_batch_size_default_bounds_match_the_spec():
+    assert batch_size(0.0) == 4  # B_MIN
+    # At P=1.0 the raw formula would hit B_MAX exactly; MICRO_BATCH's own
+    # band never actually reaches 1.0 (>=0.75 is DEFER), but the formula
+    # itself must still cap there if ever asked.
+    assert batch_size(1.0) == 8  # B_MAX
+
+
+def test_batch_cost_formula_is_exactly_sum_times_0_4_plus_0_5():
+    assert batch_cost([2.0, 2.0, 2.0, 2.0]) == pytest.approx(8.0 * 0.4 + 0.5)
+
+
+def test_batch_cost_is_genuinely_cheaper_than_streaming_at_the_default_b_min():
+    """The prompt's own requirement: batching must be genuinely cheaper,
+    not just relabelled. True at B_MIN (4) even for the cheapest real
+    event type (log, cost=0.3u) — the case most likely to fail if it were
+    going to."""
+    log_costs = [0.3] * 4
+    individual_total = sum(log_costs)
+    assert batch_cost(log_costs) < individual_total
+
+
+def test_batch_cost_can_exceed_individual_cost_below_b_min():
+    """Documents *why* B_MIN exists, rather than asserting it blindly: a
+    single cheap event batched alone is genuinely more expensive than
+    streaming it — batch_cost() faithfully computes that, it does not
+    protect against it. batch_size() choosing >= B_MIN is what protects
+    against it in practice."""
+    one_log = [0.3]
+    assert batch_cost(one_log) > sum(one_log)

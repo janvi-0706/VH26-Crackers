@@ -248,3 +248,59 @@ def decide(
             f"pressure {pressure_value:.2f} in [0.40, 0.75) — batching amortises overhead",
         )
     return Decision.DEFER, f"pressure {pressure_value:.2f} >= 0.75 — deferring until pressure falls"
+
+
+# --------------------------------------------------------------------------
+# BATCHING — how big a MICRO_BATCH decision actually is, and what it costs.
+# Pure formulas, same as everything else in this module; worker.py owns the
+# actual gathering and the simulated sleep.
+# --------------------------------------------------------------------------
+
+# B_max is capped, not just parameterised, on purpose: CLAUDE.md hard rule 3
+# says P0 is never batched — it never is — but a worker mid-batch is still
+# unavailable to pick up a P0 arrival until the whole batch finishes. A
+# large batch of low-cost P2 events would be quick regardless, but a batch
+# that happened to gather several 2.0u inventory events could otherwise run
+# long enough to matter against P0's 200ms SLA. Eight items keeps a worst
+# case worth of batched inventory under a few hundred milliseconds.
+B_MIN = 4
+B_MAX = 8
+
+
+def batch_size(pressure_value: float, b_min: int = B_MIN, b_max: int = B_MAX) -> int:
+    """round(B_min + (B_max - B_min) * P), clamped to [b_min, b_max] as a
+    hard safety bound regardless of what P is handed in (pressure is
+    already clamped to [0, 1] by pressure() itself, but this function must
+    not trust that blindly — a stale or synthetic P outside that range must
+    not produce a batch bigger than B_max or smaller than B_min).
+
+    B_min is chosen, not arbitrary: batching only pays for itself once the
+    fixed 0.5u overhead is amortised across enough items. At the cheapest
+    real event type (log, cost=0.3u), batch_cost(4 logs) = 4*0.3*0.4 + 0.5
+    = 0.98u versus 1.2u streamed individually — a real ~18% saving, not a
+    coin-flip. Below that, a "batch" of 1-2 cheap items can cost *more*
+    than streaming them (see batch_cost's own docstring for the arithmetic)
+    — relabelling, not genuine efficiency, which is exactly what this
+    prompt asks us not to build.
+    """
+    raw = b_min + (b_max - b_min) * pressure_value
+    return max(b_min, min(b_max, round(raw)))
+
+
+def batch_cost(costs: list[float]) -> float:
+    """sum(costs) * 0.4 + 0.5 — a batch is charged 60% of its members'
+    combined cost plus one fixed 0.5u overhead, instead of each member's
+    full cost individually. Whether that is actually cheaper depends on how
+    many items are in it and how expensive they are:
+
+        1 log   (0.3u):  individual 0.3u   vs batched 0.3*0.4+0.5 = 0.62u  (worse)
+        4 logs  (1.2u):  individual 1.2u   vs batched 1.2*0.4+0.5 = 0.98u  (18% cheaper)
+        4 clicks(2.0u):  individual 2.0u   vs batched 2.0*0.4+0.5 = 1.30u  (35% cheaper)
+        4 invty (8.0u):  individual 8.0u   vs batched 8.0*0.4+0.5 = 3.70u  (54% cheaper)
+
+    This is why B_MIN exists on the gathering side: this function will
+    faithfully compute whatever it's given, including a cost *higher* than
+    streaming for a too-small batch — genuinely cheaper is a property of
+    how batch_size() is chosen, not of this formula alone.
+    """
+    return sum(costs) * 0.4 + 0.5

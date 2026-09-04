@@ -12,10 +12,10 @@ Two modes, chosen once at process start, never mixed:
                     Stage C's priority/tiers exist — the reason
                     fake_metrics.py was built in Stage A.
 
-Stage C: the queue is now the three-heap priority structure from queue.py
-(P0 by EDF, P1/P2 by arrival, a bounded aging exception for P2). This file
-did not need to change for that — Engine just constructs an EventQueue and
-never looks inside it.
+Stage D: `Engine` also owns the deferred-buffer drainer's lifecycle
+(started alongside the worker pool, stopped alongside it) — the actual
+decision-making (score, pressure, batch vs defer) lives in queue.py and
+worker.py; this file just starts and stops the background tasks.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -33,10 +32,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import decision, ledger, metrics
+from . import deferral, ledger, metrics
 from .classifier import Classifier
 from .config import Config, load_config
-from .contracts import Decision, Event, EventType, MetricsFrame
+from .contracts import Event, EventType, MetricsFrame
 from .fake_metrics import FakeSource
 from .generator import EventGenerator
 from .queue import EventQueue, Mode as QueueMode
@@ -77,6 +76,8 @@ class Engine:
         self.workers = WorkerPool(self.queue, config=self.config)
         self._stop = asyncio.Event()
         self._ingest_task: asyncio.Task[None] | None = None
+        self._drain_stop: asyncio.Event | None = None
+        self._drain_task: asyncio.Task[None] | None = None
 
     def set_rate(self, rate: float) -> None:
         self.generator.set_rate(rate)
@@ -137,39 +138,42 @@ class Engine:
     async def start(self) -> None:
         self.workers.start()
         self._ingest_task = asyncio.create_task(self._ingest(), name="pulse-ingest")
+        self._drain_stop = asyncio.Event()
+        self._drain_task = asyncio.create_task(
+            deferral.run_drainer(
+                replay=self.queue.put_replayed,
+                current_pressure=lambda: metrics.current_pressure(self.config),
+                stop_event=self._drain_stop,
+            ),
+            name="pulse-drainer",
+        )
 
     async def stop(self) -> None:
         self._stop.set()
         if self._ingest_task is not None:
             self._ingest_task.cancel()
             await asyncio.gather(self._ingest_task, return_exceptions=True)
+        if self._drain_stop is not None:
+            self._drain_stop.set()
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            await asyncio.gather(self._drain_task, return_exceptions=True)
         await self.workers.stop()
 
     async def _ingest(self) -> None:
-        """generator -> classifier -> decision -> queue, one event at a time.
+        """generator -> classifier -> queue, one event at a time.
 
-        The routing decision is computed against real, live pressure right
-        here at admission — not a synthetic value only exercised by tests.
-        For Stage D this is deliberately observational: every event is
-        still enqueued exactly as before regardless of what decide()
-        returns. Actually *acting* on MICRO_BATCH (worker.py executing a
-        real batch) or DEFER (a real deferred buffer to park in and drain
-        from) is Stage E's machinery — building that now would be building
-        ahead of what this prompt asked for. What Stage D adds is real
-        anyway: the decision is genuinely computed from live system state,
-        and every non-STREAM_NOW one is recorded to the ledger via
-        metrics.observe_decision the moment pressure first crosses a
-        threshold, not retrofitted once Stage E lands.
-        """
+        No decision-making here. Stage D's first draft decided at admission
+        (against pressure measured right then) — moved to worker.py instead,
+        because MICRO_BATCH/DEFER are about what a worker actually does with
+        an event it is about to serve, and by dequeue time a real backlog
+        may have sat long enough that pressure measured at ingest is stale.
+        Deciding as late as possible uses the freshest signal, and it is
+        also the only point that can actually act on the answer — batch
+        execution and deferral both live in worker.py now, not just their
+        audit trail."""
         async for raw in self.generator.events(self._stop):
             event = self.classifier.classify(raw)
-            now = time.time()
-            pressure_value = metrics.current_pressure(self.config, now=now)
-            chosen, reason = decision.decide(
-                event, pressure_value, now, self.config.worker_capacity_ups
-            )
-            if chosen is not Decision.STREAM_NOW:
-                metrics.observe_decision(event, chosen, reason, pressure_value, now=now)
             await self.queue.put(event)
 
 

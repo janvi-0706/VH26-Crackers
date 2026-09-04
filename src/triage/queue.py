@@ -160,6 +160,16 @@ class EventQueue:
         metrics.observe_ingest(event)
         self._enqueue(event)
 
+    def put_replayed(self, event: Event) -> None:
+        """Re-admit an event the deferral drainer is replaying. Deliberately
+        NOT put()/put_nowait(): this event was already counted once in
+        `ingested` when it first arrived, and metrics.observe_replay (not
+        observe_ingest) is what keeps the conservation equation from
+        double-counting it — see that function's own docstring. Used only
+        by deferral.py's drainer."""
+        metrics.observe_replay(event)
+        self._enqueue(event)
+
     def _enqueue(self, event: Event) -> None:
         # Always into pending: settled's sortedness must never be disturbed
         # by an append, or popping its last element stops being O(1)-safe.
@@ -192,6 +202,18 @@ class EventQueue:
             # await point yields control.
             self._nonempty.clear()
             await self._nonempty.wait()
+
+    def try_get(self) -> Event | None:
+        """Non-blocking get: the current best event under the active
+        policy, or None immediately if nothing is takeable right now —
+        never waits. Used by worker.py while gathering a MICRO_BATCH: a
+        batch worth waiting to fill would add latency exactly where
+        batching is supposed to save it, so gathering only ever takes what
+        is *already* available."""
+        event = self._try_take()
+        if event is not None:
+            metrics.observe_dequeue(event)
+        return event
 
     def _try_take(self) -> Event | None:
         if self._mode == "naive":

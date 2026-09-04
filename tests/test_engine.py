@@ -9,11 +9,12 @@ its own test rather than trusting the fake feed's calibration check.
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 
 import pytest
 
-from triage import ledger, metrics
+from triage import deferral, ledger, metrics
 from triage.config import load_config
 from triage.contracts import Event, EventType, Tier
 from triage.queue import EventQueue
@@ -24,9 +25,11 @@ from triage.worker import WorkerPool
 def clean_registry():
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
     yield
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
 
 
 def make_event(seq: int, cost: float = 1.0) -> Event:
@@ -86,18 +89,46 @@ async def test_worker_pool_sustains_150_units_per_second_within_5_percent():
     """6 workers x 25 u/s = 150 u/s. With cost=1.0 events, that ceiling
     translates directly into events/sec, so a 5% throughput check is also a
     5% check on the cost-model sleep math in worker.serve().
+
+    Uses P0 events specifically, now that worker.py actually acts on
+    decision.decide(): preloading 1200 items pushes queue depth (and so
+    pressure) high enough that P1/P2 events would get routed to
+    MICRO_BATCH/DEFER instead of streamed one at a time, which is a
+    decision-routing question, not the raw cost-model-sleep-math question
+    this test exists to answer. P0 is unconditionally STREAM_NOW regardless
+    of pressure, which is exactly the isolation this test wants.
     """
     cfg = load_config()
     q = EventQueue()
     sunk: list[Event] = []
     pool = WorkerPool(q, config=cfg, sink_write=sunk.append)
 
+    def make_p0_event(seq: int) -> Event:
+        now = time.time()
+        return Event(
+            event_id=f"evt-{seq}", dedup_key=f"dk-{seq}", seq=seq,
+            partition_key="customer:0", idempotency_key=f"ik-{seq}",
+            type=EventType.PAYMENT, tier=Tier.P0, payload_size=64,
+            value=1.0, cost=1.0, ingest_ts=now, deadline_ts=now + 60.0,
+        )
+
     # A backlog large enough that the queue never runs dry during the
     # measurement window — otherwise an idle worker would understate the
     # ceiling rather than reveal it.
     backlog = 1200
     for i in range(backlog):
-        q.put_nowait(make_event(i))
+        q.put_nowait(make_p0_event(i))
+
+    # Tests earlier in a full run (test_app.py's live-spike integration
+    # tests in particular) create thousands of Event objects and SQLite
+    # rows in a few real seconds; if a GC pass lands mid-measurement here
+    # it can eat enough wall-clock time to blow the 5% budget on its own,
+    # independent of anything wrong with the cost-model sleep math this
+    # test actually exists to check. Collecting right before starting the
+    # clock — not disabling GC, which would just move the same pause to a
+    # less predictable moment — keeps the measurement about the thing this
+    # test is for.
+    gc.collect()
 
     measure_seconds = 3.0
     pool.start()

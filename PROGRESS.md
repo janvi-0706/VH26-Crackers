@@ -733,3 +733,111 @@ Stage F's job) — noted honestly as an observed, plausible improvement.
 per-event decisions (not asked for this prompt); no batching execution,
 no deferred buffer, no ladder, no admission control (Stage E); no
 benchmark report quantifying any of this (Stage F).
+
+## Stage D — P11 micro-batching and the durable deferred buffer (Lane A/D)
+
+Decisions now *do* something, not just get recorded. Two execution paths
+land in `worker.py`, driven by `decision.decide()` called fresh at
+dequeue time (not once at ingest — pressure moves while an event waits):
+
+- **MICRO_BATCH**: `decision.batch_size(pressure)` (`round(B_min + (B_max
+  - B_min)*P)`, `B_min=4`, `B_max=8` — capped hard regardless of pressure,
+  so batching can never grow large enough to threaten the 200ms P0 SLA
+  even though P0 never enters a batch anyway). The worker greedily,
+  non-blockingly gathers more MICRO_BATCH-eligible events off the same
+  queue (`EventQueue.try_get()`, new), re-checking each one — an event
+  pulled while filling a batch that turns out to deserve STREAM_NOW or
+  DEFER is not forced in just because it was convenient to grab. The
+  whole batch is served with one combined sleep from
+  `decision.batch_cost()` (`sum(costs)*0.4 + 0.5`) — genuinely one
+  shorter sleep, not several relabelled; proven by wall-clock, not just
+  by trusting the formula (`test_micro_batch_is_actually_faster...`).
+- **DEFER**: handed to the new `deferral.py` — a SQLite-backed
+  `DeferralStore` whose schema is exactly `docs/DATA_MODEL.md`'s
+  `deferred_buffer` table (P0 rejected by construction). A background
+  drainer (`run_drainer`, started alongside ingest in `Engine.start()`,
+  stopped alongside it) replays parked events once pressure falls below
+  `DRAIN_PRESSURE_THRESHOLD = 0.35`, rate-limited to
+  `DRAIN_BATCH_PER_TICK / DRAIN_TICK_SECONDS` (100 events/sec) so replay
+  cannot re-saturate the pool it is draining into.
+
+**The infinite-redefer trap, found and fixed:** `decide()`'s own rule —
+`slack < 0` always defers, checked before pressure, unconditionally — is
+correct and was left untouched (already tested). But it means a replayed
+event whose deadline has already passed would be deferred again forever
+on every replay. Fixed in `worker.py._resolve()`: a *second* DEFER
+verdict for an event already known to `deferral.was_deferred()` is
+overridden to STREAM_NOW instead — served now, honestly counted as an
+SLA miss, never looped. `decision.py`'s formula itself needed no change.
+
+**Two real bugs found empirically, not by inspection, while making the
+required acceptance test actually pass** (a 30s real spike, a real
+`/control/reset`, then waiting for the backlog to hit zero):
+
+1. **`in_flight` leaked on every DEFER.** `observe_dequeue()` increments
+   `in_flight`; only `observe_complete()` decremented it. A deferred
+   event is never completed, so every one silently held its slot open
+   forever — `worker_util` pinned to 1.0 within seconds of any load,
+   which alone kept computed pressure elevated and stopped the drainer
+   from ever running. Fixed with a new `metrics.observe_defer()` that
+   releases the slot without counting the event as processed (its real
+   SLA outcome is still judged honestly later, at actual completion on
+   replay).
+2. **The arrival/service EWMA silently dropped simultaneous samples.**
+   `_Ewma.observe_amount()` returned early on `dt <= 0` — meant to guard
+   divide-by-zero, but a micro-batch's `for e in batch:
+   metrics.observe_complete(e, now=now)` calls land on the *same*
+   timestamp, so every event but the first in a batch vanished from the
+   service-rate signal entirely. That systematically understated service
+   rate the moment any batching happened, biasing pressure high and
+   self-reinforcing more batching/deferral — real oscillation risk, not
+   the load. Fixed by carrying the amount forward (`_pending_amount`) to
+   the next call with a real `dt`, instead of discarding it.
+3. **Replayed events poisoned their own queue-wait signal.** A replayed
+   event's `ingest_ts` can be tens of seconds old (it sat deferred that
+   whole time); measuring "queue wait" for pressure purposes as `now -
+   ingest_ts` the moment it's replayed reports a p95 sojourn of tens of
+   seconds, alone saturating pressure back to 1.0 and stalling the
+   drainer the instant it starts — the exact oscillation this stage is
+   required to prevent. Fixed with `metrics._replay_admitted_at`: the
+   real re-admission time, used only for the pressure-facing wait signal.
+   `observe_complete()`'s end-to-end latency/SLA accounting is
+   deliberately untouched — it still measures from the true original
+   `ingest_ts`, so a late replay still and correctly counts as an SLA
+   miss.
+
+With all three fixed: pressure genuinely decays toward calm at baseline,
+the drainer runs at a steady ~100 events/sec with no self-induced
+stalls, and a real 30s spike's multi-thousand-event backlog fully drains
+within the test's (generous, math-backed) wait window.
+
+**Tests — 26 new**
+
+- `tests/test_decision.py` — 6 new: `batch_size()`'s growth, hard cap,
+  and default bounds; `batch_cost()`'s exact formula and why `B_min`
+  exists (cheaper above it, not below).
+- `tests/test_deferral.py` (new file, 9 tests) — schema/storage/ordering
+  (`(ready_at, tier, deadline_ts, seq)` exactly, matching the DDL's own
+  index), `already_deferred` surviving a drain, drain-rate windowing, and
+  the drainer itself: gated on pressure, rate-limited to
+  `DRAIN_BATCH_PER_TICK` per tick, not all-at-once.
+- `tests/test_batching.py` (new file, 8 tests) — P0 immunity even at
+  pressure 1.0, a batch actually gathering and serving together
+  (wall-clock proof), exact `task_done()` accounting under the
+  gather-and-serve path, an event that deserves STREAM_NOW not getting
+  dragged into someone else's batch, DEFER routing to the store and the
+  ledger, and the infinite-redefer-trap regression test itself.
+- `tests/test_app.py` — 1 new, the literal acceptance line: real 30s
+  spike, real reset, poll until the backlog hits zero, assert everything
+  ever deferred was drained (read after the wait completes, since a few
+  more events can still land deferred in the brief high-pressure window
+  right after reset — those are just as real and just as owed a drain).
+
+**Known, pre-existing, unrelated flake (not a regression):**
+`test_worker_pool_sustains_150_units_per_second_within_5_percent`
+occasionally fails only when run as part of the full suite (never
+standalone) — Windows `ProactorEventLoop` `asyncio.sleep()` overhead
+degrading under heavy concurrent test load elsewhere in the same
+process, documented since Stage C/P5. Not caused by anything in this
+prompt's changes; re-confirmed by running it standalone after every
+change here.

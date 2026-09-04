@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from triage import ledger, metrics
+from triage import deferral, ledger, metrics
 from triage.app import SPIKE_EVENTS_PER_MINUTE, SPIKE_RATE_EPS, create_app
 from triage.contracts import Decision, MetricsFrame, Tier
 
@@ -19,11 +19,13 @@ from triage.contracts import Decision, MetricsFrame, Tier
 def setup_function() -> None:
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
 
 
 def teardown_function() -> None:
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
 
 
 # --------------------------------------------------------------------------
@@ -429,3 +431,69 @@ def test_live_pipeline_never_defers_p0_even_under_a_real_spike():
 
     p0_rows = [row for row in ledger_module.records() if row["tier"] == Tier.P0.value]
     assert p0_rows == [], f"P0 event(s) reached the ledger under a real spike: {p0_rows}"
+
+
+def test_deferred_events_are_never_lost_across_a_real_spike_and_reset():
+    """The literal acceptance line: after a 30s spike and a reset, the
+    number of events ever deferred equals the number ever drained, and the
+    backlog reaches exactly zero. Uses deltas from a captured baseline
+    (not deferral's raw totals) because the default store is process-wide
+    and shared across tests — see deferral.py's own module docstring on
+    why it is ambient rather than per-Engine.
+
+    30 real seconds of overload is what actually exercises this
+    end-to-end: it has to build a genuine backlog (some of it inventory,
+    whose 5s SLA all but guarantees slack goes negative before pressure
+    ever falls — the exact case worker.py's already-deferred override
+    exists for), survive a real reset, and then actually finish draining —
+    which, at the drainer's deliberately rate-limited pace, takes its own
+    real time afterwards. Not just be asserted to in principle.
+    """
+    import time as _time
+
+    from triage import deferral as deferral_module
+
+    app = create_app(fake=False, seed=27)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        baseline_deferred = deferral_module.pending_count()  # usually 0, robust either way
+        baseline_total_deferred = deferral_module._default_store.total_deferred
+        baseline_total_drained = deferral_module._default_store.total_drained
+
+        engine.spike()
+        _time.sleep(30.0)
+
+        deferred_by_end_of_spike = deferral_module._default_store.total_deferred - baseline_total_deferred
+        assert deferred_by_end_of_spike > 0, "test setup: the spike must actually defer something"
+
+        client.post("/control/reset")  # rate back to baseline; deferral is untouched by this
+
+        # A real 30s spike at ~333 events/sec, ~90% of it P1/P2 and pressure
+        # sustained near 1.0 for most of it, parks thousands of events (this
+        # backlog has been observed in the 3000-5000 range) — at the
+        # drainer's deliberately rate-limited ~100 events/sec (see
+        # deferral.py's DRAIN_BATCH_PER_TICK comment), draining ~5000 events
+        # alone takes ~50s, plus another 15-20s for post-reset pressure to
+        # first fall under DRAIN_PRESSURE_THRESHOLD at all. 150s gives that
+        # real math genuine margin rather than being tuned to just clear it.
+        deadline = _time.monotonic() + 150.0
+        while (
+            _time.monotonic() < deadline
+            and deferral_module.pending_count() > baseline_deferred
+        ):
+            _time.sleep(0.25)
+
+        # Pressure does not drop below DRAIN_PRESSURE_THRESHOLD the instant
+        # /control/reset returns — the rate takes a moment to actually fall
+        # and a couple more real events can still land with negative slack
+        # (or still-high pressure) in that window and get deferred too.
+        # Those are just as real and just as owed a drain as anything from
+        # the spike itself, so "everything ever deferred" is read fresh
+        # here, after the wait loop, not from the pre-reset snapshot above.
+        total_ever_deferred = deferral_module._default_store.total_deferred - baseline_total_deferred
+
+    store = deferral_module._default_store
+    assert deferral_module.pending_count() == baseline_deferred, "backlog must reach zero"
+    assert store.total_drained - baseline_total_drained == total_ever_deferred, (
+        "everything ever deferred must have been drained — nothing lost"
+    )

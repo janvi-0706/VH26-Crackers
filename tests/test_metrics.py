@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from triage import ledger, metrics
+from triage import deferral, ledger, metrics
 from triage.contracts import Decision, Event, EventType, Mode, Tier
 
 
@@ -18,9 +18,11 @@ from triage.contracts import Decision, Event, EventType, Mode, Tier
 def clean_registry():
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
     yield
     metrics.reset()
     ledger.reset()
+    deferral.reset_default_store()
 
 
 def event(seq: int = 1, tier: Tier = Tier.P2, etype: EventType = EventType.CLICK,
@@ -135,13 +137,19 @@ def test_percentiles_are_reported_per_tier_independently():
 
 
 def test_decision_counters_and_narrative():
+    """deferred_pending is deliberately not asserted here: as of Stage D it
+    is sourced live from deferral.pending_count() (see observe_replay's own
+    docstring for why), not from observe_decision — a DEFER decision being
+    *recorded* here is a separate concern from an event actually being
+    *stored* in the deferred buffer, which nothing in this test does. See
+    tests/test_deferral.py for deferred_pending's own coverage."""
     metrics.observe_decision(event(seq=1), Decision.SHED, "below shed line", 1.4)
     metrics.observe_decision(event(seq=2), Decision.SAMPLE_ROLLUP, "duplicate", 1.2)
     metrics.observe_decision(event(seq=3), Decision.DEFER, "deadline distant", 1.1)
     metrics.observe_decision(event(seq=4), Decision.STREAM_NOW, "headroom", 0.2)
 
     frame = metrics.snapshot()
-    assert (frame.shed, frame.sampled_out, frame.deferred_pending) == (1, 1, 1)
+    assert (frame.shed, frame.sampled_out) == (1, 1)
     assert frame.value_shed == pytest.approx(5.0)
     assert len(frame.recent_decisions) == 4
     assert frame.recent_decisions[0].seq == 4, "newest decision comes first"

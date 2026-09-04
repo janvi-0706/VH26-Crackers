@@ -58,17 +58,28 @@ must be demoable at each one.
 - [ ] Decisions visible per event in the *dashboard* — backend records them
       (ledger + recent_decisions), no frontend panel yet; not asked for in
       this prompt, left for the next one that asks for it
+- [x] `worker.py`: MICRO_BATCH actually executed — greedy non-blocking
+      gather up to `decision.batch_size(pressure)` (capped B_max=8),
+      served with one combined `decision.batch_cost()` sleep, proven
+      genuinely cheaper by wall-clock
 
 ## Stage E — Backpressure, ladder, ledger (H10–12.5)
 - [ ] `codel.py`: queue-latency controller
 - [ ] `ladder.py`: degradation rungs with hysteresis
 - [ ] `admission.py`: credit-based admission, source throttling
-- [ ] `deferral.py`: park and drain
+- [x] `deferral.py`: park and drain — SQLite-backed store matching
+      `docs/DATA_MODEL.md`'s `deferred_buffer` schema, pressure-gated
+      background drainer, rate-limited to ~100 events/sec; done ahead of
+      its planned slot because the driving prompt (P11) asked for it
+      alongside micro-batching under Stage D — see PROGRESS.md
 - [ ] `ledger.py`: real hash-chained audit ledger
 
 ## Stage F — Benchmark + report (H12.5–14)
 - [ ] `bench/run.py`: headless adaptive vs naive runs
 - [ ] Conservation equation balances (ingested = processed + in-flight + deferred + sampled + shed)
+      — the deferred/drained corner of this is already proven under real
+      spike load in `tests/test_app.py` (P11); the full equation across
+      every bucket at once is still this stage's job
 - [ ] `docs/BENCHMARK.md` with numbers
 
 ## Stage G — Polish, freeze, rehearse (H14–16) — Round 2

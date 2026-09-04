@@ -7,11 +7,15 @@ process (CLAUDE.md hard rule 1), so a registry object passed through six
 constructors would buy nothing and cost every call site an argument. Single
 threaded, single event loop: no locks needed, and none are taken.
 
-Five observation points, called by the engine:
+Seven observation points, called by the engine:
 
     observe_ingest(event)                              at the door
+    observe_replay(event)                               a deferred event re-enters
     observe_dequeue(event)                             worker picks it up
     observe_complete(event)                            worker finishes it
+    observe_defer(event)                                worker parks it instead — releases
+                                                         the in_flight slot observe_dequeue
+                                                         reserved, without counting it done
     observe_decision(event, decision, reason, pressure)  triage chose
     snapshot() -> MetricsFrame                         4 Hz, to the dashboard
 
@@ -20,9 +24,11 @@ STAGE D STATUS — what is real and what is not:
   REAL   latency percentiles (p50/p95/p99, per tier and pooled), queue-wait
          percentiles, queue depth per tier, the ledger counters, SLA
          attainment, value delivered vs value shed, true click count,
-         worker_count, active_workers, and — new in Stage D — pressure and
-         service_rate, computed from live arrival/service rate EWMAs, p95
-         sojourn, queue depth and worker utilisation (see current_pressure).
+         worker_count, active_workers, pressure and service_rate (computed
+         from live arrival/service rate EWMAs, p95 sojourn, queue depth and
+         worker utilisation — see current_pressure), and deferred_pending
+         (sourced live from deferral.pending_count(), not a resettable
+         in-memory counter — see observe_replay's own docstring for why).
 
   STUB   throughput, offered/admitted rate, ladder_rung, weighted_click_count,
          cost_adaptive, cost_naive, retries, duplicates_caught,
@@ -37,7 +43,7 @@ import time
 from collections import deque
 from typing import Sequence
 
-from . import decision, ledger
+from . import decision, deferral, ledger
 from .config import Config, load_config
 from .contracts import (
     TIER_KEYS,
@@ -107,6 +113,15 @@ _recent_decisions: deque[DecisionTrace] = deque(maxlen=RECENT)
 _recent_sheds: deque[ShedRecord] = deque(maxlen=RECENT)
 _started_at = 0.0
 
+# event_id -> the wall-clock moment a replayed event re-entered the live
+# queue, so observe_dequeue can measure this pass's queue-wait from there
+# instead of from the event's (possibly ancient) original ingest_ts. See
+# observe_replay's docstring. Bounded by construction: every entry is
+# popped by the one observe_dequeue call that follows its admission, and
+# reset() clears any left over from a mid-flight event a /control/reset cut
+# short.
+_replay_admitted_at: dict[str, float] = {}
+
 
 class _Ewma:
     """Exponentially-weighted moving average of a rate, plus a first-
@@ -128,15 +143,37 @@ class _Ewma:
         self.level = 0.0
         self.trend = 0.0
         self._last_update: float | None = None
+        # Amount observed at a timestamp that has not yet produced a
+        # positive dt — see observe_amount's dt<=0 branch for why this
+        # exists at all.
+        self._pending_amount = 0.0
 
     def observe_amount(self, amount: float, now: float) -> None:
         if self._last_update is None:
             self._last_update = now
+            self._pending_amount += amount
             return  # first point: no elapsed time yet to turn it into a rate
         dt = now - self._last_update
         if dt <= 0.0:
-            return  # clock didn't advance; skip rather than divide by zero
-        raw_rate = amount / dt
+            # The clock didn't advance since the last call — e.g. a worker
+            # finishing several events from one micro-batch in the same
+            # instant, so observe_complete calls them all with the same
+            # `now`. Every call but the first here would land on dt<=0 and,
+            # if simply skipped, its whole `amount` would vanish from the
+            # rate forever — not deferred, discarded. That silently starves
+            # service_rate_ewma of exactly the cost a batch was supposed to
+            # account for, biasing pressure high right after batching (and
+            # via the b term of decision.pressure(), keeping the system in
+            # MICRO_BATCH/DEFER territory it should have left) — found
+            # empirically: baseline pressure plateaued around 0.5 instead of
+            # decaying toward the calm value, because every batched
+            # completion but one was being dropped here. Carry it forward
+            # instead: it gets folded into the next call that does have a
+            # real dt.
+            self._pending_amount += amount
+            return
+        raw_rate = (amount + self._pending_amount) / dt
+        self._pending_amount = 0.0
         alpha = 1.0 - 0.5 ** (dt / self.half_life)
         new_level = alpha * raw_rate + (1.0 - alpha) * self.level
         self.trend = new_level - self.level
@@ -154,6 +191,7 @@ class _Ewma:
         self.level = 0.0
         self.trend = 0.0
         self._last_update = None
+        self._pending_amount = 0.0
 
 
 _arrival_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
@@ -214,7 +252,6 @@ def reset() -> None:
         processed=0,
         in_queue=0,
         in_flight=0,
-        deferred_pending=0,
         sampled_out=0,
         shed=0,
         true_click_count=0,
@@ -224,6 +261,7 @@ def reset() -> None:
     _value_shed = 0.0
     _recent_decisions.clear()
     _recent_sheds.clear()
+    _replay_admitted_at.clear()
     _started_at = time.time()
 
 
@@ -286,16 +324,64 @@ def observe_ingest(event: Event, now: float | None = None) -> None:
     _arrival_rate_ewma.observe_amount(event.cost, now)
 
 
+def observe_replay(event: Event, now: float | None = None) -> None:
+    """A previously-deferred event re-enters the live queue via the
+    drainer. Deliberately NOT observe_ingest(): this event was already
+    counted once in `ingested` when it first arrived, so counting it again
+    would double it in the conservation equation (ingested = processed +
+    in_queue + in_flight + deferred_pending + sampled_out + shed) — a
+    replay only ever *moves* an event from the deferred_pending bucket to
+    in_queue, it never creates a new one.
+
+    Also deliberately does NOT feed the arrival-rate EWMA. That EWMA
+    answers "how fast is NEW work arriving" — feeding replayed (old) work
+    into it would make the drainer's own activity look like a fresh
+    incoming spike and could push pressure back up right as the system is
+    trying to drain, which is exactly the oscillation this stage has to
+    avoid. The rate limiting that prevents it lives in deferral.py's own
+    drain pacing, not here — but not double-counting here is just as
+    necessary a part of it.
+
+    Records `now` as this event's re-admission time in `_replay_admitted_at`
+    — observe_dequeue reads it back so the queue-wait signal it feeds into
+    pressure reflects time actually spent in the *live* queue on this pass,
+    not `now - event.ingest_ts`. Found empirically, not by inspection: a
+    replayed event's ingest_ts can be tens of seconds old (it sat deferred
+    that whole time), so without this, the moment the drainer replays
+    anything, the very next dequeue reports a p95 queue-wait of "tens of
+    seconds" — which alone saturates pressure's c term back past 1.0 and
+    stops the drainer that just started, the exact oscillation this stage
+    is required to prevent. observe_complete is deliberately NOT touched by
+    this: end-to-end latency and SLA attainment must stay honest about the
+    event's true full journey (ingest_ts is right for that), including
+    reporting it as an SLA miss when it truly was one.
+    """
+    now = time.time() if now is None else now
+    tier = event.tier.value
+    _counters["in_queue"] += 1
+    _queue_depth[tier] += 1
+    _replay_admitted_at[event.event_id] = now
+
+
 def observe_dequeue(event: Event, now: float | None = None) -> None:
     """A worker took the event off the queue. The gap since ingest is queue
-    wait — the signal the CoDel controller will act on in Stage E."""
+    wait — the signal the CoDel controller will act on in Stage E.
+
+    For a replayed event, "since ingest" would mean since it first arrived
+    — including its whole time parked in deferral.py — which is not queue
+    wait in any sense pressure should react to. observe_replay records the
+    moment it actually re-entered the live queue; if that's on file for
+    this event_id, measure from there instead, and forget it (one dequeue
+    per admission).
+    """
     now = time.time() if now is None else now
     tier = event.tier.value
     _counters["in_queue"] = max(0, _counters["in_queue"] - 1)
     _counters["in_flight"] += 1
     _queue_depth[tier] = max(0, _queue_depth[tier] - 1)
 
-    wait_ms = max(0.0, (now - event.ingest_ts) * 1000.0)
+    admitted_at = _replay_admitted_at.pop(event.event_id, event.ingest_ts)
+    wait_ms = max(0.0, (now - admitted_at) * 1000.0)
     _queue_wait_ms[tier].append(wait_ms)
     _queue_wait_ms[ALL].append(wait_ms)
 
@@ -327,6 +413,27 @@ def observe_complete(event: Event, now: float | None = None) -> None:
         _sla_missed[tier] += 1
     else:
         _value_delivered += event.value
+
+
+def observe_defer(event: Event) -> None:
+    """A worker dequeued this event (observe_dequeue already ran, in_flight
+    is already +1 for it) and decided DEFER instead of serving it.
+
+    Without this call in_flight leaks: observe_dequeue's +1 is only ever
+    balanced by observe_complete's -1, and a deferred event is never
+    completed — it is parked in deferral.py's store, to be replayed and
+    *then* completed later. Found empirically, not by inspection: baseline
+    pressure after a spike-and-reset was observed plateauing around 0.5
+    instead of decaying toward 0, because in_flight climbed unboundedly
+    (every deferred event's slot held forever) and worker_util saturated at
+    1.0 permanently — which alone kept pressure sitting above
+    DRAIN_PRESSURE_THRESHOLD, so the drainer never ran at all. This is not
+    a "completion" in any sense that belongs in processed/latency/SLA
+    accounting — those are judged later, for real, when the event is
+    finally streamed on replay (via observe_complete). This function only
+    releases the in_flight slot that observe_dequeue reserved for it.
+    """
+    _counters["in_flight"] = max(0, _counters["in_flight"] - 1)
 
 
 def observe_decision(
@@ -377,10 +484,10 @@ def observe_decision(
         )
     elif decision is Decision.SAMPLE_ROLLUP:
         _counters["sampled_out"] += 1
-    elif decision is Decision.DEFER:
-        # Decremented by the deferral drain path in Stage E, which owns the
-        # other half of this counter.
-        _counters["deferred_pending"] += 1
+    # DEFER's own count is not tracked here: deferral.pending_count() is
+    # the live source of truth (see snapshot()) — a resettable in-memory
+    # counter would go stale the moment /control/reset clears _counters
+    # while the durable deferred buffer still holds real, un-drained rows.
 
     ledger.record(
         seq=event.seq,
@@ -470,7 +577,7 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         processed=_counters["processed"],
         in_queue=_counters["in_queue"],
         in_flight=_counters["in_flight"],
-        deferred_pending=_counters["deferred_pending"],
+        deferred_pending=deferral.pending_count(),
         sampled_out=_counters["sampled_out"],
         shed=_counters["shed"],
         weighted_click_count=0.0,  # stub: needs the rollup sampler (Stage E)
