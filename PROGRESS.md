@@ -2477,3 +2477,73 @@ passed clean here too.
 built since the jury tag: Stage I's exactly-once recovery, ingest-time
 dedup, and learned cost model, plus this final prompt's own bench
 extension and documentation set.
+
+## Phase J0 — contention measurement (before the P0/P1-P2 process split)
+
+Measurement only, per this prompt's own explicit instruction — `src/` is
+untouched (confirmed via `git status --short src/` before and after
+running this file); every number below comes from monkeypatching two
+`WorkerPool` methods in memory, for the duration of one run, then
+restoring the exact originals.
+
+**Built**
+
+- `bench/contention.py` (new) — wraps `WorkerPool.serve()`/`_serve_batch()`
+  at runtime (both already carry a real `worker_id` since Stage I, which
+  is what makes per-worker timeline attribution possible without touching
+  `worker.py` at all) to record, per worker, exactly what it served and
+  when. For every P0 event, the portion of its own queue wait that
+  overlaps a LOWER-tier interval on the SPECIFIC worker that eventually
+  serves it is attributed to head-of-line blocking; the portion
+  overlapping another P0 event on that same worker is attributed
+  separately — a real distinction named explicitly in the file's own
+  docstring (a process split removes the first, not the second). A
+  separate event-loop-lag prober runs concurrently for the whole 90s,
+  measuring `asyncio.sleep(0)`'s own round-trip delay as the standard
+  proxy for GIL/loop contention.
+
+**Two real bugs found and fixed in this file itself, not in the pipeline
+it measures, before its numbers could be trusted:**
+
+- The loop-lag prober's first version paced itself with
+  `asyncio.wait_for(stop.wait(), timeout=5ms)` between samples — measured
+  directly to not behave like a timer at all on this platform/asyncio
+  combination (an isolated 2s test produced ~118,000 samples, ~17us
+  apart, instead of the ~400 a 5ms interval implies).
+- Switching to a plain `asyncio.sleep(5ms)` fixed that, but exposed a
+  second, smaller anomaly ONLY under the real engine's own load (never
+  reproduced against a synthetic six-task substitute): most gaps between
+  consecutive wake-ups measured LESS than the requested interval, which
+  `asyncio.sleep()`'s own contract should never allow. Root cause not
+  fully pinned down within this prompt's own scope — resolved instead by
+  removing pacing entirely: probe with `sleep(0)` on every loop turn
+  (measuring its own round-trip, the textbook technique) and record only
+  every 500th sample to keep memory bounded, which measured cleanly (all
+  non-negative, microsecond-scale, sane distribution) in the same
+  isolated test that broke the paced version. Documented in
+  `_loop_lag_prober`'s own docstring rather than silently swapped without
+  explanation, including the honest caveat that the prober's own
+  hundreds-of-thousands-of-calls-per-second footprint is itself a (likely
+  minor) observer effect on whatever loop contention section 4 reports.
+
+**`bench/contention-before.md` — the real 90s/20x-spike result:**
+
+- 3068 P0 events observed. 512 (16.7%) experienced ANY head-of-line wait
+  behind a P1/P2 interval; p95 31.6ms, p99 63.0ms, max 218.4ms.
+- Total P0 queue wait decomposes to: p99 63.0ms behind P1/P2 work
+  specifically (what a process split removes) vs. p99 187.4ms behind
+  other P0 events on the same worker (what it does not — P0's own load
+  can still queue behind itself with N workers regardless of process
+  boundaries).
+- Largest single blocking event: 218.41ms, one P0 event waiting behind a
+  7-event P1 MICRO_BATCH.
+- Event-loop scheduling delay itself stayed microsecond-scale throughout
+  (p50 4.7us, p99 8.3us) with one 2.00ms outlier over the whole run —
+  the loop itself stays responsive; the real cost this report finds is in
+  queueing/head-of-line blocking, not raw GIL/loop scheduling lag.
+
+This is the "before" evidence Phase J's own future prompt needs — not a
+promise about what a process split will achieve, and not a claim that
+every cost of that split (IPC, serialization, a second
+audit-ledger-consistency problem) has been accounted for, both stated
+explicitly in the report's own closing section.
