@@ -13,12 +13,15 @@ graph TD
     contracts["contracts.py<br/><i>Event, Decision, MetricsFrame — frozen after Stage A</i>"]
     config["config.py<br/><i>Config, load_config()</i>"]
     codel["codel.py<br/><i>CoDelController — pure, no local imports</i>"]
+    dedup["dedup.py<br/><i>BloomFilter, Deduplicator — no local imports</i>"]
+    checkpoint["checkpoint.py<br/><i>CheckpointStore — write-ahead in-flight table</i>"]
 
     decision["decision.py<br/><i>score, pressure, decide</i>"]
     ladder["ladder.py<br/><i>Rung, escalate, ReservoirSampler</i>"]
     deferral["deferral.py<br/><i>SQLite deferred buffer + drainer</i>"]
     ledger["ledger.py<br/><i>hash-chained audit ledger</i>"]
     admission["admission.py<br/><i>CreditBucket, AdmissionControl (AIMD)</i>"]
+    costmodel["costmodel.py<br/><i>true_cost, CostModel — learned vs. prior</i>"]
     classifier["classifier.py<br/><i>raw payload → Event</i>"]
 
     sink["sink.py<br/><i>SQLite sink, idempotent upsert</i>"]
@@ -30,7 +33,7 @@ graph TD
     worker["worker.py<br/><i>WorkerPool — resolves + dispatches decisions</i>"]
 
     fake_metrics["fake_metrics.py<br/><i>Stage A/B stand-in feed</i>"]
-    app["app.py<br/><i>FastAPI wiring, /ws, /control/*</i>"]
+    app["app.py<br/><i>FastAPI wiring, /ws, /control/*, /chaos/*</i>"]
 
     config --> contracts
     decision --> contracts
@@ -39,8 +42,13 @@ graph TD
     ledger --> contracts
     admission --> contracts
     admission --> config
+    checkpoint --> contracts
+    costmodel --> contracts
+    costmodel --> config
+    costmodel --> generator
     classifier --> contracts
     classifier --> config
+    classifier --> costmodel
     sink --> contracts
     sink --> ladder
 
@@ -56,6 +64,7 @@ graph TD
     queue --> config
     queue --> decision
     queue --> metrics
+    queue --> costmodel
 
     generator --> contracts
     generator --> config
@@ -71,6 +80,8 @@ graph TD
     worker --> metrics
     worker --> sink
     worker --> queue
+    worker --> checkpoint
+    worker --> costmodel
 
     fake_metrics --> contracts
     fake_metrics --> config
@@ -86,18 +97,28 @@ graph TD
     app --> queue
     app --> worker
     app --> fake_metrics
+    app --> dedup
+    app --> costmodel
+    app --> sink
 
     classDef leaf fill:#1e3a2f,stroke:#4ade80,color:#eaffea;
     classDef top fill:#3a1e2f,stroke:#f87171,color:#ffeaea;
-    class contracts leaf
+    class contracts,codel,dedup leaf
     class app top
 ```
 
 `contracts.py` sits at the bottom with an in-degree from every other
 module and an out-degree of zero — nothing it defines depends on anything
-this project wrote. `codel.py` is the other leaf: it takes a sojourn time
-and a clock, and returns a boolean; it has never needed to know what an
-`Event` is. `app.py` sits at the top: it is the only module that imports
+this project wrote. `codel.py` and `dedup.py` are the other two leaves:
+`codel.py` takes a sojourn time and a clock and returns a boolean;
+`dedup.py` takes a string key and returns a boolean; neither has ever
+needed to know what an `Event` is, and Stage I built `dedup.py` to that
+same independence standard on purpose (see
+[ADR 0010](adr/0010-bloom-lru-over-persistent-dedup-store.md)).
+`checkpoint.py` depends on nothing but `contracts.py` either, for the
+same reason — a write-ahead in-flight table only ever needs to serialise
+and hand back an `Event`, never to reason about queues, pressure, or
+decisions. `app.py` sits at the top: it is the only module that imports
 `generator`, `worker`, and `fake_metrics` together, because wiring them
 into one running process is the one thing only `app.py` is allowed to do.
 
@@ -174,6 +195,61 @@ service rate, P2 sojourn — recomputed by `metrics.py` on every tick, so
 neither loop can starve or double-count against the other; they are two
 consumers of one sensor, not two independent sensors that could disagree.
 
+## A third feedback loop: online cost learning (Stage I)
+
+```mermaid
+flowchart LR
+    complete["worker.py<br/>a service genuinely finishes"]
+    truecost["event.cost<br/>(true, simulated — never touched)"]
+    observe["CostModel.observe(type, payload_size, cost)"]
+    running["RunningEstimate<br/>EWMA per (type, payload bucket)"]
+    estimate["CostModel.estimate(type, payload_size)"]
+    order["decision.score() / decide()<br/>ordering + routing"]
+
+    complete --> truecost --> observe --> running --> estimate --> order
+    order -- "which event is served next" --> complete
+```
+
+A third loop, deliberately the slowest and the only strictly one-way one:
+`worker.py` feeds `costmodel.py` the TRUE cost of every event it actually
+finishes; `CostModel.estimate()` then changes how `decision.py` scores
+and routes the NEXT comparison. One-way in the sense that matters most —
+see [ADR 0011](adr/0011-online-cost-learning-over-static-or-bandit.md):
+`observe()` never chooses what gets served, only how already-scheduled
+traffic is weighed afterward, which is what keeps this loop from being a
+bandit. The other two loops (admission, ladder) react within seconds;
+this one is deliberately slower (an EWMA half-life of dozens of samples,
+not milliseconds) because a cost estimate re-adapting instantly to one
+noisy observation would make ordering decisions flicker for no real
+reason — see `costmodel.py`'s own docstring for why the decay is keyed to
+sample count, not wall-clock time, so responsiveness never degrades the
+longer a demo has been running.
+
+## Resilience paths, not control loops (Stage I)
+
+Two more Stage I modules sit outside the pressure/admission/ladder/cost
+feedback system entirely — they answer "did this actually happen exactly
+once," not "what should happen next":
+
+- **`checkpoint.py`** — a per-`WorkerPool`, write-ahead, in-memory table
+  of which events a specific worker currently holds. `worker.py` writes
+  to it immediately before the one `await` a worker's own death could
+  land inside, and clears its entry immediately after. On a real death,
+  `WorkerPool._on_worker_done()` recovers exactly what that worker still
+  held and nothing else (see [ADR 0009](adr/0009-write-ahead-checkpoint-over-full-transaction-log.md)).
+- **`dedup.py`** — a Bloom-filter candidate check backed by a bounded
+  exact set, sitting in `Engine._ingest()` before an event ever reaches
+  the queue. Every event passes through it, not just chaos-flood-injected
+  ones (see [ADR 0010](adr/0010-bloom-lru-over-persistent-dedup-store.md)).
+
+Both are exercised the same way a jury can watch: `POST
+/chaos/kill-worker` and `POST /chaos/duplicate-flood` trigger the real
+mechanisms directly, not a simulated stand-in for them, and
+`bench/run.py`'s own `adaptive-spike-worker-kill`/
+`adaptive-spike-duplicate-flood` configs run the identical real actions
+headless, reporting `exactly_once_violations` as a column that reads 0 in
+every row, chaos rows included.
+
 ## Why the module boundaries are where they are
 
 Every boundary above splits along one question, not one pipeline stage:
@@ -218,6 +294,24 @@ Every boundary above splits along one question, not one pipeline stage:
   choosing between a real engine and the Stage A/B stand-in feed, is a
   process-composition decision, not a domain decision any lower module
   should need to make about itself.
+- **`costmodel.py` is a separate file from `decision.py`, not a new
+  function inside it.** `decision.py`'s own docstring already commits to
+  staying pure and stateless — "only computes numbers... from numbers it
+  is handed." A learned estimate is the opposite of that: state that
+  changes over the life of a process, updated from real traffic. Keeping
+  it in its own file (imported by `queue.py`/`worker.py`, handed to
+  `decision.py`'s functions as a plain `cost: float` parameter) means
+  `decision.py` never has to know an estimate exists at all — it is
+  handed a number, exactly as it always was.
+- **`checkpoint.py` is owned per-`WorkerPool`, not an ambient
+  module-level singleton** like `sink.py`/`deferral.py`/`ledger.py` are.
+  Those three are genuinely global concepts for this project (one audit
+  trail, one deferred backlog, one durable sink, for the one pipeline
+  CLAUDE.md hard rule 1 says exists per process); a table keyed by
+  `worker_id` is scoped to one specific pool's own tasks instead, and
+  sharing one global table across every `WorkerPool` a test constructs
+  would let unrelated tests' reused event_ids collide — the opposite of
+  what a per-instance store is for.
 
 ## Why the contract was frozen before implementation
 

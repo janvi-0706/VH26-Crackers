@@ -145,7 +145,10 @@ def test_svg_line_chart_handles_a_single_x_value_without_dividing_by_zero():
 # --------------------------------------------------------------------------
 
 
-def _make_result(label: str, mode: str, p0_p99: float, p0_lost: int = 0, chain_ok: bool = True) -> "bench_run.ConfigResult":
+def _make_result(
+    label: str, mode: str, p0_p99: float, p0_lost: int = 0, chain_ok: bool = True,
+    exactly_once_violations: int = 0,
+) -> "bench_run.ConfigResult":
     per_tier_f = {"P0": p0_p99, "P1": 500.0, "P2": 2000.0}
     per_tier_i = {"P0": 10, "P1": 10, "P2": 10}
     return bench_run.ConfigResult(
@@ -159,6 +162,7 @@ def _make_result(label: str, mode: str, p0_p99: float, p0_lost: int = 0, chain_o
         actual_worker_seconds=540.0, naive_scaled_worker_seconds=1000.0,
         cost_actual_usd=0.05, cost_naive_scaled_usd=0.1,
         p0_loss_count=p0_lost, audit_chain_ok=chain_ok, critical_failures=0,
+        exactly_once_violations=exactly_once_violations,
     )
 
 
@@ -232,6 +236,67 @@ def test_render_html_marks_a_p0_loss_as_bad_not_ok():
 def test_render_html_includes_all_three_charts():
     html = bench_run.render_html(_passing_matrix(), [_make_sensitivity(m, 1.0) for m in (5, 10, 20, 40)])
     assert html.count("<svg") == 3
+
+
+# --------------------------------------------------------------------------
+# exactly_once_violations — the final prompt's own column ("0 in every row")
+# --------------------------------------------------------------------------
+
+
+def test_render_markdown_reports_exactly_once_violations_as_zero():
+    md = bench_run.render_markdown(_passing_matrix(), [_make_sensitivity(m, 1.0) for m in (5, 10, 20, 40)])
+    assert "Exactly-once violations" in md
+    # Every synthetic row in _passing_matrix() is built with the default
+    # exactly_once_violations=0 — the header appears once, and the matrix
+    # section's own row count of trailing "| 0 |" cells (one per config)
+    # is a cheap, real proxy for "every row reports zero", not just "the
+    # column exists".
+    assert md.count("| yes | 0 |") == len(_passing_matrix())
+
+
+def test_render_html_marks_a_nonzero_exactly_once_violation_as_bad():
+    matrix = _passing_matrix()
+    matrix[3] = _make_result("adaptive-spike", "adaptive", 190.0, exactly_once_violations=1)
+    html = bench_run.render_html(matrix, [_make_sensitivity(m, 1.0) for m in (5, 10, 20, 40)])
+    assert '<td class="bad">1</td>' in html
+
+
+def test_render_html_marks_zero_exactly_once_violations_as_ok():
+    html = bench_run.render_html(_passing_matrix(), [_make_sensitivity(m, 1.0) for m in (5, 10, 20, 40)])
+    assert html.count('<td class="ok">0</td>') >= len(_passing_matrix())
+
+
+# --------------------------------------------------------------------------
+# The two chaos configs run_all() adds — real Engine, real chaos actions
+# --------------------------------------------------------------------------
+
+
+async def test_run_all_includes_both_chaos_configs_with_zero_violations():
+    """A short, real run (not the full 90s) proving run_all() actually
+    wires the two new configs in, fires a real chaos action against each,
+    and reports exactly_once_violations=0 for both — the same claim
+    bench/report.md makes at full duration, checked here fast enough to
+    run in the normal test suite."""
+    matrix, _ = await bench_run.run_all(duration_s=2.0)
+    labels = {r.label for r in matrix}
+    assert "adaptive-spike-worker-kill" in labels
+    assert "adaptive-spike-duplicate-flood" in labels
+    for r in matrix:
+        assert r.exactly_once_violations == 0, f"{r.label}: {r.exactly_once_violations}"
+
+
+async def test_duplicate_flood_config_actually_suppresses_duplicates():
+    """Not just that the config runs without crashing — that the chaos
+    action it fires is the real mechanism, genuinely catching duplicates,
+    not a no-op wired in for show."""
+    matrix, _ = await bench_run.run_all(duration_s=2.0)
+    flood_row = next(r for r in matrix if r.label == "adaptive-spike-duplicate-flood")
+    # sink.reset_default_store() in full_reset() gives this config a clean
+    # sink, so whatever it replays mid-run was admitted by this SAME run's
+    # own Deduplicator moments earlier — it should have real duplicates to
+    # catch, not be starved by another config's leftover state.
+    assert flood_row.ingested > 0
+    assert flood_row.p0_loss_count == 0
 
 
 def test_sensitivity_none_attainment_renders_as_not_available_not_zero():

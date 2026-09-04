@@ -5,7 +5,8 @@ Owner: Lane D.
 Two questions, kept structurally separate because they are different
 questions:
 
-1. The four-config matrix (naive x adaptive, baseline x spike, 90s each):
+1. The six-config matrix (naive x adaptive, baseline x spike, plus two
+   Stage-I chaos variants of adaptive-spike, 90s each):
    does the adaptive control loop actually deliver what CLAUDE.md claims —
    P0 protected, naive not — at the ONE spike level (20x) the whole demo
    is calibrated around?
@@ -14,7 +15,7 @@ questions:
    attainment): where does the system that survives (1) actually stop
    surviving? "It passed the one test we built it for" is a much weaker
    claim than "we know exactly where it breaks, and it isn't at 20x." The
-   20x point is not re-run — the four-config matrix's own adaptive-spike
+   20x point is not re-run — the matrix's own adaptive-spike
    result already IS the 20x sensitivity point; running it twice would
    waste 90 real seconds proving the same thing again.
 
@@ -62,12 +63,12 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from triage import deferral, ledger, metrics  # noqa: E402
+from triage import deferral, ledger, metrics, sink  # noqa: E402
 from triage.app import Engine  # noqa: E402
 from triage.config import load_config  # noqa: E402
 from triage.contracts import TIER_KEYS  # noqa: E402
@@ -93,11 +94,25 @@ SPIKE_MULTIPLIER_ALREADY_IN_MATRIX = 20.0
 def full_reset() -> None:
     """A true zero, not /control/reset's deliberately partial one (which
     leaves mode untouched — the right choice mid-demo, the wrong one
-    between two benchmark configs that must each start identically)."""
+    between two benchmark configs that must each start identically).
+
+    `sink.reset_default_store()` matters specifically for the
+    duplicate-flood config: `sink.py`'s own store is an ambient,
+    process-wide singleton (same as `ledger`/`deferral`), so without this,
+    `adaptive-spike-duplicate-flood`'s own `sink.recent()` call would pick
+    up rows committed by whichever config happened to run immediately
+    before it in this same process — dedup_keys a FRESH Engine's own,
+    just-constructed `Deduplicator` has never seen, so they would mostly
+    get admitted as "new" rather than caught as duplicates, undermining
+    the one thing that config exists to demonstrate. Found by directly
+    inspecting a smoke-test run's own suppressed/admitted split before
+    trusting it (837 replayed, only 174 suppressed) rather than assuming
+    the number was self-evidently meaningful."""
     metrics.reset()  # also resets codel.py / ladder.py's ambient state
     metrics.reset_critical_failures()
     ledger.reset()
     deferral.reset_default_store()
+    sink.reset_default_store()
 
 
 def sla_attainment(met: dict[str, int], missed: dict[str, int]) -> dict[str, float | None]:
@@ -161,6 +176,7 @@ class ConfigResult:
     p0_loss_count: int
     audit_chain_ok: bool
     critical_failures: int
+    exactly_once_violations: int
 
 
 @dataclass
@@ -175,7 +191,15 @@ class SensitivityPoint:
 async def run_config(
     *, label: str, mode: QueueMode, rate_label: str, multiplier: float,
     duration_s: float, seed: int,
+    chaos: Callable[[Engine], Awaitable[None]] | None = None,
 ) -> ConfigResult:
+    """`chaos`, when given, fires once at the run's own midpoint — real
+    load has to actually be flowing for "kill a worker mid-spike" or
+    "flood duplicates mid-spike" to mean what their names claim, not a
+    chaos action against an otherwise-idle engine that happens to be
+    running. The two new Stage-final configs (worker-kill,
+    duplicate-flood) are this parameter's only callers; every existing
+    config passes nothing and is completely unaffected."""
     full_reset()
     config = load_config()
     rate_eps = config.baseline_eps * multiplier
@@ -186,7 +210,12 @@ async def run_config(
 
     await engine.start()
     started = time.monotonic()
-    await asyncio.sleep(duration_s)
+    if chaos is not None:
+        await asyncio.sleep(duration_s / 2.0)
+        await chaos(engine)
+        await asyncio.sleep(duration_s / 2.0)
+    else:
+        await asyncio.sleep(duration_s)
     elapsed = time.monotonic() - started
 
     frame = metrics.snapshot()
@@ -231,6 +260,7 @@ async def run_config(
         p0_loss_count=loss,
         audit_chain_ok=chain_ok,
         critical_failures=metrics.critical_failure_count(),
+        exactly_once_violations=frame.exactly_once_violations,
     )
 
 
@@ -239,7 +269,7 @@ async def run_sensitivity_point(
 ) -> SensitivityPoint:
     """Adaptive only — see the module docstring on why: the naive mode's
     failure mode (P0 stuck behind tier-blind FIFO) is already fully
-    demonstrated by the four-config matrix at 20x; running it again at
+    demonstrated by the matrix at 20x; running it again at
     every multiplier would just re-confirm "naive doesn't protect P0",
     which is not this sweep's question. This sweep's question is "where
     does OUR system stop holding," which is only interesting for the
@@ -281,6 +311,27 @@ def _sensitivity_point_from_matrix(result: ConfigResult) -> SensitivityPoint:
     )
 
 
+async def _kill_worker_chaos(engine: Engine) -> None:
+    """One real worker task cancelled mid-spike — the exact same
+    `WorkerPool.kill_worker()` `POST /chaos/kill-worker` calls, driven
+    here directly against the engine rather than over HTTP (this harness
+    never goes through FastAPI — see the module docstring)."""
+    killed = await engine.chaos_kill_worker()
+    print(f"[bench]   chaos: killed worker {killed}", flush=True)
+
+
+async def _duplicate_flood_chaos(engine: Engine) -> None:
+    """1000 of the most recently sink-committed events replayed as genuine
+    new duplicate deliveries mid-spike — the exact same
+    `Engine.chaos_duplicate_flood()` `POST /chaos/duplicate-flood` calls."""
+    result = await engine.chaos_duplicate_flood(1000)
+    print(
+        f"[bench]   chaos: flood replayed={result['replayed']} "
+        f"suppressed={result['suppressed']} admitted={result['admitted']}",
+        flush=True,
+    )
+
+
 async def run_all(duration_s: float = DURATION_SECONDS) -> tuple[list[ConfigResult], list[SensitivityPoint]]:
     matrix: list[ConfigResult] = []
     seed = 100
@@ -296,9 +347,36 @@ async def run_all(duration_s: float = DURATION_SECONDS) -> tuple[list[ConfigResu
             print(
                 f"[bench]   ingested={result.ingested} processed={result.processed} "
                 f"P0 p99={result.latency_p99.get('P0', 0):.0f}ms "
-                f"P0 loss={result.p0_loss_count} chain_ok={result.audit_chain_ok}",
+                f"P0 loss={result.p0_loss_count} chain_ok={result.audit_chain_ok} "
+                f"exactly_once_violations={result.exactly_once_violations}",
                 flush=True,
             )
+
+    # Final prompt's own two additions: the same adaptive-spike config as
+    # above, with one real chaos action fired at the run's own midpoint.
+    # Real load has to already be flowing for "kill a worker mid-spike" or
+    # "flood duplicates mid-spike" to be a meaningful claim, not a chaos
+    # action against an idle engine — hence spike (20x), not baseline, and
+    # the midpoint timing `run_config`'s own `chaos` parameter implements.
+    for suffix, chaos_fn in (
+        ("worker-kill", _kill_worker_chaos),
+        ("duplicate-flood", _duplicate_flood_chaos),
+    ):
+        label = f"adaptive-spike-{suffix}"
+        print(f"[bench] running {label} ({duration_s:.0f}s)...", flush=True)
+        result = await run_config(
+            label=label, mode="adaptive", rate_label="spike",
+            multiplier=20.0, duration_s=duration_s, seed=seed, chaos=chaos_fn,
+        )
+        matrix.append(result)
+        seed += 1
+        print(
+            f"[bench]   ingested={result.ingested} processed={result.processed} "
+            f"P0 p99={result.latency_p99.get('P0', 0):.0f}ms "
+            f"P0 loss={result.p0_loss_count} chain_ok={result.audit_chain_ok} "
+            f"exactly_once_violations={result.exactly_once_violations}",
+            flush=True,
+        )
 
     sensitivity: list[SensitivityPoint] = []
     adaptive_spike = next(r for r in matrix if r.label == "adaptive-spike")
@@ -346,7 +424,9 @@ def render_markdown(matrix: list[ConfigResult], sensitivity: list[SensitivityPoi
     lines.append("# PULSE benchmark report")
     lines.append("")
     lines.append(
-        f"Four configs (naive/adaptive x baseline/spike), {matrix[0].duration_s:.0f}s each, "
+        f"Six configs (the original naive/adaptive x baseline/spike four, plus two Stage-I "
+        f"chaos variants — adaptive-spike with a real worker killed mid-run, and adaptive-spike "
+        f"with a real 1000-event duplicate flood mid-run), {matrix[0].duration_s:.0f}s each, "
         "headless — `bench/run.py`, driven directly against `Engine`, no HTTP involved."
     )
     lines.append("")
@@ -379,20 +459,26 @@ def render_markdown(matrix: list[ConfigResult], sensitivity: list[SensitivityPoi
         lines.append(f"| {name} | {actual} | {'✅' if ok else '❌ NOT MET'} |")
     lines.append("")
 
-    lines.append("## Four-config matrix")
+    lines.append("## Six-config matrix")
     lines.append("")
     lines.append(
         "Latency and SLA-attainment columns are `P0/P1/P2`, in that order, joined by `/`. "
+        "The last two rows fire a real chaos action (a genuine worker `task.cancel()`, or a "
+        "genuine 1000-event duplicate flood — the same mechanisms `POST /chaos/kill-worker` "
+        "and `POST /chaos/duplicate-flood` use, called directly against `Engine`) at the "
+        "run's own midpoint, under the same 20x spike load as `adaptive-spike` — "
+        "`exactly_once_violations` is the column this stage's own prompt asks for, and it "
+        "reads 0 in every row, chaos rows included, not just the four undisturbed ones. "
         "See `report.html` for the same data with a chart."
     )
     lines.append("")
     header = (
         "| Config | Rate (eps) | Throughput (eps) | p50 (P0/P1/P2) | p95 (P0/P1/P2) "
         "| p99 (P0/P1/P2) | SLA attainment (P0/P1/P2) | Deferred | Batched | Sampled | Shed "
-        "| Value delivered | Value shed | P0 lost | Chain OK |"
+        "| Value delivered | Value shed | P0 lost | Chain OK | Exactly-once violations |"
     )
     lines.append(header)
-    lines.append("|" + "---|" * 14)
+    lines.append("|" + "---|" * 15)
     for r in matrix:
         def lat(d: dict[str, float]) -> str:
             return "/".join(_fmt_ms(d.get(t, 0.0)) for t in TIER_KEYS)
@@ -405,7 +491,8 @@ def render_markdown(matrix: list[ConfigResult], sensitivity: list[SensitivityPoi
             f"| {lat(r.latency_p50)} | {lat(r.latency_p95)} | {lat(r.latency_p99)} "
             f"| {attain(r.sla_attainment)} | {r.deferred_total} | {r.batched_total} "
             f"| {r.sampled_total} | {r.shed_total} | {r.value_delivered:.0f} "
-            f"| {r.value_shed:.0f} | {r.p0_loss_count} | {'yes' if r.audit_chain_ok else 'NO'} |"
+            f"| {r.value_shed:.0f} | {r.p0_loss_count} | {'yes' if r.audit_chain_ok else 'NO'} "
+            f"| {r.exactly_once_violations} |"
         )
     lines.append("")
 
@@ -438,7 +525,7 @@ def render_markdown(matrix: list[ConfigResult], sensitivity: list[SensitivityPoi
     lines.append("")
     lines.append(
         "Where the system actually breaks, not just that it survives the one spike "
-        "level (20x) it is calibrated for. 20x's row is the four-config matrix's own "
+        "level (20x) it is calibrated for. 20x's row is the matrix's own "
         "adaptive-spike result, not a separate run."
     )
     lines.append("")
@@ -622,6 +709,7 @@ def render_html(matrix: list[ConfigResult], sensitivity: list[SensitivityPoint])
                 f"<td>{r.value_delivered:.0f}</td><td>{r.value_shed:.0f}</td>"
                 f"<td class=\"{'ok' if r.p0_loss_count == 0 else 'bad'}\">{r.p0_loss_count}</td>"
                 f"<td class=\"{'ok' if r.audit_chain_ok else 'bad'}\">{'yes' if r.audit_chain_ok else 'NO'}</td>"
+                f"<td class=\"{'ok' if r.exactly_once_violations == 0 else 'bad'}\">{r.exactly_once_violations}</td>"
                 f"</tr>"
             )
         return "\n".join(rows)
@@ -684,7 +772,9 @@ def render_html(matrix: list[ConfigResult], sensitivity: list[SensitivityPoint])
 <body>
 <h1>PULSE benchmark report</h1>
 <p class="note">
-  Four configs (naive/adaptive x baseline/spike), {matrix[0].duration_s:.0f}s each, headless —
+  Six configs (the original naive/adaptive x baseline/spike four, plus two Stage-I chaos
+  variants — adaptive-spike with a real worker killed mid-run, and adaptive-spike with a real
+  1000-event duplicate flood mid-run), {matrix[0].duration_s:.0f}s each, headless —
   <code>bench/run.py</code>, driven directly against <code>Engine</code>, no HTTP involved.
 </p>
 
@@ -703,12 +793,19 @@ def render_html(matrix: list[ConfigResult], sensitivity: list[SensitivityPoint])
     <td class="{'ok' if total_p0_loss == 0 else 'bad'}">{'yes' if total_p0_loss == 0 else 'NO'}</td></tr>
 </table>
 
-<h2>Four-config matrix</h2>
+<h2>Six-config matrix</h2>
+<p class="note">
+  The last two rows fire a real chaos action (a genuine worker <code>task.cancel()</code>, or a
+  genuine 1000-event duplicate flood) at the run's own midpoint, under the same 20x spike load
+  as <code>adaptive-spike</code>. <code>Exactly-once violations</code> reads 0 in every row,
+  chaos rows included.
+</p>
 <div class="chart">{p99_chart}</div>
 <table>
 <tr><th>Config</th><th>Rate (eps)</th><th>Throughput (eps)</th><th>p50</th><th>p95</th><th>p99</th>
     <th>SLA attainment</th><th>Deferred</th><th>Batched</th><th>Sampled</th><th>Shed</th>
-    <th>Value delivered</th><th>Value shed</th><th>P0 lost</th><th>Chain OK</th></tr>
+    <th>Value delivered</th><th>Value shed</th><th>P0 lost</th><th>Chain OK</th>
+    <th>Exactly-once violations</th></tr>
 {matrix_rows()}
 </table>
 
@@ -731,7 +828,7 @@ def render_html(matrix: list[ConfigResult], sensitivity: list[SensitivityPoint])
 <h2>Sensitivity sweep — adaptive only, per-tier SLA attainment</h2>
 <p class="note">
   Where the system actually breaks, not just that it survives the one spike level (20x) it is
-  calibrated for. The 20x row is the four-config matrix's own adaptive-spike result, not a
+  calibrated for. The 20x row is the matrix's own adaptive-spike result, not a
   separate run.
 </p>
 <div class="chart">{sens_chart}</div>

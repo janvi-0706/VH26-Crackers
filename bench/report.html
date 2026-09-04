@@ -26,7 +26,9 @@
 <body>
 <h1>PULSE benchmark report</h1>
 <p class="note">
-  Four configs (naive/adaptive x baseline/spike), 90s each, headless —
+  Six configs (the original naive/adaptive x baseline/spike four, plus two Stage-I chaos
+  variants — adaptive-spike with a real worker killed mid-run, and adaptive-spike with a real
+  1000-event duplicate flood mid-run), 90s each, headless —
   <code>bench/run.py</code>, driven directly against <code>Engine</code>, no HTTP involved.
 </p>
 
@@ -37,15 +39,21 @@
 <h2>Target check</h2>
 <table>
 <tr><th>Target</th><th>Result</th><th>Met?</th></tr>
-<tr><td>naive-at-spike P0 p99 in the seconds</td><td>767ms</td>
+<tr><td>naive-at-spike P0 p99 in the seconds</td><td>842ms</td>
     <td class="bad">NO</td></tr>
-<tr><td>adaptive-at-spike P0 p99 under 200ms</td><td>290ms</td>
+<tr><td>adaptive-at-spike P0 p99 under 200ms</td><td>418ms</td>
     <td class="bad">NO</td></tr>
-<tr><td>zero critical (P0) events lost, any config</td><td>0 lost across 4 configs</td>
+<tr><td>zero critical (P0) events lost, any config</td><td>0 lost across 6 configs</td>
     <td class="ok">yes</td></tr>
 </table>
 
-<h2>Four-config matrix</h2>
+<h2>Six-config matrix</h2>
+<p class="note">
+  The last two rows fire a real chaos action (a genuine worker <code>task.cancel()</code>, or a
+  genuine 1000-event duplicate flood) at the run's own midpoint, under the same 20x spike load
+  as <code>adaptive-spike</code>. <code>Exactly-once violations</code> reads 0 in every row,
+  chaos rows included.
+</p>
 <div class="chart"><svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace">
 <text x="320.0" y="16" text-anchor="middle" font-size="13" font-weight="700" fill="#e6e9f2">P0/P1/P2 p99 latency by config (log scale — naive-spike is seconds, everything else is ms)</text>
 <line x1="56" y1="260.0" x2="620" y2="260.0" stroke="#232a3b" stroke-dasharray="3 3"/>
@@ -54,22 +62,30 @@
 <line x1="56" y1="87.5" x2="620" y2="87.5" stroke="#232a3b" stroke-dasharray="3 3"/>
 <line x1="56" y1="30.0" x2="620" y2="30.0" stroke="#232a3b" stroke-dasharray="3 3"/>
 <text x="48" y="38" text-anchor="end" font-size="10" fill="#5b6478">p99 (ms, log)</text>
-<rect x="73.6" y="132.6" width="28.2" height="127.4" fill="#60a5fa"/>
-<rect x="108.9" y="33.5" width="28.2" height="226.5" fill="#c084fc"/>
-<rect x="144.1" y="35.2" width="28.2" height="224.8" fill="#fb923c"/>
-<text x="126.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
-<rect x="214.6" y="91.4" width="28.2" height="168.6" fill="#60a5fa"/>
-<rect x="249.9" y="74.7" width="28.2" height="185.3" fill="#c084fc"/>
-<rect x="285.1" y="79.7" width="28.2" height="180.3" fill="#fb923c"/>
-<text x="267.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
-<rect x="355.6" y="132.8" width="28.2" height="127.2" fill="#60a5fa"/>
-<rect x="390.9" y="143.8" width="28.2" height="116.2" fill="#c084fc"/>
-<rect x="426.1" y="173.7" width="28.2" height="86.3" fill="#fb923c"/>
-<text x="408.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
-<rect x="496.6" y="116.0" width="28.2" height="144.0" fill="#60a5fa"/>
-<rect x="531.9" y="100.7" width="28.2" height="159.3" fill="#c084fc"/>
-<rect x="567.1" y="65.8" width="28.2" height="194.2" fill="#fb923c"/>
-<text x="549.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="67.8" y="101.9" width="18.8" height="158.1" fill="#60a5fa"/>
+<rect x="91.2" y="114.9" width="18.8" height="145.1" fill="#c084fc"/>
+<rect x="114.8" y="152.7" width="18.8" height="107.3" fill="#fb923c"/>
+<text x="103.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
+<rect x="161.8" y="60.8" width="18.8" height="199.2" fill="#60a5fa"/>
+<rect x="185.2" y="42.4" width="18.8" height="217.6" fill="#c084fc"/>
+<rect x="208.8" y="47.5" width="18.8" height="212.5" fill="#fb923c"/>
+<text x="197.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
+<rect x="255.8" y="100.2" width="18.8" height="159.8" fill="#60a5fa"/>
+<rect x="279.2" y="34.1" width="18.8" height="225.9" fill="#c084fc"/>
+<rect x="302.8" y="144.4" width="18.8" height="115.6" fill="#fb923c"/>
+<text x="291.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
+<rect x="349.8" y="81.4" width="18.8" height="178.6" fill="#60a5fa"/>
+<rect x="373.2" y="69.6" width="18.8" height="190.4" fill="#c084fc"/>
+<rect x="396.8" y="56.6" width="18.8" height="203.4" fill="#fb923c"/>
+<text x="385.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="443.8" y="85.9" width="18.8" height="174.1" fill="#60a5fa"/>
+<rect x="467.2" y="76.1" width="18.8" height="183.9" fill="#c084fc"/>
+<rect x="490.8" y="48.3" width="18.8" height="211.7" fill="#fb923c"/>
+<text x="479.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike-worker-kill</text>
+<rect x="537.8" y="88.6" width="18.8" height="171.4" fill="#60a5fa"/>
+<rect x="561.2" y="76.2" width="18.8" height="183.8" fill="#c084fc"/>
+<rect x="584.8" y="57.2" width="18.8" height="202.8" fill="#fb923c"/>
+<text x="573.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike-duplicate-flood</text>
 <rect x="56" y="286" width="8" height="8" fill="#60a5fa"/>
 <text x="67" y="294" font-size="10" fill="#8b93a7">P0</text>
 <rect x="88" y="286" width="8" height="8" fill="#c084fc"/>
@@ -80,11 +96,14 @@
 <table>
 <tr><th>Config</th><th>Rate (eps)</th><th>Throughput (eps)</th><th>p50</th><th>p95</th><th>p99</th>
     <th>SLA attainment</th><th>Deferred</th><th>Batched</th><th>Sampled</th><th>Shed</th>
-    <th>Value delivered</th><th>Value shed</th><th>P0 lost</th><th>Chain OK</th></tr>
-<tr><td>naive-baseline</td><td>16.6</td><td>16.2</td><td>P0: 120ms<br>P1: 79ms<br>P2: 21ms</td><td>P0: 140ms<br>P1: 346ms<br>P2: 30ms</td><td>P0: 150ms<br>P1: 7.50s<br>P2: 7.02s</td><td>P0: 100.0%<br>P1: 95.0%<br>P2: 100.0%</td><td>24</td><td>156</td><td>0</td><td>24</td><td>24950</td><td>72</td><td class="ok">0</td><td class="ok">yes</td></tr>
-<tr><td>naive-spike</td><td>333.0</td><td>194.1</td><td>P0: 656ms<br>P1: 719ms<br>P2: 624ms</td><td>P0: 732ms<br>P1: 1.17s<br>P2: 889ms</td><td>P0: 767ms<br>P1: 1.48s<br>P2: 1.22s</td><td>P0: 1.8%<br>P1: 100.0%<br>P2: 100.0%</td><td>71</td><td>14520</td><td>12140</td><td>16</td><td>160866</td><td>68</td><td class="ok">0</td><td class="ok">yes</td></tr>
-<tr><td>adaptive-baseline</td><td>16.6</td><td>16.6</td><td>P0: 120ms<br>P1: 80ms<br>P2: 21ms</td><td>P0: 140ms<br>P1: 92ms<br>P2: 26ms</td><td>P0: 149ms<br>P1: 97ms<br>P2: 29ms</td><td>P0: 100.0%<br>P1: 100.0%<br>P2: 100.0%</td><td>1</td><td>123</td><td>0</td><td>0</td><td>24113</td><td>0</td><td class="ok">0</td><td class="ok">yes</td></tr>
-<tr><td>adaptive-spike</td><td>333.0</td><td>172.2</td><td>P0: 127ms<br>P1: 170ms<br>P2: 187ms</td><td>P0: 204ms<br>P1: 407ms<br>P2: 1.86s</td><td>P0: 290ms<br>P1: 531ms<br>P2: 2.11s</td><td>P0: 99.5%<br>P1: 100.0%<br>P2: 100.0%</td><td>12035</td><td>12441</td><td>214</td><td>88</td><td>469341</td><td>292</td><td class="ok">0</td><td class="ok">yes</td></tr>
+    <th>Value delivered</th><th>Value shed</th><th>P0 lost</th><th>Chain OK</th>
+    <th>Exactly-once violations</th></tr>
+<tr><td>naive-baseline</td><td>16.6</td><td>16.6</td><td>P0: 117ms<br>P1: 81ms<br>P2: 18ms</td><td>P0: 189ms<br>P1: 129ms<br>P2: 34ms</td><td>P0: 209ms<br>P1: 134ms<br>P2: 37ms</td><td>P0: 97.1%<br>P1: 100.0%<br>P2: 100.0%</td><td>0</td><td>130</td><td>0</td><td>0</td><td>24538</td><td>0</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
+<tr><td>naive-spike</td><td>333.0</td><td>178.3</td><td>P0: 650ms<br>P1: 701ms<br>P2: 609ms</td><td>P0: 775ms<br>P1: 1.27s<br>P2: 924ms</td><td>P0: 842ms<br>P1: 1.57s<br>P2: 1.32s</td><td>P0: 6.6%<br>P1: 100.0%<br>P2: 100.0%</td><td>1751</td><td>13118</td><td>11055</td><td>166</td><td>154279</td><td>558</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
+<tr><td>adaptive-baseline</td><td>16.6</td><td>16.6</td><td>P0: 143ms<br>P1: 79ms<br>P2: 31ms</td><td>P0: 206ms<br>P1: 130ms<br>P2: 48ms</td><td>P0: 221ms<br>P1: 2.07s<br>P2: 49ms</td><td>P0: 93.8%<br>P1: 100.0%<br>P2: 100.0%</td><td>4</td><td>171</td><td>0</td><td>2</td><td>23147</td><td>6</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
+<tr><td>adaptive-spike</td><td>333.0</td><td>163.9</td><td>P0: 144ms<br>P1: 154ms<br>P2: 123ms</td><td>P0: 267ms<br>P1: 422ms<br>P2: 592ms</td><td>P0: 418ms<br>P1: 625ms<br>P2: 971ms</td><td>P0: 89.4%<br>P1: 100.0%<br>P2: 100.0%</td><td>11755</td><td>11717</td><td>233</td><td>149</td><td>418909</td><td>493</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
+<tr><td>adaptive-spike-worker-kill</td><td>333.0</td><td>175.8</td><td>P0: 141ms<br>P1: 153ms<br>P2: 126ms</td><td>P0: 249ms<br>P1: 390ms<br>P2: 656ms</td><td>P0: 359ms<br>P1: 500ms<br>P2: 1.28s</td><td>P0: 89.6%<br>P1: 100.0%<br>P2: 100.0%</td><td>12585</td><td>12848</td><td>18</td><td>103</td><td>425520</td><td>323</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
+<tr><td>adaptive-spike-duplicate-flood</td><td>333.0</td><td>175.7</td><td>P0: 142ms<br>P1: 155ms<br>P2: 124ms</td><td>P0: 249ms<br>P1: 376ms<br>P2: 611ms</td><td>P0: 328ms<br>P1: 499ms<br>P2: 951ms</td><td>P0: 89.2%<br>P1: 100.0%<br>P2: 100.0%</td><td>13234</td><td>12860</td><td>32</td><td>25</td><td>421493</td><td>81</td><td class="ok">0</td><td class="ok">yes</td><td class="ok">0</td></tr>
 </table>
 
 <h2>Cost model</h2>
@@ -104,18 +123,24 @@
 <line x1="56" y1="87.5" x2="620" y2="87.5" stroke="#232a3b" stroke-dasharray="3 3"/>
 <line x1="56" y1="30.0" x2="620" y2="30.0" stroke="#232a3b" stroke-dasharray="3 3"/>
 <text x="48" y="38" text-anchor="end" font-size="10" fill="#5b6478">worker-seconds</text>
-<rect x="79.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
-<rect x="126.5" y="250.0" width="37.6" height="10.0" fill="#f87171"/>
-<text x="126.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
-<rect x="220.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
-<rect x="267.5" y="60.0" width="37.6" height="200.0" fill="#f87171"/>
-<text x="267.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
-<rect x="361.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
-<rect x="408.5" y="250.0" width="37.6" height="10.0" fill="#f87171"/>
-<text x="408.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
-<rect x="502.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
-<rect x="549.5" y="60.0" width="37.6" height="200.0" fill="#f87171"/>
-<text x="549.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="71.7" y="155.9" width="25.1" height="104.1" fill="#34d399"/>
+<rect x="103.0" y="250.0" width="25.1" height="10.0" fill="#f87171"/>
+<text x="103.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
+<rect x="165.7" y="155.8" width="25.1" height="104.2" fill="#34d399"/>
+<rect x="197.0" y="60.0" width="25.1" height="200.0" fill="#f87171"/>
+<text x="197.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
+<rect x="259.7" y="155.9" width="25.1" height="104.1" fill="#34d399"/>
+<rect x="291.0" y="250.0" width="25.1" height="10.0" fill="#f87171"/>
+<text x="291.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
+<rect x="353.7" y="155.8" width="25.1" height="104.2" fill="#34d399"/>
+<rect x="385.0" y="60.0" width="25.1" height="200.0" fill="#f87171"/>
+<text x="385.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="447.7" y="155.9" width="25.1" height="104.1" fill="#34d399"/>
+<rect x="479.0" y="60.0" width="25.1" height="200.0" fill="#f87171"/>
+<text x="479.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike-worker-kill</text>
+<rect x="541.7" y="155.8" width="25.1" height="104.2" fill="#34d399"/>
+<rect x="573.0" y="60.0" width="25.1" height="200.0" fill="#f87171"/>
+<text x="573.0" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike-duplicate-flood</text>
 <rect x="56" y="286" width="8" height="8" fill="#34d399"/>
 <text x="67" y="294" font-size="10" fill="#8b93a7">actual (fixed 6 workers)</text>
 <rect x="264" y="286" width="8" height="8" fill="#f87171"/>
@@ -128,12 +153,14 @@
 <tr><td>naive-spike</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
 <tr><td>adaptive-baseline</td><td>540</td><td>52</td><td>$0.0540</td><td>$0.0052</td><td>0.10x</td></tr>
 <tr><td>adaptive-spike</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
+<tr><td>adaptive-spike-worker-kill</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
+<tr><td>adaptive-spike-duplicate-flood</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
 </table>
 
 <h2>Sensitivity sweep — adaptive only, per-tier SLA attainment</h2>
 <p class="note">
   Where the system actually breaks, not just that it survives the one spike level (20x) it is
-  calibrated for. The 20x row is the four-config matrix's own adaptive-spike result, not a
+  calibrated for. The 20x row is the matrix's own adaptive-spike result, not a
   separate run.
 </p>
 <div class="chart"><svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace">
@@ -152,13 +179,13 @@
 <text x="136.6" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">10x</text>
 <text x="297.7" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">20x</text>
 <text x="620.0" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">40x</text>
-<polyline points="56.0,30.0 136.6,30.0 297.7,31.1 620.0,256.3" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
-<circle cx="56.0" cy="30.0" r="3" fill="#60a5fa"/>
-<circle cx="136.6" cy="30.0" r="3" fill="#60a5fa"/>
-<circle cx="297.7" cy="31.1" r="3" fill="#60a5fa"/>
+<polyline points="56.0,44.2 136.6,44.0 297.7,54.9 620.0,256.3" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
+<circle cx="56.0" cy="44.2" r="3" fill="#60a5fa"/>
+<circle cx="136.6" cy="44.0" r="3" fill="#60a5fa"/>
+<circle cx="297.7" cy="54.9" r="3" fill="#60a5fa"/>
 <circle cx="620.0" cy="256.3" r="3" fill="#60a5fa"/>
-<polyline points="56.0,30.3 136.6,30.0 297.7,30.0 620.0,30.0" fill="none" stroke="#c084fc" stroke-width="2.5"/>
-<circle cx="56.0" cy="30.3" r="3" fill="#c084fc"/>
+<polyline points="56.0,31.3 136.6,30.0 297.7,30.0 620.0,30.0" fill="none" stroke="#c084fc" stroke-width="2.5"/>
+<circle cx="56.0" cy="31.3" r="3" fill="#c084fc"/>
 <circle cx="136.6" cy="30.0" r="3" fill="#c084fc"/>
 <circle cx="297.7" cy="30.0" r="3" fill="#c084fc"/>
 <circle cx="620.0" cy="30.0" r="3" fill="#c084fc"/>
@@ -177,10 +204,10 @@
 <table>
 <tr><th>Multiplier</th><th>Rate (eps)</th><th>P0 SLA</th><th>P1 SLA</th><th>P2 SLA</th>
     <th>P0 p99</th><th>P1 p99</th><th>P2 p99</th><th>P0 lost</th></tr>
-<tr><td>5x</td><td>83.2</td><td>100.0%</td><td>99.9%</td><td>100.0%</td><td>134ms</td><td>87ms</td><td>47ms</td><td class="ok">0</td></tr>
-<tr><td>10x</td><td>166.5</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>139ms</td><td>124ms</td><td>96ms</td><td class="ok">0</td></tr>
-<tr><td>20x</td><td>333.0</td><td>99.5%</td><td>100.0%</td><td>100.0%</td><td>290ms</td><td>531ms</td><td>2.11s</td><td class="ok">0</td></tr>
-<tr><td>40x</td><td>666.0</td><td>4.1%</td><td>100.0%</td><td>100.0%</td><td>41.39s</td><td>79ms</td><td>31ms</td><td class="ok">0</td></tr>
+<tr><td>5x</td><td>83.2</td><td>94.0%</td><td>99.4%</td><td>100.0%</td><td>220ms</td><td>133ms</td><td>47ms</td><td class="ok">0</td></tr>
+<tr><td>10x</td><td>166.5</td><td>94.1%</td><td>100.0%</td><td>100.0%</td><td>217ms</td><td>156ms</td><td>123ms</td><td class="ok">0</td></tr>
+<tr><td>20x</td><td>333.0</td><td>89.4%</td><td>100.0%</td><td>100.0%</td><td>418ms</td><td>625ms</td><td>971ms</td><td class="ok">0</td></tr>
+<tr><td>40x</td><td>666.0</td><td>4.1%</td><td>100.0%</td><td>100.0%</td><td>45.88s</td><td>107ms</td><td>30ms</td><td class="ok">0</td></tr>
 </table>
 
 </body>
