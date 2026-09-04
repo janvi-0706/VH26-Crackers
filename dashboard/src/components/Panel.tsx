@@ -1,25 +1,28 @@
 import type { ReactNode } from "react";
 
 /**
- * The layout system, built first and on purpose (per the Stage B prompt):
- * roughly ten panels land here over the next several stages, and a shared
- * sizing vocabulary matters more up front than the three charts that ship
- * with it today.
+ * Stage H's own "final layout" pass: everything has to fit one 1920x1080
+ * screen with no page scroll, at the same time as two more panels arrive.
+ * The old system (a `size` enum picking a column span, `auto-rows-[220px]`,
+ * `gridAutoFlow: dense`, letting however many rows the content happened to
+ * need stack up) could not guarantee that — "however many rows fit" was
+ * never actually checked against "however many rows the viewport has".
  *
- * `size` maps to a fixed span on the 12-column grid defined by
- * `PanelGrid` below. Because every panel only ever claims its own span,
- * adding the 11th panel cannot reflow the 10 already on screen — it just
- * takes the next slot the grid's auto-placement finds.
+ * The fix: `PanelGrid` now claims the *entire* remaining viewport height
+ * (its parent is `flex-1 min-h-0` inside an `h-screen overflow-hidden`
+ * page — see App.tsx) and divides it into a FIXED number of rows via
+ * `grid-rows-N`, each an equal `1fr` share of whatever height is actually
+ * left after the header and control bar. That is what makes "fits without
+ * scrolling" true by construction, on any real screen size, rather than a
+ * fixed pixel guess that happens to work at exactly one resolution.
+ * `Panel` itself now takes a plain 1-12 column count instead of a named
+ * size — with a deliberately fixed row count, the interesting layout
+ * decision is only ever "how wide", never "how tall".
  */
-export type PanelSize = "sm" | "md" | "lg" | "wide" | "tall" | "full";
-
-const SIZE_CLASSES: Record<PanelSize, string> = {
-  sm: "col-span-12 sm:col-span-6 lg:col-span-3 row-span-1",
-  md: "col-span-12 sm:col-span-6 lg:col-span-4 row-span-1",
-  lg: "col-span-12 lg:col-span-6 row-span-1",
-  wide: "col-span-12 lg:col-span-8 row-span-1",
-  tall: "col-span-12 sm:col-span-6 lg:col-span-4 row-span-2",
-  full: "col-span-12 row-span-1",
+const COL_SPAN: Record<number, string> = {
+  1: "col-span-1", 2: "col-span-2", 3: "col-span-3", 4: "col-span-4",
+  5: "col-span-5", 6: "col-span-6", 7: "col-span-7", 8: "col-span-8",
+  9: "col-span-9", 10: "col-span-10", 11: "col-span-11", 12: "col-span-12",
 };
 
 export type PanelAccent = "neutral" | "good" | "bad" | "warn";
@@ -33,7 +36,10 @@ const ACCENT_BORDER: Record<PanelAccent, string> = {
 
 export interface PanelProps {
   title: string;
-  size?: PanelSize;
+  /** 1-12: how many of the grid's 12 columns this panel claims this row.
+   * Row height is never chosen per-panel — see this module's own
+   * docstring on why that is now PanelGrid's job alone. */
+  cols?: number;
   accent?: PanelAccent;
   /** Small right-aligned status text next to the title, e.g. a live value. */
   headline?: string;
@@ -43,7 +49,7 @@ export interface PanelProps {
 
 export function Panel({
   title,
-  size = "md",
+  cols = 4,
   accent = "neutral",
   headline,
   footer,
@@ -51,20 +57,20 @@ export function Panel({
 }: PanelProps) {
   return (
     <section
-      className={`${SIZE_CLASSES[size]} flex flex-col rounded-xl border bg-surface-panel
-        ${ACCENT_BORDER[accent]} shadow-sm shadow-black/20 overflow-hidden`}
+      className={`${COL_SPAN[cols]} flex flex-col rounded-xl border bg-surface-panel
+        ${ACCENT_BORDER[accent]} shadow-sm shadow-black/20 overflow-hidden min-h-0`}
     >
-      <header className="flex items-baseline justify-between gap-3 border-b border-surface-border px-4 py-2.5">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+      <header className="flex shrink-0 items-baseline justify-between gap-3 border-b border-surface-border px-3 py-1.5">
+        <h2 className="text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
           {title}
         </h2>
         {headline && (
-          <span className="font-mono text-sm text-ink-muted tabular-nums">{headline}</span>
+          <span className="font-mono text-xs text-ink-muted tabular-nums">{headline}</span>
         )}
       </header>
-      <div className="flex-1 min-h-0 p-3">{children}</div>
+      <div className="min-h-0 flex-1 p-2">{children}</div>
       {footer && (
-        <footer className="border-t border-surface-border px-4 py-2 text-xs text-ink-faint">
+        <footer className="shrink-0 border-t border-surface-border px-3 py-1 text-[10px] text-ink-faint">
           {footer}
         </footer>
       )}
@@ -72,13 +78,18 @@ export function Panel({
   );
 }
 
-/** The 12-column grid every Panel drops into. Fixed row height so a panel's
- * span (via row-span) is predictable instead of depending on content. */
-export function PanelGrid({ children }: { children: ReactNode }) {
+/** Fills whatever height its parent gives it (see App.tsx: a flex-1
+ * min-h-0 child of an h-screen overflow-hidden page) and divides that
+ * height into exactly `rows` equal tracks. Panels are declared in the
+ * exact row-major order they should render in; as long as each row's
+ * `cols` values sum to 12, plain (non-dense) grid auto-flow places them
+ * exactly where intended — no `gridAutoFlow: dense` repacking needed once
+ * the layout is planned up front instead of left emergent. */
+export function PanelGrid({ children, rows = 4 }: { children: ReactNode; rows?: number }) {
   return (
     <div
-      className="grid grid-cols-12 gap-4 auto-rows-[220px]"
-      style={{ gridAutoFlow: "dense" }}
+      className="grid h-full grid-cols-12 gap-3"
+      style={{ gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}
     >
       {children}
     </div>

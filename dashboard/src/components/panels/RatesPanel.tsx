@@ -45,7 +45,7 @@ export function RatesPanel({ history }: { history: MetricsFrame[] }) {
   return (
     <Panel
       title="Offered / admitted / service rate"
-      size="wide"
+      cols={4}
       headline={latest ? `gap ${formatRate(Math.max(0, latest.offered_rate - latest.admitted_rate))}` : "—"}
     >
       <ResponsiveContainer width="100%" height="100%">

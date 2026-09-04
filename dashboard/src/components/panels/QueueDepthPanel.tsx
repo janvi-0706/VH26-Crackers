@@ -39,7 +39,7 @@ export function QueueDepthPanel({ history }: { history: MetricsFrame[] }) {
   });
 
   return (
-    <Panel title="Queue depth by tier" size="wide" headline={`${total} queued`}>
+    <Panel title="Queue depth by tier" cols={4} headline={`${total} queued`}>
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -12 }}>
           <CartesianGrid stroke="#232a3b" strokeDasharray="3 3" vertical={false} />

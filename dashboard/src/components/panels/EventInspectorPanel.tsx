@@ -39,7 +39,7 @@ export function EventInspectorPanel() {
   };
 
   return (
-    <Panel title="Event inspector" size="md">
+    <Panel title="Event inspector" cols={4}>
       <div className="flex h-full flex-col gap-2">
         <div className="flex gap-2">
           <input

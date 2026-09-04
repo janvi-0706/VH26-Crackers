@@ -138,3 +138,17 @@ export const RUNG_STYLE: readonly string[] = [
   "border-bad/40 bg-bad/15 text-bad", // SAMPLE_ROLLUP
   "border-bad/40 bg-bad/15 text-bad", // SHED
 ];
+
+/** config/tiers.yaml's own worker capacity (25 work-units/sec/worker,
+ * frozen since Stage A). Duplicated here for the same reason as the
+ * constants above — the cost-comparison panel needs it to turn
+ * MetricsFrame.offered_rate (real, work-units/sec) into "workers this load
+ * would need if linearly scaled", the same formula bench/run.py's own
+ * cost model uses, without a live config fetch. */
+export const WORKER_CAPACITY_UPS = 25;
+
+/** bench/run.py's own stated, illustrative rate — duplicated here so the
+ * live cost-comparison panel and the offline benchmark report tell the
+ * same dollar story. Not tied to any vendor's real pricing; the ratio
+ * between actual and naive-scaled cost is the argument, not this number. */
+export const COST_PER_WORKER_SECOND_USD = 0.36 / 3600;

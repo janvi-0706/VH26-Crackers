@@ -42,7 +42,7 @@ export function PressureGaugePanel({ latest }: { latest: MetricsFrame | null }) 
   const zone = zoneFor(clamped);
 
   return (
-    <Panel title="Pressure" size="sm" accent={hasData ? zone : "neutral"}>
+    <Panel title="Pressure" cols={2} accent={hasData ? zone : "neutral"}>
       <div className="flex h-full flex-col items-center justify-center gap-3">
         <div
           className={`font-mono text-4xl font-bold tabular-nums ${

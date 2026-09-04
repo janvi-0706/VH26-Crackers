@@ -30,7 +30,7 @@ export function LatencyByTierPanel({ history }: { history: MetricsFrame[] }) {
   });
 
   return (
-    <Panel title="p99 latency by tier" size="wide">
+    <Panel title="p99 latency by tier" cols={4}>
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -12 }}>
           <CartesianGrid stroke="#232a3b" strokeDasharray="3 3" vertical={false} />

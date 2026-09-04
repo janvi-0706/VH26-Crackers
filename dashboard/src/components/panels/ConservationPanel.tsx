@@ -43,7 +43,7 @@ export function ConservationPanel({ latest }: { latest: MetricsFrame | null }) {
   return (
     <Panel
       title="Conservation equation"
-      size="full"
+      cols={5}
       accent={!hasData ? "neutral" : broken ? "bad" : "good"}
     >
       <div

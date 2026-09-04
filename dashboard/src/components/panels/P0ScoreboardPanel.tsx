@@ -21,7 +21,7 @@ export function P0ScoreboardPanel({ latest }: { latest: MetricsFrame | null }) {
       : "text-bad";
 
   return (
-    <Panel title="P0 p99 vs 200ms target" size="sm" accent={accent}>
+    <Panel title="P0 p99 vs 200ms target" cols={3} accent={accent}>
       <div className="flex h-full flex-col items-center justify-center gap-1">
         <div className={`font-mono text-5xl font-bold tabular-nums ${numberClass}`}>
           {hasData && p99 !== null ? formatMs(p99) : "—"}

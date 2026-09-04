@@ -105,7 +105,7 @@ export function WeightsPanel() {
   return (
     <Panel
       title="Routing weights"
-      size="wide"
+      cols={8}
       headline="live — /control/weights"
       footer={!loaded ? "loading current weights…" : undefined}
     >

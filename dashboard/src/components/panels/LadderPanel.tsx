@@ -20,7 +20,7 @@ export function LadderPanel({ latest }: { latest: MetricsFrame | null }) {
   const hasData = latest !== null && latest.ingested > 0;
 
   return (
-    <Panel title="Ladder rung by tier" size="sm">
+    <Panel title="Ladder rung by tier" cols={2}>
       <div className="flex h-full flex-col items-center justify-center gap-2.5">
         {TIERS.map((tier) => {
           const rung = latest?.ladder_rung[tier] ?? 0;

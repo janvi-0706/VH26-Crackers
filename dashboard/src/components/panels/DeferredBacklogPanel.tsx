@@ -28,7 +28,7 @@ export function DeferredBacklogPanel({ history }: { history: MetricsFrame[] }) {
   return (
     <Panel
       title="Deferred backlog"
-      size="lg"
+      cols={3}
       headline={latest ? `${latest.deferred_pending} parked` : "—"}
     >
       <ResponsiveContainer width="100%" height="100%">

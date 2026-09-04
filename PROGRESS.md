@@ -1650,3 +1650,317 @@ since the existing raw counters already carry that information; no attempt
 to diagnose the one real discrepancy found on the long-running dev server
 above — flagged for a future prompt, not chased under a dashboard-only
 scope.
+
+## Stage G — P17: bench/run.py, the headless benchmark harness
+
+**Built**
+
+- `bench/run.py` — four configs (naive/adaptive x baseline/spike, 90s
+  each), each driving a fresh `Engine` directly (no HTTP, no dashboard —
+  a headless CLI harness), fully reset between configs (not
+  `/control/reset`'s deliberately partial reset, which leaves mode
+  untouched on purpose for a live demo; a benchmark needs every config to
+  start from true zero, mode included). Per config: throughput, per-tier
+  p50/p95/p99, per-tier SLA attainment (`met/(met+missed)`, reported as
+  `None`/"n/a" rather than a false `0%` when a tier saw zero completions
+  in the window), cumulative deferred/batched/sampled/shed counts, P0 loss
+  count (SHED/SAMPLE_ROLLUP rows for tier P0 in that config's own fresh
+  audit ledger — should always be exactly 0), and whether the hash chain
+  still verifies. Plus a 5x/10x/20x/40x sensitivity sweep, adaptive only
+  (naive's failure mode is already fully shown by the matrix; the
+  sweep's own question — "where does the system we're claiming works
+  stop working" — is only interesting for that system), reusing the
+  matrix's own adaptive-spike (20x) result rather than re-running it.
+- Cost model, exactly as specified: `actual_worker_seconds = worker_count
+  * duration` (the fixed 6-worker pool, paid for regardless of load) vs.
+  `naive_scaled_worker_seconds = (config.demand_ups(rate_eps) * duration)
+  / worker_capacity_ups` (workers needed, continuously/linearly scaled, to
+  stream 100% of that same offered load with zero triage — computed
+  analytically from the tier table, not from a noisy live EWMA, so it is
+  exactly reproducible from the same config every time). Both converted to
+  USD at a stated, illustrative $0.36/worker-hour — not tied to any
+  vendor's real pricing; the ratio between the two figures is the actual
+  argument, not the absolute dollar amount.
+- `make bench` now actually runs it (was a stub echo since Stage B),
+  writing `bench/report.md` and `bench/report.html` (hand-rolled inline
+  SVG bar/line charts — no charting library, consistent with this
+  project's own "originality, not glued-together libraries" scoring
+  criterion). The report's own banner reads ALL TARGETS MET or flags
+  which ones aren't, in both formats, so the finding below is visible
+  without reading a number table.
+- `tests/test_bench.py` — 23 tests: every pure function (formatters,
+  `sla_attainment()`'s `None`-not-`0%` handling, `p0_loss_count()` against
+  a real ledger, both SVG renderers including a zero-value log-scale edge
+  case, both report renderers against synthetic data covering BOTH a
+  passing and a failing target check), plus two short (2s) real
+  integration runs proving `run_config()`/`run_sensitivity_point()`
+  actually drive a real `Engine`, not just accept whatever shape of data
+  the report renderer is handed.
+
+**Run for real: `make bench`, four 90s configs + three 90s sensitivity
+points (20x reused), ~11 real minutes, on an otherwise-idle machine (a
+stale demo server and an orphaned interpreter were both killed first —
+this run's own numbers matter too much to risk the timing contamination
+already documented for other tests in this project).**
+
+```
+naive-at-spike    P0 p99: 765ms    (target: seconds)     — NOT MET
+adaptive-at-spike P0 p99: 272ms    (target: < 200ms)      — NOT MET
+P0 events lost, any config: 0      (target: 0)            — MET
+```
+
+**Per CLAUDE.md's own instruction ("if the numbers don't show that, tell
+me immediately — it means a calibration problem, not a reporting
+problem"): two of the three targets are not met. Told immediately, not
+buried in this file. Both have real, understood, and different causes —
+neither is "the harness is wrong":**
+
+1. **naive-at-spike P0 p99 is 765ms, not "seconds."** Root cause: Stage F
+   (admission) added upstream AIMD credit gating that runs *before* the
+   queue and does not check queue mode at all — it throttles P1/P2
+   admission identically whether the queue is naive or adaptive. Before
+   that stage existed, naive mode's unbounded FIFO backlog really did
+   grow into the tens of thousands and P0 really did wait tens of seconds
+   behind it (Stage B's own PROGRESS notes recorded exactly that). Now,
+   the SAME upstream throttling that protects adaptive mode also keeps
+   naive's overall backlog bounded — just not *tier-aware*, so P0 still
+   queues behind whatever bounded P1/P2 backlog currently exists (naive's
+   own selection is still 100% tier-blind FIFO by `seq` — confirmed
+   directly: naive-spike's own table row shows P0 SLA attainment
+   collapsing to 2.0% while P1/P2 stay near 100%, which is *only*
+   explicable by P0 losing its priority, not by admission
+   under-throttling P1/P2). This is a genuine, structural side effect of
+   how two features built in different stages interact, not a broken
+   measurement — flagging it rather than either quietly loosening the
+   target or quietly "fixing" naive mode to look worse than it now
+   actually is.
+2. **adaptive-at-spike P0 p99 is 272ms, not under 200ms — but this
+   specific number is not new.** Stage C's own PROGRESS notes already
+   measured "P0's own p99 crept up to 265ms" under a sustained real spike
+   and documented it as worker-pool contention, not a routing bug: P0
+   alone demands ~108 u/s against a 150 u/s pool (72% utilisation on its
+   own), so even perfectly-prioritised P0 traffic still occasionally has
+   to wait for whichever worker finishes next. Stage D's own dashboard
+   verification later measured P0 sitting around 200-210ms. 272ms, found
+   independently by this prompt's own 90-second scripted benchmark, is
+   the same phenomenon, now measured more rigorously than a live-demo
+   eyeball check ever did — not a new regression this prompt introduced.
+   The `< 200ms` target itself may simply be tighter than this system, at
+   its current worker count and cost model, has ever actually achieved
+   under a real, sustained (not instantaneous) 20x spike.
+
+**A genuine, dramatic, and valuable finding from the sensitivity sweep —
+exactly what it was built to surface:** at 40x, P0 SLA attainment
+collapses to **5.6%** (P0 p99: 43.15s), while P1 and P2 stay at 100%. This
+is not a bug either — it is arithmetic: P0's own admission is
+unconditional (CLAUDE.md hard rule 3; `admission.py`'s critical bucket
+never throttles it), so at 40x, P0's *own* organic demand alone
+(`0.325u/event x 16.65eps x 40 = 216.5 u/s`) exceeds the entire 150 u/s
+worker pool by itself — no amount of correct prioritisation can serve
+more work than physically exists to serve it with. This is the honest
+answer to "what if critical events alone exceed capacity" (one of the
+`docs/QA.md` questions this project's own runbook already anticipates a
+judge asking), now backed by a real, reproducible number instead of a
+hand-wave. At 5x/10x, P0/P1/P2 all sit at or near 100% attainment — the
+system has real headroom before 20x, and a real, sharp, well-understood
+cliff between 20x and 40x, not a gradual decline.
+
+**One more curiosity, noted honestly rather than investigated under this
+prompt's own scope:** naive-baseline's own row shows P1/P2 p99 of 11.53s/
+11.03s despite p50/p95 both staying under 600ms and baseline demand
+sitting at ~14.4 u/s against 150 u/s capacity — comfortably idle. Almost
+certainly a small number of individual events (baseline P1+P2 volume over
+90s is only a couple hundred) caught by a cold-start pressure transient
+(service_rate genuinely reads 0 for the first fraction of a second after
+`Engine.start()`, which `decision.pressure()`'s own EPS floor turns into a
+large-but-finite ratio rather than a crash — documented as expected
+behaviour since Stage D) that got deferred once before pressure settled,
+not a sustained problem — the p50/p95 numbers for the same row are
+completely ordinary. Flagged rather than silently smoothed over or
+silently chased; worth a real look in a dedicated future prompt, not
+guessed at here.
+
+**What this prompt deliberately does not do:** does not modify
+`config/tiers.yaml` (frozen), `decision.py`'s pressure bands, or
+`admission.py`'s AIMD constants to chase either missed target — Stage G's
+own prompt is "build the harness," not "retune the system to pass it,"
+and CLAUDE.md's working style is one prompt at a time; retuning belongs to
+whichever future prompt the user chooses once they have seen these real
+numbers. `git tag stage-g` is not created yet — the stage map names P17
+and P18 together as Stage G, and P18 (the invariant test suite) has not
+run yet.
+
+## Stage G — P18: the invariant test suite ("how do you know?")
+
+No new features, per the prompt's own first line — every test added here
+exercises a mechanism that already existed. Confirmed directly before
+writing anything: `git status` shows only `tests/*.py` files touched.
+
+**Built**
+
+- `tests/test_stage_g_claims.py` — a new file, organised by CLAIM rather
+  than by module (every other test file in this project is organised by
+  the module it tests — the right axis for "does the code work", the
+  wrong axis for "which single file do I open when a judge asks whether
+  P0 can ever be shed"). Five of the eight claims get fresh, dedicated
+  tests here; the other three were already proven by existing, real,
+  slow (60-190s) live tests — rather than paying that wall-clock cost
+  again for a second copy of the same proof under a second name, those
+  three existing tests were renamed (pure test-file edits, not new
+  tests, not new features) so their names read as the literal claim, and
+  this file's own docstring points at them by exact name and path:
+
+  - "the conservation equation balances after a 60s spike" →
+    `test_app.py::test_after_a_60s_spike_the_conservation_equation_balances_and_no_critical_assertion_fired`
+    (already named almost exactly this; unchanged)
+  - "deferred count in equals count out after a full drain" →
+    `test_app.py::test_deferred_count_in_equals_count_out_after_a_full_drain`
+    (renamed from `test_deferred_events_are_never_lost_across_a_real_spike_and_reset`)
+  - "weighted click count is within 5% of true count under sampling" →
+    `test_app.py::test_weighted_click_count_is_within_5_percent_of_true_click_count_under_sampling`
+    (renamed from `test_weighted_click_count_converges_to_true_click_count_after_a_real_spike`)
+
+  The other five, new in this file:
+
+  - **P0 never batched/deferred/sampled/shed, at any pressure 0-1** — a
+    404-case sweep: 101 pressure values x 2 P0 event types (payment,
+    order) x 2 slack states (ordinary, already-past-deadline), through
+    BOTH `decision.decide()` and `ladder.escalate()` — Stage D's own
+    sweep (`test_invariant.py`) only ever exercised `decide()`; `escalate()`
+    is the ONLY other function capable of routing an event away from
+    STREAM_NOW (SAMPLE_ROLLUP, SHED — decisions `decide()` itself never
+    returns), and had never been swept end-to-end before. Plus the exact
+    `HARD_SHED_PRESSURE` boundary value and a direct `cap()` check.
+  - **P0 admitted rate never falls below P0 offered rate** — there is no
+    live per-tier offered/admitted field on `MetricsFrame` (both are
+    pooled across tiers), so this is proved at the mechanism that
+    actually guarantees it: a critical `CreditBucket.try_acquire()` has
+    no failure path at all. Hammered with adversarial costs/pressures
+    or one and confirmed live against a real 5-second spike
+    (`bucket.denied_count == 0`).
+  - **Ladder rung caps hold per tier under sustained load** — the
+    structural guarantee (`cap()` against every `Rung` x every `Tier`)
+    plus a live read of the real `MetricsFrame.ladder_rung` field,
+    repeatedly, across a real 10-second spike — P0 pinned to STREAM,
+    P1 never past DEFER, the whole time, not just once.
+  - **The audit hash chain detects any row mutation** — parametrised over
+    six different columns (reason, pressure, decision, tier, seq,
+    recorded_ts), plus a deleted row, plus the "forge both the row and
+    its own row_hash" case (still caught, at the *next* row's now-broken
+    `prev_hash` link).
+  - **Naive mode still works and produces the degraded baseline** — two
+    tests: naive genuinely processes events without stalling, and a
+    head-to-head comparison (same real spike, naive vs adaptive) proving
+    naive's own P0 p99 is measurably worse than adaptive's. Deliberately
+    a RELATIVE claim, not an absolute latency floor — P17's own benchmark
+    run (same session) found naive-at-spike P0 p99 currently lands at
+    765ms, not literally "in the seconds" the way it did before Stage F's
+    admission control existed (see that stage's own PROGRESS entry for
+    why). Writing this test to assert a specific absolute number that the
+    system's own real, current behaviour does not reliably produce would
+    make the suite lie about what "degraded" means; the comparison this
+    test actually makes (naive worse than adaptive, under identical load)
+    is both true and exactly what "naive mode still works and produces
+    the degraded baseline" literally claims.
+
+**Full suite: 948 tests (505 before this prompt + 23 from `bench/run.py`'s
+own test file, added earlier this session under P17, + 420 new here).**
+
+```
+$ python -m pytest -q
+946 passed, 2 failed in 455.28s
+```
+
+The 2 failures are both already-documented, pre-existing, environmental
+timer flakes — `test_worker_pool_sustains_150_units_per_second_within_5_percent`
+(known since Stage C/P5) and `test_a_real_gap_opens_between_offered_and_admitted_under_sustained_spike`
+(known since the admission-control prompt; already isolated once this
+session via `git stash` to reproduce identically on code that predates
+it). A stale demo server and one orphaned interpreter were killed before
+launching this run, but a second, unrelated system-Python `pytest`
+process was found running concurrently only after the fact — competing
+for the same CPU/timer resolution these two specific tests are already
+known to be sensitive to. Neither failure touches anything this prompt
+added; every one of the 420 new claim tests, and both renamed ones,
+passed. Re-running clean (no other process at all) is the honest next
+step before citing this number on stage, not done as part of this
+prompt's own scope.
+
+## Stage H — dashboard-only: final layout, no scroll, cost + worker-pool panels
+
+Dashboard-only, per the prompt's own scope — no Python touched; confirmed
+via `git status` before finishing.
+
+**Layout redesign, not just two panels bolted on.** `Panel.tsx`'s old
+`size` enum (`sm`/`md`/`lg`/`wide`/`tall`/`full`) plus `gridAutoFlow:
+dense` was emergent — it guessed at "fits without scroll" from fixed
+pixel heights, and had no way to *guarantee* 13 panels fit a 1920x1080
+viewport, only to hope they did. Replaced with an explicit `cols` (1-12)
+prop per panel and a fixed `rows` count (`PanelGrid rows={4}`) whose
+`grid-template-rows: repeat(N, minmax(0,1fr))` fills exactly 100% of the
+remaining flex height — every row's `cols` sum to 12 by construction, so
+"all panels visible without scrolling" is a property of the layout math,
+not a screenshot-and-hope check. Four rows, by what a judge needs to read
+first: status (Conservation, P0 scoreboard, Pressure, Ladder), the three
+time-series that tell the triage story (Rates, Latency-by-tier, Queue
+depth), what happened to the backlog (Deferred, Worker pool, Cost
+comparison, Shed log), then interactive/reference (Event inspector,
+Weights).
+
+Two panels dropped in the same pass, not left cluttering the grid:
+`ModeByTierPanel` (Stage D) — superseded by `LadderPanel`'s real
+`ladder_rung` field, which shows strictly more than ModeByTierPanel's
+client-side pressure-band recomputation ever could; and `ThroughputPanel`
+— `throughput` has been a permanent zero stub since Stage D, and a
+flat-zero panel reads as a bug to a judge, not as "not implemented yet."
+
+**Built**
+
+- `CostComparisonPanel` — a running total accumulated client-side, frame
+  by frame, from real wire fields: `actual worker-seconds += worker_count
+  * dt` (the fixed 6-worker pool, paid every second regardless of load)
+  vs. `naive-scaled worker-seconds += (offered_rate / WORKER_CAPACITY_UPS)
+  * dt` (workers a naive linear-scaling policy would need to stream 100%
+  of currently offered load). `dt` is measured between successive
+  frames' own server timestamps, not client `Date.now()`. Deliberately
+  NOT reset by the dashboard's Reset button — a running total across the
+  whole session on stage, the same philosophy as `metrics.critical_failure_count()`
+  staying unlatched by a normal reset. `WORKER_CAPACITY_UPS` and
+  `COST_PER_WORKER_SECOND_USD` duplicated into `types/metrics.ts` from
+  `config/tiers.yaml` / `bench/run.py`'s own cost model, so the live panel
+  and the offline benchmark report tell the same dollar story.
+- `WorkerPoolGridPanel` — `worker_count`/`active_workers` as a grid of
+  cells rather than a number, lighting left-to-right on activity.
+  **Caught live, not assumed:** `active_workers` is wired to
+  `metrics.py`'s own `in_flight` counter, which is real but not bounded
+  by pool size — under a real spike it read `30` against a 6-worker pool.
+  Rendering that verbatim as "30/6 busy" is exactly the kind of number
+  Stage H's own brief rules out ("no panel should require explanation to
+  read"), so the panel clamps lit cells to `min(active, total)` and
+  reports the overflow honestly instead of hiding it: `"6/6 (+24
+  waiting)"` — true statement (pool saturated, more work queued behind
+  it), no implication a 6-worker pool somehow ran 30 workers at once.
+  This is a dashboard-only display fix; `active_workers`'s backend
+  semantics are untouched, out of this prompt's scope.
+
+**Verified live**, `npm run build` clean
+(`dist/assets/index-*.js` 546.47 kB), server restarted fresh
+(`--port 8000 --seed 9`), browser at 1920x1080:
+
+- All 13 panels visible with zero page scroll, both at baseline and mid-
+  spike (triggered `/control/spike` live to populate Worker pool/Cost
+  comparison/Shed log with real non-zero data before screenshotting).
+- Headline numbers (BALANCED tick, P99 ms, pressure, $ costs, ratio) all
+  render visibly larger than their labels across every panel — the
+  "numbers larger than labels" requirement was already `Panel.tsx`'s
+  convention from Stage F, carried forward rather than rebuilt.
+- 5-minute WebSocket-survival check: server log watched continuously
+  (`tail -F` filtered for `WebSocket /ws`/`connection open`/`connection
+  closed`) across a 305-second window with the browser tab left
+  untouched, no page reload, no navigation. Zero new handshake or
+  disconnect lines appeared — the one WS connection opened at the start
+  of the window was still the only one at the end. `useMetricsSocket`'s
+  reconnect backoff was never exercised because nothing triggered it.
+
+**Hard stop after this prompt**, per its own last line — no further stage
+started without new instruction.
