@@ -195,3 +195,49 @@ underlying `python -m ...` command above.
 - `Event.payload` and the rollup/ledger/deferred/sink-only contracts flagged
   in the data-model review are still outstanding — unrelated to this prompt,
   carried forward.
+
+## Stage B — P6 dashboard scaffold (Lane C)
+
+**Done** (`dashboard/` only; `src/` untouched)
+
+- Vite + React 18 + TypeScript + Tailwind + Recharts, dark theme
+  (`tailwind.config.js` custom palette: `surface`/`ink`/`good`/`bad`/`warn`/
+  `tier`).
+- `src/components/Panel.tsx` — the layout system, built first as asked.
+  `PanelGrid` is a 12-column CSS grid with fixed-height rows; `Panel` claims
+  a fixed span via `size` (`sm|md|lg|wide|tall|full`). New panels only ever
+  add a grid item, so the next ~7 panels over the coming stages drop in
+  without moving the ones already placed.
+- `src/hooks/useMetricsSocket.ts` — one WebSocket to `ws://localhost:8000/ws`
+  for the app's lifetime, capped exponential backoff (0.5s → 8s) on any
+  drop, exposes `status` + a 240-frame (60s at 4 Hz) rolling history.
+- `src/components/ConnectionIndicator.tsx` — always visible in the header;
+  green/live, amber/reconnecting, red/disconnected.
+- Three panels: `ThroughputPanel` (events/sec line), `LatencyByTierPanel`
+  (p99, one line per tier — meaningful now because the classifier already
+  tags every event's tier, ahead of Stage C's scheduler), `P0ScoreboardPanel`
+  (large p99 vs the 200ms target, green/red, "waiting for data" before the
+  first event lands).
+- `src/types/metrics.ts` — hand-kept TypeScript mirror of `contracts.py`'s
+  `MetricsFrame`/`DecisionTrace`/`ShedRecord`; no fields omitted.
+- `dashboard/README.md` — layout system, panel list, run instructions for
+  both the Vite dev server and the FastAPI-served build.
+
+**Not done — no Node.js/npm on this machine**
+
+`npm install`, `npm run build`, and `npm run dev` could not be run here, so
+the acceptance line (`make dev` one process; charts moving at 1000
+events/min; `POST /control/rate 20000` visibly climbing latency) has **not**
+been visually verified — only checked without a JS runtime: `package.json`
+and both `tsconfig*.json` parse as valid JSON, every `.ts`/`.tsx` file has
+balanced brackets, and every import/export was cross-checked by hand. Until
+`npm run build` has been run once, `dashboard/dist` does not exist and
+`app.py` serves its existing JSON fallback at `/` instead (verified in P5).
+The backend half of the acceptance line — rate control, throughput, latency
+climbing under load — is already covered by `tests/test_engine.py` and
+`tests/test_app.py`.
+
+**Next action, before Stage C:** on a machine with Node, run
+`cd dashboard && npm install && npm run build`, then `make dev` and confirm
+the acceptance line directly. Flagging this now rather than silently
+declaring P6 acceptance-tested.

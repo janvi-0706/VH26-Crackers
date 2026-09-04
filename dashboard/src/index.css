@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface text-ink;
+    font-feature-settings: "tnum" 1; /* tabular numerals: metrics must not jitter horizontally */
+  }
+
+  ::selection {
+    @apply bg-tier-p0/30;
+  }
+}
+
+@layer utilities {
+  /* Big scoreboard numerals, readable from across a room. */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
