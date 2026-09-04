@@ -978,3 +978,230 @@ backend change this prompt didn't ask for); no persistence of a tuned
 weight set across a process restart (in-memory only, same as every other
 live control this project has); `/control/reset` deliberately leaves
 weights untouched, the same design already applied to `mode`.
+
+## Stage E — CoDel, the escalation ladder, and reservoir sampling
+
+**Built**
+
+- `src/triage/codel.py` — new module, `CoDelController`: RFC 8289 applied to
+  P2 queue sojourn time only, exactly as specified. Tracks the minimum
+  sojourn observed within each 100ms interval; enters the sampling state
+  only once that minimum has stayed above the 500ms target for a *full*
+  interval, exits the instant any single observation drops back below
+  target. No queue-length signal anywhere in the file — sojourn time is the
+  only input, checked directly in tests (`test_codel.py`). Deliberately
+  does **not** carry over RFC 8289's adaptive drop-frequency schedule
+  (`count`/`sqrt` interval shrinking): that machinery paces *repeated
+  drops*, and this stage substitutes reservoir sampling for dropping, which
+  has its own separate, much simpler pacing (fixed 1-in-N) — carrying the
+  scheduler over would be complexity with no corresponding behaviour.
+- `src/triage/ladder.py` — new module:
+  - `Rung` (STREAM/MICRO_BATCH/DEFER/SAMPLE_ROLLUP/SHED), `MAX_RUNG` per
+    tier (P0 caps at STREAM, P1 caps at DEFER, P2 uncapped), and `cap()` —
+    CLAUDE.md hard rule 3 enforced a second, independent way (decide()
+    already guarantees P0 never leaves STREAM; this is the second
+    enforcement layer "in case a future refactor" the same way
+    `decision.decide()`'s own defensive assert already is).
+  - `escalate(tier, base_decision, pressure, codel_sampling)` — P2 only.
+  - `ReservoirSampler`/`add_to_reservoir()` — one reservoir per P2 type
+    (click, log independently), window size exactly `RESERVOIR_N` (10)
+    events: the Nth event in each window is kept (`observed_count=1`), the
+    other N-1 are represented only by `sample_weight=N` — an **exact**
+    reconstruction by construction (`observed_count * sample_weight == N ==
+    the true count that window covered`), not a statistical estimate that
+    merely lands close.
+  - `Rollup` — mirrors docs/DATA_MODEL.md's `rollups` table.
+- `src/triage/sink.py` — `rollups` table (schema exactly per
+  DATA_MODEL.md), `write_rollup()`/`rollup_count()`. Deliberately **not**
+  the source `MetricsFrame.weighted_click_count` reads from — see
+  `metrics.py`'s own note on why; this table is the durable reconciliation
+  record DATA_MODEL.md describes, not the live dashboard's data source.
+- `src/triage/metrics.py` — `observe_dequeue()` now feeds `codel.observe()`
+  the real sojourn for every P2 dequeue (the exact call site that
+  module's own docstring named as its consumer since Stage D);
+  `observe_complete()` adds weight 1 for every full-fidelity click served;
+  new `observe_rollup()` adds `observed_count * sample_weight` for a
+  finished click rollup; `observe_decision()` now records the rung
+  (`ladder.DECISION_RUNG`) each tier's most recent real decision landed
+  on, which `MetricsFrame.ladder_rung` reports. `observe_defer()` — Stage
+  D's name, generalised: it already did exactly "release the in_flight
+  slot without counting complete," which SAMPLE_ROLLUP and SHED need
+  identically to DEFER, so Stage E reuses it rather than adding two
+  near-duplicate functions.
+- `src/triage/worker.py` — `_resolve()` calls `ladder.escalate()` for P2
+  events (after the Stage D redefer-trap override, and skipped once that
+  trap has already fired — an event already forced to stream should
+  actually stream). New `_dispatch_off_path()` unifies DEFER/
+  SAMPLE_ROLLUP/SHED handling (used both by the main dispatch and by the
+  MICRO_BATCH-gathering loop's "this extra doesn't belong in the batch"
+  branch) instead of duplicating the DEFER-only logic Stage D had in two
+  places.
+- Dashboard — `LadderPanel.tsx`: reads `MetricsFrame.ladder_rung` directly
+  off the wire (real, per-tier, as of this stage) rather than recomputing
+  a client-side approximation the way Stage D's `ModeByTierPanel` still
+  does for its own (still-accurate-for-P0/P1) purpose — rungs 3/4
+  (SAMPLE_ROLLUP/SHED) depend on CoDel/hard-shed state a pressure formula
+  alone cannot reconstruct client-side.
+
+**Four real bugs found empirically, not by inspection — three fixed, one
+reversed a design decision made earlier in this same prompt:**
+
+1. **Floating-point precision in `codel.py`'s interval-boundary check.**
+   `elapsed >= self.interval_seconds` failed intermittently depending on
+   the *magnitude* of the timestamps involved — a toy test value like
+   `1000.0` never showed it, but real wall-clock time (`time.time()`,
+   ~1.7e9) does: measured directly, `(time.time() + 0.1) - time.time()`
+   landed ~1e-7 short of `0.1`. Without a tolerance, a genuinely-complete
+   100ms interval could silently miss its own boundary check and delay
+   entering the sampling state by a full extra interval, for a reason that
+   has nothing to do with the actual control law. Fixed with a
+   `1e-4`-second epsilon — three orders of magnitude above the measured
+   error, three below the interval itself.
+2. **Reservoir rollup windows could collide on the durable table's own
+   unique index.** `docs/DATA_MODEL.md`'s `rollups` table uniques on
+   `(event_type, window_start, window_end)`. At spike rate, a
+   `RESERVOIR_N`-sized window's worth of P2 events can genuinely complete
+   within the same tick of the system clock's own resolution the *next*
+   window opens in (the SAMPLE_ROLLUP path has zero artificial delay,
+   unlike `serve()`), producing two different windows with an identical
+   `(window_start, window_end)` pair — a live `sqlite3.IntegrityError`,
+   reproduced directly by stress-testing the path with an artificially
+   frozen clock (500 events, one fixed timestamp, worst case). Fixed by
+   anchoring each new window's start to the *previous* window's own end
+   (`+1e-6`) rather than to `now` — windows stay strictly ordered and
+   distinct regardless of how fast real time is actually moving.
+3. **`ladder.escalate()`'s original priority order made the reservoir
+   sampler nearly unreachable.** The first implementation checked hard
+   shed (`pressure >= 0.95`) *before* CoDel sampling. Confirmed directly,
+   not assumed: a real sustained 20x spike drives pressure to roughly
+   0.6-0.8 for most of its duration and — this codebase's *own* existing
+   30-second-spike test already documents — pressure sustained near 1.0 is
+   a real, not hypothetical, outcome of a genuine sustained spike. Under
+   the original ordering, "hard shed above 0.95" would fire on nearly all
+   P2 traffic whenever pressure got that high, and CoDel's own sampling
+   path would almost never run — the reservoir would sit nearly empty
+   while shed (genuinely, unrecoverably lost) traffic climbed, directly
+   contradicting this stage's own acceptance line ("we lost resolution,
+   not information"). This stage's own spec says "when CoDel signals, do
+   NOT drop" — unconditionally, not "unless pressure is also very high" —
+   so the fix was to check CoDel sampling *first*: hard shed is now the
+   fallback for when pressure is extreme and CoDel is *not* already
+   sampling (a sharper spike than CoDel's own 100ms detection has caught
+   up with yet), not a competing priority that can pre-empt sampling once
+   it has started.
+4. **`in_flight` would have leaked on SHED and SAMPLE_ROLLUP**, the exact
+   Stage D DEFER bug applied to the two new off-paths — caught before it
+   ever reached a live symptom, by recognising `observe_defer()`'s
+   existing body was already fully generic ("release the slot
+   observe_dequeue reserved, without counting complete") and had no actual
+   DEFER-specific logic to duplicate. Both new paths reuse it; no new bug
+   to have shipped in the first place.
+
+**A genuinely emergent finding, understood and worked through, not just
+patched over:** why does `weighted_click_count` *diverge* from
+`true_click_count` for most of an ongoing spike, even after fix #3 above?
+Traced directly (a diagnostic script instrumenting every P2 sojourn sample
+fed to `codel.observe()`, then a full `MetricsFrame` trace every 500ms
+through a real 30-second spike): a real sustained spike's dominant P1/P2
+overflow path is **DEFER**, not sampling or shedding — pressure mostly sits
+in `[0.40, 0.75)`-`[0.75, 0.95)` territory, essentially never crossing
+`HARD_SHED_PRESSURE`. DEFER preserves 100% of a click's identity; it only
+*delays* when it is finally counted, and the drainer that replays it is
+gated on pressure falling under `DRAIN_PRESSURE_THRESHOLD` (0.35) — which,
+correctly, does not happen while a spike is still ongoing. So
+`weighted_click_count` legitimately trails `true_click_count` by roughly
+the size of the currently-unresolved backlog (queued + deferred) for as
+long as the spike continues — that gap is delay, not loss, and checking
+the two counters mid-spike was checking a number that cannot possibly be
+close yet, for a reason that has nothing to do with whether the sampling
+machinery itself works (which it does — proven directly and
+deterministically in `test_ladder.py`/`test_batching.py` via forced
+pressure/forced CoDel state). Confirmed the recovery story end-to-end with
+a live diagnostic before writing it as a test: spike for 15s (gap opens:
+weighted 1386 vs true 2493, ratio 56%) → ease the rate back to baseline →
+pressure fell under 0.35 at ~48s post-ease → the deferred backlog (2247 at
+that point) drained steadily → ratio crossed 95% at **exactly** the moment
+the backlog reached zero (ratio 0.995) — the two numbers converging
+precisely when everything the spike had ever touched was finally accounted
+for, one way or another.
+
+**Tests — 48 new (444 total)**
+
+- `tests/test_codel.py` (new, 9 tests) — no queue-length signal anywhere;
+  a single slow observation does not trigger sampling; the interval
+  minimum staying above target for a full interval does; a single
+  below-target sample among otherwise-high ones does not (the interval's
+  *minimum* is what matters); exit is immediate, not interval-gated;
+  sustained congestion holds sampling across many intervals; reset;
+  the ambient module-level default controller.
+- `tests/test_ladder.py` (new, 23 tests) — the rung ceiling for all three
+  tiers against every rung (P0 always clamps to STREAM, P1 never past
+  DEFER, P2 uncapped); `escalate()`'s priority order (CoDel wins over hard
+  shed, not the reverse — the bug #3 fix, locked in directly); P0/P1 never
+  escalated regardless of pressure or CoDel state; the reservoir's exact
+  1-in-N reconstruction, per-type independence (click and log never share
+  a window), seq-bound coverage, and reset.
+- `tests/test_sink.py` (new, 4 tests) — rollup persistence, distinct ids
+  per window, the DDL's own `seq_high >= seq_low` CHECK.
+- `tests/test_batching.py` (9 new) — SAMPLE_ROLLUP/SHED routing and P0/P1
+  immunity from both, a finished reservoir window actually reaching
+  `sink.write_rollup()` and `weighted_click_count` (the exact-N-weight
+  proof, end to end through the real worker), hard shed reaching the
+  ledger, and the in_flight-leak regression test for both new off-paths.
+- `tests/test_metrics.py` (9 new) — `observe_complete()`'s click-weight-1
+  path, `observe_rollup()`'s click-only weighting, the two counters
+  resetting together (not independently — the exact property the recovery
+  test below depends on), `observe_decision()` recording the right rung,
+  the P2-only codel feed, and `metrics.reset()` clearing `codel`/`ladder`'s
+  ambient state too.
+- `tests/test_app.py` (1 new) — the literal acceptance line, run for real:
+  a warmed-up engine (2s baseline first — cold-start's service_rate=0
+  artifact was confirmed directly to cause exactly the bug #3 symptom on
+  its own, independent of the priority-order bug, if skipped), a real
+  spike, then the rate eased back to baseline directly
+  (`engine.set_rate()`, deliberately **not** `/control/reset` — that
+  endpoint calls `metrics.reset()`, which would zero both counters
+  together and make any comparison trivial), polled for up to 300s.
+
+  **A second timing-sensitive flake found while finalising this test — not
+  in the mechanism, in the test's own budget.** Standalone, it converges in
+  90-190s. Run as part of the *full* suite with a leftover demo server
+  (started earlier for the dashboard screenshots below) still listening on
+  the same machine, it twice failed a 180s deadline at 37% and 82% — the
+  exact same class of issue already documented since Stage C/P5 for the
+  150 u/s throughput test ("more noticeable when a live demo server is also
+  running in the background"), now affecting a *second*, unrelated
+  wall-clock test for the identical reason: real CPU/timer contention
+  slowing this test's own background drainer. Confirmed directly, not
+  guessed: killing the leftover server and re-running the full suite
+  passed clean, 444/444, including this test. Fixed by widening the
+  deadline to 300s (a real margin, not tuned to just clear either failure)
+  and documenting the cause here rather than silently loosening the number
+  and hoping.
+
+**Verified live, in the browser, against the real backend**
+
+```
+POST /control/spike, sustained:
+  Pressure 0.62-0.68, Mode/Ladder by tier: P0=stream, P1=P2=micro-batch
+  Deferred backlog: 0 -> ~7000 parked over ~25s, visibly climbing on the
+  new area chart panel — the DEFER-dominant overflow path, exactly as the
+  diagnostic above found.
+POST /control/reset: rate back to 16.65, demo left at a clean baseline.
+```
+
+**Full suite, clean: 444/444 passed** (killing the leftover demo server
+before the run — see the timing-sensitivity note above — was what made it
+clean; both wall-clock-sensitive tests, the pre-existing throughput one
+from Stage C/P5 and this stage's own new convergence test, are sensitive to
+the exact same real-CPU-contention cause and both pass reliably once
+nothing else on the machine is competing for the clock.
+
+**What this prompt deliberately does not do:** no hash-chained/SQLite
+`audit_ledger` (ledger.py's own Stage-A stub comment mentions "Stage E/F"
+loosely, but this prompt's own text asks only for `codel.py`/`ladder.py` —
+flagged, not built silently); no dashboard panel for sampling fidelity
+(`weighted_click_count` vs `true_click_count`) beyond what the prompt
+named (the ladder widget) — the numbers are verified by the new
+`test_app.py` acceptance test and by hand above, not exposed as a new
+permanent panel this prompt didn't ask for.

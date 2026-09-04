@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from triage import deferral, ledger, metrics
+from triage import codel, deferral, ladder, ledger, metrics
 from triage.contracts import Decision, Event, EventType, Mode, Tier
 
 
@@ -353,3 +353,98 @@ def test_ewma_with_trend_reflects_a_rising_rate():
     assert ewma.level > steady_level
     assert ewma.trend > 0
     assert ewma.with_trend > ewma.level  # leans into the ramp, not just behind it
+
+
+# --------------------------------------------------------------------------
+# Stage E: weighted_click_count, ladder_rung, and the codel/ladder reset wire
+# --------------------------------------------------------------------------
+
+
+def test_observe_complete_adds_full_weight_for_an_unsampled_click():
+    ev = event(etype=EventType.CLICK)
+    metrics.observe_ingest(ev)
+    metrics.observe_dequeue(ev)
+    metrics.observe_complete(ev)
+    assert metrics.snapshot().weighted_click_count == pytest.approx(1.0)
+
+
+def test_observe_complete_does_not_move_weighted_click_count_for_non_clicks():
+    ev = event(etype=EventType.LOG)
+    metrics.observe_ingest(ev)
+    metrics.observe_dequeue(ev)
+    metrics.observe_complete(ev)
+    assert metrics.snapshot().weighted_click_count == pytest.approx(0.0)
+
+
+def test_observe_rollup_adds_observed_count_times_sample_weight_for_clicks():
+    rollup = ladder.Rollup(
+        event_type="click", window_start=0.0, window_end=1.0,
+        sample_weight=10.0, observed_count=1, subtype_counts={"click": 1},
+        seq_low=1, seq_high=10,
+    )
+    metrics.observe_rollup(rollup)
+    assert metrics.snapshot().weighted_click_count == pytest.approx(10.0)
+
+
+def test_observe_rollup_ignores_log_rollups():
+    rollup = ladder.Rollup(
+        event_type="log", window_start=0.0, window_end=1.0,
+        sample_weight=10.0, observed_count=1, subtype_counts={"log": 1},
+        seq_low=1, seq_high=10,
+    )
+    metrics.observe_rollup(rollup)
+    assert metrics.snapshot().weighted_click_count == pytest.approx(0.0)
+
+
+def test_weighted_and_true_click_counts_reset_together():
+    ev = event(etype=EventType.CLICK)
+    metrics.observe_ingest(ev)
+    metrics.observe_dequeue(ev)
+    metrics.observe_complete(ev)
+    assert metrics.snapshot().weighted_click_count > 0
+    assert metrics.snapshot().true_click_count > 0
+
+    metrics.reset()
+
+    frame = metrics.snapshot()
+    assert frame.weighted_click_count == 0.0
+    assert frame.true_click_count == 0
+
+
+def test_observe_decision_records_the_rung_that_decision_maps_to():
+    ev = event(tier=Tier.P1)
+    metrics.observe_decision(ev, Decision.MICRO_BATCH, "test", 0.5)
+    assert metrics.snapshot().ladder_rung[Tier.P1.value] == int(ladder.Rung.MICRO_BATCH)
+
+    metrics.observe_decision(ev, Decision.DEFER, "test", 0.9)
+    assert metrics.snapshot().ladder_rung[Tier.P1.value] == int(ladder.Rung.DEFER)
+
+
+def test_ladder_rung_defaults_to_stream_for_every_tier():
+    frame = metrics.snapshot()
+    for tier in (Tier.P0, Tier.P1, Tier.P2):
+        assert frame.ladder_rung[tier.value] == int(ladder.Rung.STREAM)
+
+
+def test_observe_dequeue_feeds_codel_only_for_p2():
+    codel.reset()
+    now = time.time()
+    slow_p1 = event(seq=1, tier=Tier.P1, ingest_ts=now - 10.0)
+    metrics.observe_ingest(slow_p1, now=now - 10.0)
+    metrics.observe_dequeue(slow_p1, now=now)
+    # A 10-second wait would trivially trigger CoDel if P1 fed it -- it must
+    # not, since this stage's sampling machinery is P2-only.
+    assert codel.is_sampling() is False
+
+
+def test_reset_clears_codel_and_ladder_ambient_state():
+    codel.reset()
+    now = time.time()
+    # Drive P2 sojourn above target for a full interval, directly.
+    codel.observe(codel.TARGET_SECONDS + 1.0, now)
+    codel.observe(codel.TARGET_SECONDS + 1.0, now + codel.INTERVAL_SECONDS)
+    assert codel.is_sampling() is True
+
+    metrics.reset()
+
+    assert codel.is_sampling() is False

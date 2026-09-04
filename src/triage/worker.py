@@ -24,6 +24,17 @@ as late as possible uses the freshest signal.
     DEFER         -> handed to deferral.py instead of served now. See
                      _resolve() for the one case this needs to override
                      decide()'s own answer, and why.
+    SAMPLE_ROLLUP -> Stage E, P2 only: ladder.escalate() overrides decide()'s
+                     own STREAM_NOW/MICRO_BATCH/DEFER answer once
+                     codel.is_sampling() says P2's queue sojourn has been
+                     elevated for a sustained interval. The event is folded
+                     into a reservoir (ladder.add_to_reservoir) instead of
+                     served; a finished window is persisted durably
+                     (sink.write_rollup) and its weight added to the live
+                     weighted_click_count gauge (metrics.observe_rollup).
+    SHED          -> Stage E, P2 only, pressure >= ladder.HARD_SHED_PRESSURE:
+                     dropped, audited via the same ledger choke point every
+                     decision already passes through, never served.
 
 Every event a worker takes off the queue — whether via the blocking
 ``queue.get()`` that starts a turn or the non-blocking ``queue.try_get()``
@@ -43,14 +54,20 @@ import sys
 import time
 from typing import Callable
 
-from . import decision, deferral, metrics, sink
+from . import codel, decision, deferral, ladder, metrics, sink
 from .config import Config, load_config
-from .contracts import Decision, Event
+from .contracts import Decision, Event, Tier
 from .queue import EventQueue
 
 logger = logging.getLogger(__name__)
 
 SinkWriter = Callable[[Event], object]
+
+# The three decisions that dequeue an event without ever completing it —
+# see _dispatch_off_path().
+_OFF_PATH: frozenset[Decision] = frozenset(
+    {Decision.DEFER, Decision.SAMPLE_ROLLUP, Decision.SHED}
+)
 
 
 def _raise_windows_timer_resolution() -> None:
@@ -98,6 +115,8 @@ class WorkerPool:
         self.served_count = 0  # observability for tests; not in MetricsFrame
         self.batched_count = 0
         self.deferred_count = 0
+        self.sampled_count = 0
+        self.shed_count = 0
 
     @property
     def worker_count(self) -> int:
@@ -165,6 +184,15 @@ class WorkerPool:
         chance to wait: if this is not the first time, serve it now instead
         of deferring it again. It will correctly show up as an SLA miss
         (metrics.observe_complete already does that), not loop forever.
+
+        Stage E adds one more step, after the redefer trap and only for
+        P2: ladder.escalate() may push decide()'s own answer further, to
+        SAMPLE_ROLLUP (codel.py says P2's sojourn has been elevated) or
+        SHED (pressure alone is already past ladder.HARD_SHED_PRESSURE).
+        Deliberately last and deliberately skipped once the redefer trap
+        has already fired: an event already forced to stream because it
+        was given one chance and used it should actually stream, not be
+        sampled or shed on its way out the door.
         """
         result, reason = decision.decide(event, pressure_value, now, self.capacity_units_per_sec)
         if result is Decision.DEFER and deferral.was_deferred(event.event_id):
@@ -172,7 +200,44 @@ class WorkerPool:
                 Decision.STREAM_NOW,
                 "already deferred once; serving now rather than re-deferring forever",
             )
+        if event.tier is Tier.P2:
+            escalated, escalated_reason = ladder.escalate(
+                event.tier, result, pressure_value, codel.is_sampling()
+            )
+            if escalated_reason is not None:
+                return escalated, escalated_reason
         return result, reason
+
+    def _dispatch_off_path(
+        self, event: Event, result: Decision, reason: str, pressure_value: float, now: float
+    ) -> None:
+        """DEFER, SAMPLE_ROLLUP, and SHED — the three decisions that dequeue
+        an event without ever completing it. All three: record the
+        decision (the single ledger choke point), then release the
+        in_flight slot observe_dequeue reserved (metrics.observe_defer —
+        generic since Stage E, see its own docstring). Then the one thing
+        specific to each:
+
+            DEFER          hand to deferral.py for later replay.
+            SAMPLE_ROLLUP  fold into this event's type's reservoir; a
+                           finished window is persisted (sink.write_rollup)
+                           and counted (metrics.observe_rollup).
+            SHED           nothing further — dropped, already audited.
+        """
+        metrics.observe_decision(event, result, reason, pressure_value, now=now)
+        metrics.observe_defer(event)
+
+        if result is Decision.DEFER:
+            self._defer(event, reason)
+            self.deferred_count += 1
+        elif result is Decision.SAMPLE_ROLLUP:
+            rollup = ladder.add_to_reservoir(event, now)
+            self.sampled_count += 1
+            if rollup is not None:
+                sink.write_rollup(rollup)
+                metrics.observe_rollup(rollup)
+        elif result is Decision.SHED:
+            self.shed_count += 1
 
     async def _handle(self, event: Event) -> None:
         now = time.time()
@@ -182,11 +247,8 @@ class WorkerPool:
         if result is Decision.STREAM_NOW:
             await self.serve(event)
             return
-        if result is Decision.DEFER:
-            metrics.observe_decision(event, result, reason, pressure_value, now=now)
-            metrics.observe_defer(event)
-            self._defer(event, reason)
-            self.deferred_count += 1
+        if result in _OFF_PATH:
+            self._dispatch_off_path(event, result, reason, pressure_value, now)
             return
 
         # MICRO_BATCH: gather more, best-effort, non-blocking. Every extra
@@ -210,11 +272,8 @@ class WorkerPool:
             try:
                 if extra_result is Decision.STREAM_NOW:
                     await self.serve(extra)
-                else:  # DEFER
-                    metrics.observe_decision(extra, extra_result, extra_reason, pressure_value, now=extra_now)
-                    metrics.observe_defer(extra)
-                    self._defer(extra, extra_reason)
-                    self.deferred_count += 1
+                else:  # DEFER, SAMPLE_ROLLUP, or SHED
+                    self._dispatch_off_path(extra, extra_result, extra_reason, pressure_value, extra_now)
             finally:
                 self.queue.task_done()
 

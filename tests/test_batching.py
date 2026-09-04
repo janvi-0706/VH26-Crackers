@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from triage import deferral, ledger, metrics
+from triage import codel, deferral, ladder, ledger, metrics
 from triage.config import load_config
 from triage.contracts import Event, EventType, Tier
 from triage.queue import EventQueue
@@ -25,13 +25,17 @@ from triage.worker import WorkerPool
 
 @pytest.fixture(autouse=True)
 def clean_state():
-    metrics.reset()
+    metrics.reset()  # also resets codel.py and ladder.py's ambient state
     ledger.reset()
     deferral.reset_default_store()
     yield
     metrics.reset()
     ledger.reset()
     deferral.reset_default_store()
+
+
+def force_codel_sampling(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
+    monkeypatch.setattr(codel, "is_sampling", lambda: value)
 
 
 def make_event(
@@ -252,3 +256,161 @@ async def test_a_second_defer_verdict_is_overridden_to_stream_instead_of_looping
 
     assert sunk == [ev], "must be served on the second pass, not deferred again"
     assert deferral.pending_count() == 0, "must not have been re-inserted into the store"
+
+
+# --------------------------------------------------------------------------
+# SAMPLE_ROLLUP — Stage E, CoDel-driven, P2 only
+# --------------------------------------------------------------------------
+
+
+async def test_codel_sampling_routes_p2_to_sample_rollup_instead_of_streaming(monkeypatch):
+    force_pressure(monkeypatch, 0.1)  # well below every pressure band
+    force_codel_sampling(monkeypatch, True)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    sunk: list[Event] = []
+    pool = WorkerPool(q, config=cfg, sink_write=sunk.append)
+    now = time.time()
+    ev = make_event(1, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=now, sla_seconds=30.0)
+    q.put_nowait(ev)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert sunk == [], "a sampled event must never be sunk individually"
+    assert pool.sampled_count == 1
+
+
+async def test_codel_sampling_never_touches_p0_or_p1(monkeypatch):
+    force_pressure(monkeypatch, 0.1)
+    force_codel_sampling(monkeypatch, True)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    sunk: list[Event] = []
+    pool = WorkerPool(q, config=cfg, sink_write=sunk.append)
+    now = time.time()
+    p0 = make_event(1, tier=Tier.P0, etype=EventType.PAYMENT, cost=3.5, value=120.0,
+                     ingest_ts=now, sla_seconds=0.2)
+    p1 = make_event(2, tier=Tier.P1, ingest_ts=now, sla_seconds=30.0)
+    q.put_nowait(p0)
+    q.put_nowait(p1)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert sorted(e.event_id for e in sunk) == sorted([p0.event_id, p1.event_id])
+    assert pool.sampled_count == 0
+
+
+async def test_a_finished_reservoir_window_is_persisted_and_counted(monkeypatch):
+    """RESERVOIR_N (10) sampled P2 clicks must produce exactly one durable
+    rollup row and move weighted_click_count by exactly RESERVOIR_N — the
+    exact-reconstruction property ladder.py's own docstring describes."""
+    force_pressure(monkeypatch, 0.1)
+    force_codel_sampling(monkeypatch, True)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    pool = WorkerPool(q, config=cfg, sink_write=lambda e: None)
+    now = time.time()
+    events = [
+        make_event(i, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=now, sla_seconds=30.0)
+        for i in range(ladder.RESERVOIR_N)
+    ]
+    for e in events:
+        q.put_nowait(e)
+
+    from triage import sink
+
+    rollups_before = sink.rollup_count()
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert pool.sampled_count == ladder.RESERVOIR_N
+    assert sink.rollup_count() == rollups_before + 1
+    assert metrics.snapshot().weighted_click_count == pytest.approx(float(ladder.RESERVOIR_N))
+
+
+# --------------------------------------------------------------------------
+# SHED — Stage E, hard shed above ladder.HARD_SHED_PRESSURE, P2 only
+# --------------------------------------------------------------------------
+
+
+async def test_hard_shed_drops_p2_above_the_pressure_threshold(monkeypatch):
+    force_pressure(monkeypatch, ladder.HARD_SHED_PRESSURE)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    sunk: list[Event] = []
+    pool = WorkerPool(q, config=cfg, sink_write=sunk.append)
+    now = time.time()
+    ev = make_event(1, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=now, sla_seconds=30.0)
+    q.put_nowait(ev)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert sunk == []
+    assert pool.shed_count == 1
+    assert deferral.pending_count() == 0
+
+
+async def test_hard_shed_never_touches_p0_or_p1(monkeypatch):
+    force_pressure(monkeypatch, 1.0)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    sunk: list[Event] = []
+    pool = WorkerPool(q, config=cfg, sink_write=sunk.append)
+    now = time.time()
+    p0 = make_event(1, tier=Tier.P0, etype=EventType.PAYMENT, cost=3.5, value=120.0,
+                     ingest_ts=now, sla_seconds=0.2)
+    q.put_nowait(p0)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert sunk == [p0]
+    assert pool.shed_count == 0
+
+
+async def test_hard_shed_is_recorded_to_the_ledger(monkeypatch):
+    from triage.contracts import Decision
+
+    force_pressure(monkeypatch, ladder.HARD_SHED_PRESSURE)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    pool = WorkerPool(q, config=cfg, sink_write=lambda e: None)
+    now = time.time()
+    ev = make_event(1, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=now, sla_seconds=30.0)
+    q.put_nowait(ev)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert ledger.total_recorded() >= 1
+    rows = list(ledger.records())
+    assert any(r["decision"] == Decision.SHED.value for r in rows)
+
+
+async def test_in_flight_does_not_leak_on_shed_or_sample(monkeypatch):
+    """The same in_flight-leak bug DEFER had in Stage D (observe_dequeue's
+    +1 only ever balanced by observe_complete's -1) applies identically to
+    SHED and SAMPLE_ROLLUP — neither ever completes an event."""
+    force_pressure(monkeypatch, ladder.HARD_SHED_PRESSURE)
+    cfg = load_config()
+    q = EventQueue(config=cfg)
+    pool = WorkerPool(q, config=cfg, sink_write=lambda e: None)
+    now = time.time()
+    ev = make_event(1, tier=Tier.P2, etype=EventType.CLICK, ingest_ts=now, sla_seconds=30.0)
+    q.put_nowait(ev)
+
+    pool.start()
+    await asyncio.wait_for(q.join(), timeout=2.0)
+    await pool.stop()
+
+    assert metrics.snapshot().in_flight == 0

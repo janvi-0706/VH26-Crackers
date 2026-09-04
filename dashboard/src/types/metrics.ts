@@ -113,3 +113,28 @@ export const P0_LATENCY_TARGET_MS = 200;
  * to draw their own bands and labels without a live config fetch. */
 export const PRESSURE_STREAM_MAX = 0.4;
 export const PRESSURE_BATCH_MAX = 0.75;
+
+/** ladder.Rung (src/triage/ladder.py) — the five-rung escalation ladder.
+ * MetricsFrame.ladder_rung reports the integer value of the rung each
+ * tier's most recently observed real decision actually landed on (Stage
+ * E), not a client-side recomputation from pressure alone — the two extra
+ * rungs above DEFER depend on CoDel/hard-shed state a pressure formula
+ * cannot express. */
+export const RUNG_LABEL: readonly string[] = [
+  "stream",
+  "micro-batch",
+  "defer",
+  "sample",
+  "shed",
+];
+
+/** One CSS class bundle per rung, escalating good -> warn -> bad exactly
+ * once congestion becomes lossy (rung 3, SAMPLE_ROLLUP) rather than at
+ * DEFER (rung 2), which still preserves every field. */
+export const RUNG_STYLE: readonly string[] = [
+  "border-good/40 bg-good/15 text-good", // STREAM
+  "border-good/40 bg-good/15 text-good", // MICRO_BATCH
+  "border-warn/40 bg-warn/15 text-warn", // DEFER
+  "border-bad/40 bg-bad/15 text-bad", // SAMPLE_ROLLUP
+  "border-bad/40 bg-bad/15 text-bad", // SHED
+];

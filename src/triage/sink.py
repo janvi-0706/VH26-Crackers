@@ -1,13 +1,30 @@
-"""SQLite terminal sink, upserted by the stable idempotency key."""
+"""SQLite terminal sink, upserted by the stable idempotency key.
+
+Stage E adds the `rollups` table: the durable audit trail for every
+reservoir-sampled window (ladder.Rollup) — schema exactly per
+docs/DATA_MODEL.md's own `rollups` DDL, persisted here because sink.py is
+already this project's "SQLite is the single-process durable edge" module
+(that document's own framing).
+
+Deliberately NOT the source the live dashboard number reads from, though:
+`weighted_click_count` lives in metrics.py instead (see that module's own
+note on why), because it has to reset in lockstep with `true_click_count`
+on every /control/reset for the two to stay comparable, and this sink is
+durable across a reset by design — same as `events_sink` itself already is.
+This table is the reconciliation record docs/DATA_MODEL.md describes
+("compares rollup coverage ... with sampled-out counters"), not the
+dashboard's data source.
+"""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
 
-from .contracts import Event
-
+from .contracts import SCHEMA_VERSION, Event
+from .ladder import Rollup
 
 EVENTS_SINK_DDL = """
 CREATE TABLE IF NOT EXISTS events_sink (
@@ -32,6 +49,28 @@ CREATE INDEX IF NOT EXISTS idx_events_sink_committed_ts
     ON events_sink (committed_ts);
 """
 
+ROLLUPS_DDL = """
+CREATE TABLE IF NOT EXISTS rollups (
+    rollup_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL CHECK (window_end > window_start),
+    sample_weight REAL NOT NULL CHECK (sample_weight >= 1.0),
+    observed_count INTEGER NOT NULL CHECK (observed_count >= 0),
+    subtype_counts TEXT NOT NULL,
+    seq_low INTEGER NOT NULL,
+    seq_high INTEGER NOT NULL CHECK (seq_high >= seq_low),
+    created_ts REAL NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rollups_type_window
+    ON rollups (event_type, window_start, window_end);
+CREATE INDEX IF NOT EXISTS idx_rollups_seq_coverage
+    ON rollups (seq_low, seq_high);
+CREATE INDEX IF NOT EXISTS idx_rollups_window
+    ON rollups (window_start DESC, window_end DESC);
+"""
+
 
 class SQLiteSink:
     """Persist the latest successful delivery for each business operation."""
@@ -42,10 +81,12 @@ class SQLiteSink:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._rollup_seq = 0
         self.initialize()
 
     def initialize(self) -> None:
         self.connection.executescript(EVENTS_SINK_DDL)
+        self.connection.executescript(ROLLUPS_DDL)
         self.connection.commit()
 
     def write(self, event: Event) -> bool:
@@ -100,6 +141,47 @@ class SQLiteSink:
         row = self.connection.execute("SELECT COUNT(*) FROM events_sink").fetchone()
         return int(row[0])
 
+    def write_rollup(self, rollup: Rollup, *, now: float | None = None) -> str:
+        """Persist one finished reservoir window (a ladder.Rollup) as the
+        durable audit trail docs/DATA_MODEL.md describes. `rollup_id` is
+        generated here, not carried on the dataclass — ladder.py's job is
+        the sampling arithmetic, not durable-row identity.
+
+        Returns the generated rollup_id, mostly so tests can look the row
+        back up without guessing it.
+        """
+        now = time.time() if now is None else now
+        self._rollup_seq += 1
+        rollup_id = f"rollup-{rollup.event_type}-{self._rollup_seq}"
+        self.connection.execute(
+            """
+            INSERT INTO rollups (
+                rollup_id, event_type, window_start, window_end,
+                sample_weight, observed_count, subtype_counts,
+                seq_low, seq_high, created_ts, schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rollup_id,
+                rollup.event_type,
+                rollup.window_start,
+                rollup.window_end,
+                rollup.sample_weight,
+                rollup.observed_count,
+                json.dumps(rollup.subtype_counts),
+                rollup.seq_low,
+                rollup.seq_high,
+                now,
+                SCHEMA_VERSION,
+            ),
+        )
+        self.connection.commit()
+        return rollup_id
+
+    def rollup_count(self) -> int:
+        row = self.connection.execute("SELECT COUNT(*) FROM rollups").fetchone()
+        return int(row[0])
+
     def attempts(self, idempotency_key: str) -> int:
         row = self.connection.execute(
             "SELECT attempt_count FROM events_sink WHERE idempotency_key = ?",
@@ -130,3 +212,11 @@ def read(idempotency_key: str) -> Event | None:
 
 def count() -> int:
     return _default_sink.count()
+
+
+def write_rollup(rollup: Rollup, *, now: float | None = None) -> str:
+    return _default_sink.write_rollup(rollup, now=now)
+
+
+def rollup_count() -> int:
+    return _default_sink.rollup_count()
