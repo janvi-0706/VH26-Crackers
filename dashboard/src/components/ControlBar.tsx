@@ -88,6 +88,17 @@ export function ControlBar({ currentMode, onReset }: ControlBarProps) {
         Reset
       </button>
 
+      {/* -- audit.csv export --------------------------------------------
+          A plain anchor, not a fetch-and-blob dance: the backend already
+          sets Content-Disposition: attachment on GET /audit.csv, so the
+          browser's own download handling is all this needs. */}
+      <a
+        href={api.AUDIT_CSV_URL}
+        className="rounded-lg border border-surface-border px-4 py-2 text-xs font-semibold uppercase tracking-wide text-ink-muted transition-colors hover:border-ink-muted hover:text-ink"
+      >
+        ⬇ audit.csv
+      </a>
+
       {/* -- SPIKE: unmissable, impossible to misclick ------------------- */}
       <button
         type="button"

@@ -8,7 +8,14 @@
  * means `npm run dev` works against a real backend with zero proxy config.
  */
 
+import type { DecisionTrace } from "../types/metrics";
+
 const API_BASE = "http://localhost:8000";
+
+/** GET /audit.csv's own URL — the download button in ControlBar links here
+ * directly (the backend already sets Content-Disposition: attachment, so
+ * a plain anchor is all a real download needs; no fetch-and-blob dance). */
+export const AUDIT_CSV_URL = `${API_BASE}/audit.csv`;
 
 export type QueueMode = "naive" | "adaptive";
 
@@ -61,4 +68,16 @@ export async function getWeights(): Promise<Weights> {
 export async function setWeights(partial: Partial<Weights>): Promise<Weights> {
   const res = await post("/control/weights", partial);
   return (await res.json()) as Weights;
+}
+
+/** GET /audit/trace/{event_id} — one decision trace from the backend's
+ * 500-item ring buffer. `null` for a 404 (unknown id, or aged out of the
+ * buffer — the two are indistinguishable from here, same as the backend
+ * itself); throws for anything else, so the caller can tell "not found"
+ * apart from "the request itself failed". */
+export async function getTrace(eventId: string): Promise<DecisionTrace | null> {
+  const res = await fetch(`${API_BASE}/audit/trace/${encodeURIComponent(eventId)}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET /audit/trace/${eventId} -> ${res.status}`);
+  return (await res.json()) as DecisionTrace;
 }

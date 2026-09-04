@@ -1568,3 +1568,85 @@ recent, and is what got built; no dashboard panel for the audit trail or
 critical-failure count — not asked for this prompt, and the ledger/
 invariant surface is already fully verifiable via `/audit.csv`,
 `/audit/trace/{event_id}`, and the Python API directly.
+
+## Stage F (dashboard) — the ledger surfaced: conservation, shed log, inspector, export
+
+Dashboard only — no backend files touched (confirmed via `git status`
+before committing). Every panel here reads fields the previous two Stage F
+prompts already made real; nothing needed a new endpoint except the two
+this stage's own spec explicitly named, and even those already existed
+from the ledger prompt (`GET /audit.csv`, `GET /audit/trace/{event_id}`).
+
+**Built**
+
+- `dashboard/src/components/panels/ConservationPanel.tsx` — the
+  centrepiece, `size="full"`, an 8xl checkmark/✕. Recomputes "ingested ==
+  processed + in_queue + in_flight + deferred_pending + sampled_out +
+  shed" client-side from the raw counters already on the wire — no new
+  backend field needed, since a real violation would already show up
+  directly in those same numbers. **Latches red for the rest of the
+  page's life once broken, and a Reset does not clear it** — deliberately
+  mirroring the backend's own `metrics.critical_failure_count()` (Stage F
+  ledger), which `reset()` also refuses to clear, for the identical
+  reason: a critical-invariant violation is exactly the evidence a demo
+  reset must not quietly erase. A judge walking up mid-demo to a red panel
+  can trust it means something really broke, not "broke once, already
+  scrolled past."
+- `dashboard/src/components/panels/ShedLogPanel.tsx` — `size="tall"`,
+  scrolling, `MetricsFrame.recent_sheds` (real since Stage A/D) rendered
+  as a log rather than a chart: tier, type, time-ago (computed from the
+  frame's own `ts` against each record's `ts`, avoiding client/server
+  clock-skew entirely — the same trick `toChartPoints` already uses), the
+  full `reason` sentence, value, pressure, and `event_id` — which a judge
+  or presenter can then paste straight into the panel next to it.
+- `dashboard/src/components/panels/EventInspectorPanel.tsx` — paste an
+  `event_id`, `GET /audit/trace/{event_id}`, render every field of the
+  returned `DecisionTrace`. A 404 is shown as genuinely ambiguous ("unknown
+  id, or aged out of the ring buffer") rather than guessing which —
+  matching the backend endpoint's own honest framing from the ledger
+  prompt.
+- `dashboard/src/components/ControlBar.tsx` — a plain `<a href=".../audit.csv">`
+  next to Reset. No fetch-and-blob dance: the backend already sets
+  `Content-Disposition: attachment` on that route, so a real anchor tag is
+  the entire implementation a genuine file download needs.
+- `dashboard/src/lib/api.ts` — `AUDIT_CSV_URL` (the constant the anchor
+  above points at) and `getTrace(eventId)`.
+
+**Verified live, in the browser, against the real backend**
+
+```
+Fresh server, real spike: Conservation panel read BALANCED (e.g.
+"ingested 940 = processed 938 + in_queue 0 + in_flight 0 +
+deferred_pending 0 + sampled_out 0 + shed 2 = 940") throughout.
+
+A separate, long-running dev server this session had already put through
+many hours of manual spike/reset cycles across the two earlier Stage F
+prompts showed the SAME panel reading BROKEN ("ingested 3406 = processed
+10366 + ... = 10367") — an honest, real discrepancy in that server's own
+long-lived accumulated state, not a dashboard bug: restarting fresh and
+re-running the identical real spike immediately read BALANCED again. Left
+uninvestigated deliberately — this prompt is dashboard-only, the panel's
+entire job is exactly to surface a discrepancy like this rather than hide
+it, and it did. Worth a look in a future backend-scoped prompt: what in
+one very long, heavily-manually-interrupted run (repeated ad-hoc
+spike/reset via curl, not the disciplined test-suite version of the same
+scenario) could produce processed > ingested. The backend's own 60-second
+scripted spike test (Stage F ledger) already passes reliably and found no
+such thing under a single, undisturbed run.
+
+Event Inspector: looked up a real event_id straight from the Shed Log —
+found it, rendered every DecisionTrace field (event_id, seq, type, tier,
+decision, reason, pressure, value, ts). Looked up a nonexistent id — the
+"unknown id, or aged out" message, not a silent blank.
+
+audit.csv link: href resolves to the real backend URL with the
+Content-Disposition the ledger stage already set.
+```
+
+**What this prompt deliberately does not do:** no backend changes of any
+kind (confirmed via `git status` before staging); no new MetricsFrame
+field for "has conservation ever broken" — computed client-side instead,
+since the existing raw counters already carry that information; no attempt
+to diagnose the one real discrepancy found on the long-running dev server
+above — flagged for a future prompt, not chased under a dashboard-only
+scope.
