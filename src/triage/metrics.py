@@ -7,7 +7,7 @@ process (CLAUDE.md hard rule 1), so a registry object passed through six
 constructors would buy nothing and cost every call site an argument. Single
 threaded, single event loop: no locks needed, and none are taken.
 
-Nine observation points, called by the engine:
+Eleven observation points, called by the engine:
 
     observe_admission(cost, admitted)                   generator.py, before an Event
                                                          even exists — see admission.py
@@ -24,6 +24,17 @@ Nine observation points, called by the engine:
     observe_decision(event, decision, reason, pressure)  triage chose; also records the
                                                          rung MetricsFrame.ladder_rung reports
     observe_rollup(rollup)                              a reservoir window finished (Stage E)
+    observe_retry(event)                                checkpoint.py recovered this event
+                                                         from a dead worker and is about to
+                                                         put_replayed() it (Stage I)
+    observe_exactly_once_violation(event, detail)       checkpoint.py's begin()/mark_done()
+                                                         reported an unexpected row state —
+                                                         live evidence of a double-process
+                                                         attempt, not a value anything
+                                                         increments speculatively (Stage I)
+    observe_duplicate_caught(event)                     dedup.Deduplicator confirmed a
+                                                         repeat dedup_key at ingest, before
+                                                         this event was ever queued (Stage I)
     snapshot() -> MetricsFrame                         4 Hz, to the dashboard
 
 STAGE F STATUS — what is real and what is not:
@@ -45,10 +56,20 @@ STAGE F STATUS — what is real and what is not:
          admitted_rate (fed by observe_admission — see admission.py for
          the AIMD credit gate upstream of it).
 
-  STUB   throughput, cost_adaptive, cost_naive, retries, duplicates_caught,
-         exactly_once_violations, spike_multiplier. These report 0 until
-         the stage that owns them lands. They are in the frame from day
-         one so the dashboard never has to be rewritten.
+  REAL as  retries (every event checkpoint.py's recovery pass ever handed
+  of      back to put_replayed() after a worker died holding it),
+  Stage I  exactly_once_violations (a live count of begin()/mark_done()
+           calls that reported an unexpected row state — "must always
+           read 0" is therefore a checked claim, not an assumed one), and
+           duplicates_caught (dedup.Deduplicator's own confirmed-suppress
+           count, wired in at Engine._ingest() — see dedup.py's own
+           docstring for what "confirmed" means and why an unconfirmed
+           Bloom hit never increments this).
+
+  STUB   throughput, cost_adaptive, cost_naive, spike_multiplier. These
+         report 0 until the stage that owns them lands. They are in the
+         frame from day one so the dashboard never
+         has to be rewritten.
 """
 
 from __future__ import annotations
@@ -374,6 +395,9 @@ def reset() -> None:
         sampled_out=0,
         shed=0,
         true_click_count=0,
+        retries=0,
+        exactly_once_violations=0,
+        duplicates_caught=0,
     )
 
     _value_delivered = 0.0
@@ -594,6 +618,54 @@ def observe_defer(event: Event) -> None:
     _counters["in_flight"] = max(0, _counters["in_flight"] - 1)
 
 
+def observe_retry(event: Event) -> None:
+    """Stage I: checkpoint.py's `recover_worker()` found this event still
+    checkpointed under a worker that just died — it will be handed to
+    `queue.put_replayed()` immediately after this call, exactly the same
+    two-step shape observe_defer()+put_replayed() already uses for a
+    DEFER. Same release for the same reason: observe_dequeue already
+    counted this event's dead attempt as in_flight, and nothing on that
+    attempt ever called observe_complete, so the slot must be released
+    here or it leaks forever, precisely the bug observe_defer's own
+    docstring already documents finding once for DEFER specifically.
+
+    A second, separate counter (`retries`) also moves — this is a REAL
+    event that a real worker death actually happened to, not a decision
+    outcome, so it is worth a name and a number of its own rather than
+    only ever showing up as an unusually-late queue-wait spike."""
+    _counters["in_flight"] = max(0, _counters["in_flight"] - 1)
+    _counters["retries"] += 1
+
+
+def observe_exactly_once_violation(event: Event, detail: str) -> None:
+    """checkpoint.py's begin()/mark_done() reported an unexpected row
+    state for this event_id — see checkpoint.py's own docstring for the
+    two concrete cases (a double-begin; a mark_done with nothing to mark).
+    This should never fire given how worker.py calls checkpoint.py (one
+    serve() call ever active per dequeued Event at a time, recovery scoped
+    to exactly the one worker_id that actually died) — asserting it
+    anyway, the same way `_check_conservation`/`_check_p0_never_non_stream`
+    assert invariants this codebase is confident hold, turns
+    `MetricsFrame.exactly_once_violations` "must always read 0" into a
+    claim this file can actually falsify if it were ever wrong."""
+    logger.error("EXACTLY-ONCE VIOLATION for %s: %s", event.event_id, detail)
+    _counters["exactly_once_violations"] += 1
+
+
+def observe_duplicate_caught(event: Event) -> None:
+    """Stage I: `dedup.Deduplicator.check()` confirmed `event.dedup_key`
+    as a real repeat within its bounded window, at ingest — before this
+    event was ever queued, so `ingested` never counts it and no worker
+    capacity is spent on it. Deliberately NOT routed through
+    observe_decision()/the ledger's decision-trace choke point: dedup is
+    an identity check ("was this business fact already admitted"), not a
+    triage decision ("what should happen to this admitted event"), and
+    conflating the two would put a non-decision into the same table
+    `test_the_audit_hash_chain_detects_any_row_mutation`-style tests treat
+    as "every decision, no exceptions"."""
+    _counters["duplicates_caught"] += 1
+
+
 def observe_decision(
     event: Event,
     decision: Decision,
@@ -788,9 +860,9 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         value_shed=round(_value_shed, 3),
         sla_met=dict(_sla_met),
         sla_missed=dict(_sla_missed),
-        retries=0,  # stub: owned by the retry path (Stage H)
-        duplicates_caught=0,  # stub: owned by dedup (Stage H)
-        exactly_once_violations=0,
+        retries=_counters["retries"],
+        duplicates_caught=_counters["duplicates_caught"],
+        exactly_once_violations=_counters["exactly_once_violations"],
         recent_decisions=list(_recent_decisions),
         recent_sheds=list(_recent_sheds),
     )

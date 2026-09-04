@@ -81,3 +81,30 @@ export async function getTrace(eventId: string): Promise<DecisionTrace | null> {
   if (!res.ok) throw new Error(`GET /audit/trace/${eventId} -> ${res.status}`);
   return (await res.json()) as DecisionTrace;
 }
+
+/** POST /chaos/kill-worker — cancels one live worker task for real (the
+ * same cancellation an actual crash would deliver). `worker_id: null` means
+ * the pool had no live worker to kill, not a failure. */
+export interface KillWorkerResult {
+  worker_id: number | null;
+}
+
+export async function killWorker(): Promise<KillWorkerResult> {
+  const res = await post("/chaos/kill-worker");
+  return (await res.json()) as KillWorkerResult;
+}
+
+/** POST /chaos/duplicate-flood — replays up to `count` of the most
+ * recently sink-committed events as genuine new duplicate deliveries
+ * (same dedup_key/idempotency_key, new event_id). */
+export interface DuplicateFloodResult {
+  requested: number;
+  replayed: number;
+  admitted: number;
+  suppressed: number;
+}
+
+export async function duplicateFlood(count = 1000): Promise<DuplicateFloodResult> {
+  const res = await post("/chaos/duplicate-flood", { count });
+  return (await res.json()) as DuplicateFloodResult;
+}

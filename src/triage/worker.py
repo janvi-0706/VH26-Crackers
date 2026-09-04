@@ -44,17 +44,38 @@ wrong is exactly the bug Stage C's `/control/reset` once had (see queue.py's
 own docstring): a dequeued item without a matching task_done() breaks the
 queue's join() contract, and cancellation (a reset can land mid-batch) is
 precisely when it is easiest to forget one.
+
+Stage I adds one more failure mode this file has to survive: the worker
+itself dying (cancelled, or an unexpected exception escapes `_run`), not
+just an event being routed off the happy path. `serve()`'s one
+`await asyncio.sleep()` and `_serve_batch()`'s shared one, plus the
+deliberate per-member `await asyncio.sleep(0)` `_serve_batch()` now takes
+between batch members — see its own docstring — are the only points a
+worker's own death can actually land inside; each is bracketed by
+`checkpoint.begin()` before and `checkpoint.mark_done()` after, per EVENT
+even inside a batch (see checkpoint.py's own docstring for why that
+granularity is the whole point). `WorkerPool` supervises its own tasks:
+when one ends for real (not because `stop()` asked it to),
+`_on_worker_done()` recovers whatever that specific worker still had
+checkpointed, `put_replayed()`s it back onto the live queue, and spawns a
+replacement task under the same `worker_id` — a dead worker shrinks the
+pool for exactly as long as it takes the event loop to notice, not for
+the rest of the run, or the fixed 6-worker capacity ceiling every other
+number in this project is measured against would silently stop being
+true.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import sys
 import time
 from typing import Callable
 
 from . import codel, decision, deferral, ladder, metrics, sink
+from .checkpoint import CheckpointStore
 from .config import Config, load_config
 from .contracts import Decision, Event, Tier
 from .queue import EventQueue
@@ -106,17 +127,26 @@ class WorkerPool:
         config: Config | None = None,
         sink_write: SinkWriter = sink.write,
         defer: Callable[[Event, str], None] = deferral.defer,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.queue = queue
         self.config = config or load_config()
         self._sink_write = sink_write
         self._defer = defer
+        # One store per pool, not an ambient module-level singleton — see
+        # checkpoint.py's own docstring ("Ownership") for why: worker_id
+        # 0..N-1 only means something within one pool, and sharing one
+        # global table across every WorkerPool a test happens to construct
+        # would let unrelated tests' reused event_ids collide.
+        self._checkpoint = checkpoint_store or CheckpointStore()
         self._tasks: list[asyncio.Task[None]] = []
+        self._stopping = False
         self.served_count = 0  # observability for tests; not in MetricsFrame
         self.batched_count = 0
         self.deferred_count = 0
         self.sampled_count = 0
         self.shed_count = 0
+        self.recovered_count = 0  # observability for tests; not in MetricsFrame
 
     @property
     def worker_count(self) -> int:
@@ -136,19 +166,117 @@ class WorkerPool:
     def start(self) -> list[asyncio.Task[None]]:
         if self._tasks:
             raise RuntimeError("worker pool already started")
-        self._tasks = [
-            asyncio.create_task(self._run(worker_id), name=f"pulse-worker-{worker_id}")
-            for worker_id in range(self.worker_count)
-        ]
+        self._stopping = False
+        self._tasks = [self._spawn(worker_id) for worker_id in range(self.worker_count)]
         return self._tasks
 
     async def stop(self) -> None:
-        """Cancel every worker task and wait for them to unwind."""
+        """Cancel every worker task and wait for them to unwind.
+
+        `_stopping` is set FIRST, before a single task is cancelled: the
+        done-callback every spawned task carries (`_on_worker_done`) reads
+        it to tell "this task ended because a clean shutdown asked it to"
+        from "this task actually died" — without the flag, `stop()`'s own
+        cancellation would look identical to a real worker death and
+        trigger pointless recovery-and-respawn churn on the way down.
+        """
+        self._stopping = True
         for task in self._tasks:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+    def _spawn(self, worker_id: int) -> asyncio.Task[None]:
+        task = asyncio.create_task(self._run(worker_id), name=f"pulse-worker-{worker_id}")
+        task.add_done_callback(lambda t, wid=worker_id: self._on_worker_done(wid, t))
+        return task
+
+    def _on_worker_done(self, worker_id: int, task: asyncio.Task[None]) -> None:
+        """Fires once `worker_id`'s task actually ends, for any reason.
+        During a clean `stop()` this is expected and a no-op. Otherwise —
+        cancelled from outside `stop()` (a test simulating a crash; a real
+        bug elsewhere calling `.cancel()` on the wrong task), or an
+        exception that was not `Exception` and so escaped `_run`'s own
+        per-event guard — this worker is genuinely gone: recover whatever
+        it still held checkpointed, then respawn a replacement under the
+        same `worker_id` so the pool's own advertised capacity
+        (`worker_count`) stays true rather than silently shrinking by one
+        for the rest of the run.
+        """
+        if self._stopping:
+            return
+        recovered = self._recover_worker(worker_id)
+        if task.cancelled():
+            logger.warning("worker-%d died (cancelled); recovered %d in-flight event(s)", worker_id, recovered)
+        else:
+            logger.error(
+                "worker-%d died (%r); recovered %d in-flight event(s)",
+                worker_id, task.exception(), recovered,
+            )
+        replacement = self._spawn(worker_id)
+        self._tasks = [replacement if t is task else t for t in self._tasks]
+
+    def _recover_worker(self, worker_id: int) -> int:
+        """Everything `worker_id` still had checkpointed gets released from
+        `in_flight` and handed straight back to the live queue — the same
+        two-step shape a DEFER already uses (metrics.observe_retry mirrors
+        metrics.observe_defer's own release; queue.put_replayed mirrors
+        deferral.py's own drain replay), just triggered by a worker's death
+        instead of a routing decision. Returns the count recovered, purely
+        for logging/tests — not part of MetricsFrame itself."""
+        orphaned = self._checkpoint.recover_worker(worker_id)
+        for event in orphaned:
+            metrics.observe_retry(event)
+            self.queue.put_replayed(event)
+        self.recovered_count += len(orphaned)
+        return len(orphaned)
+
+    def reset_checkpoint(self) -> None:
+        """Swap in a fresh, empty checkpoint store — called by
+        Engine.reset() after `stop()` has already cancelled every worker
+        cleanly (no recovery fires for that cancellation; see
+        `_on_worker_done`'s own docstring). Those workers' in-flight rows
+        are for events this reset is already discarding on purpose (the
+        same intent `queue.clear()` carries out for anything still
+        queued), not events to resurrect into the clean post-reset queue —
+        left uncleared, they would leak forever and could even collide
+        with a same-worker_id begin() after `start()` respawns fresh
+        tasks under the same 0..N-1 ids."""
+        self._checkpoint.close()
+        self._checkpoint = CheckpointStore()
+
+    def kill_worker(self, worker_id: int | None = None) -> int | None:
+        """`POST /chaos/kill-worker`'s own mechanism: cancel one live
+        worker task outright. This is real cancellation — the same
+        `.cancel()` a genuine crash would deliver — not a simulated
+        effect; `_on_worker_done` recovers and respawns exactly as it
+        would for an unplanned death, because from the pool's own
+        perspective there is no difference between the two.
+
+        `worker_id=None` (the dashboard button's own case) prefers a
+        worker `checkpoint.busy_worker_ids()` reports as currently holding
+        something, so the demo's most memorable ten seconds reliably shows
+        a real recovery — an idle worker (blocked on `queue.get()`) is
+        still a valid, real kill, just a visually uninteresting one at
+        baseline load with nothing in flight to recover. Falls back to any
+        live worker if none are currently busy.
+
+        Returns the killed worker_id, or None if the pool has no live
+        worker to kill at all (called before `start()`, or after `stop()`).
+        """
+        if not self._tasks:
+            return None
+        if worker_id is None:
+            candidates = [
+                wid for wid in self._checkpoint.busy_worker_ids()
+                if 0 <= wid < len(self._tasks) and not self._tasks[wid].done()
+            ]
+            worker_id = random.choice(candidates) if candidates else random.randrange(len(self._tasks))
+        elif not (0 <= worker_id < len(self._tasks)):
+            raise ValueError(f"no such worker_id: {worker_id}")
+        self._tasks[worker_id].cancel()
+        return worker_id
 
     # -- the loop -----------------------------------------------------------
 
@@ -156,11 +284,23 @@ class WorkerPool:
         while True:
             event = await self.queue.get()
             try:
-                await self._handle(event)
+                await self._handle(event, worker_id)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - one bad event must not kill the worker
                 logger.exception("worker-%d failed on %s", worker_id, event.event_id)
+                # This worker survives (caught here, the loop continues),
+                # but whatever it had begun checkpointing for THIS turn —
+                # one event, or the remainder of a batch a raised exception
+                # aborted partway through — will now never reach its own
+                # mark_done(). Left alone, that is a silent, permanent
+                # pipeline loss (and a leaked in_flight slot) introduced BY
+                # this very mechanism, not prevented by it — the opposite
+                # of the point. Recovering here, not only on an actual dead
+                # task, is what keeps that promise for the "worker survives
+                # an exception" case too, not just the "worker dies
+                # outright" case the prompt names explicitly.
+                self._recover_worker(worker_id)
             finally:
                 self.queue.task_done()
 
@@ -239,13 +379,13 @@ class WorkerPool:
         elif result is Decision.SHED:
             self.shed_count += 1
 
-    async def _handle(self, event: Event) -> None:
+    async def _handle(self, event: Event, worker_id: int = -1) -> None:
         now = time.time()
         pressure_value = metrics.current_pressure(self.config, now=now)
         result, reason = self._resolve(event, pressure_value, now)
 
         if result is Decision.STREAM_NOW:
-            await self.serve(event)
+            await self.serve(event, worker_id)
             return
         if result in _OFF_PATH:
             self._dispatch_off_path(event, result, reason, pressure_value, now)
@@ -271,14 +411,14 @@ class WorkerPool:
                 continue
             try:
                 if extra_result is Decision.STREAM_NOW:
-                    await self.serve(extra)
+                    await self.serve(extra, worker_id)
                 else:  # DEFER, SAMPLE_ROLLUP, or SHED
                     self._dispatch_off_path(extra, extra_result, extra_reason, pressure_value, extra_now)
             finally:
                 self.queue.task_done()
 
         try:
-            await self._serve_batch(batch)
+            await self._serve_batch(batch, worker_id)
         finally:
             # The very first event's task_done() is covered by _run()'s own
             # finally; every other batch member needs its own, and must
@@ -288,32 +428,76 @@ class WorkerPool:
             for _ in batch[1:]:
                 self.queue.task_done()
 
-    async def serve(self, event: Event) -> None:
+    async def serve(self, event: Event, worker_id: int = -1) -> None:
         """Simulate the service time for one event, then land it in the sink.
 
         Ordered service-then-complete-then-sink: latency is measured as the
         moment work genuinely finishes, and the sink write is not on the
         critical path the latency percentile reports.
+
+        Stage I: `checkpoint.begin()`/`mark_done()` bracket the one
+        `await` in this function — the only point a worker's own death can
+        land inside. `worker_id` defaults to -1 (never a real pool
+        worker's id) so direct calls that bypass the supervised pool
+        entirely (tests calling `pool.serve(event)` straight, with no
+        worker_id) still checkpoint correctly; -1's rows simply never get
+        recovered by `_on_worker_done`, which only ever recovers a
+        concrete worker_id whose task it just watched end.
         """
+        self._checkpoint.begin(event, worker_id)
         service_seconds = event.cost / self.capacity_units_per_sec
         await asyncio.sleep(service_seconds)
         metrics.observe_complete(event)
         self._sink_write(event)
         self.served_count += 1
+        if not self._checkpoint.mark_done(event.event_id):
+            metrics.observe_exactly_once_violation(
+                event, "serve(): mark_done found no in-flight row"
+            )
 
-    async def _serve_batch(self, batch: list[Event]) -> None:
+    async def _serve_batch(self, batch: list[Event], worker_id: int = -1) -> None:
         """One combined sleep for the whole batch — decision.batch_cost()
         is what makes this genuinely cheaper than serving each member
         individually, not merely labelled differently. Each member's own
         latency is still measured from its own ingest_ts, so an event
         gathered late into an otherwise-quick batch correctly shows the
-        wait it actually had, batch efficiency notwithstanding."""
+        wait it actually had, batch efficiency notwithstanding.
+
+        Stage I: every member gets its own `checkpoint.begin()` up front
+        (write-ahead, before the one shared `await`) and its own
+        `checkpoint.mark_done()` in the per-member loop below, right next
+        to that member's own `observe_complete`/sink write — never a
+        single checkpoint for the batch as a whole. See checkpoint.py's
+        own docstring for why: a real cancellation (a worker death) can
+        only ever land at an `await`, so an explicit `asyncio.sleep(0)`
+        opens exactly one such point at the TOP of each iteration, before
+        that member is touched at all — a dying worker therefore always
+        leaves the loop cleanly between two members, never inside one.
+        Every member this loop had already started is fully finished
+        (observed, sink-written, counted, marked done) with no `await`
+        between those four steps; every member the loop had not yet
+        reached is still fully checkpointed. Either way, `_recover_worker`
+        gets back exactly the members genuinely left unfinished — a batch
+        of 50 that got through 47 before its worker died retries the
+        remaining 3, not 50, and never risks double-counting metrics for
+        a member that had already been observed once.
+        """
+        for e in batch:
+            self._checkpoint.begin(e, worker_id)
         total_cost = decision.batch_cost([e.cost for e in batch])
         service_seconds = total_cost / self.capacity_units_per_sec
         await asyncio.sleep(service_seconds)
         now = time.time()
         for e in batch:
+            # The one deliberate yield point — see this method's own
+            # docstring for why it sits here, before this member's own
+            # work starts, rather than after.
+            await asyncio.sleep(0)
             metrics.observe_complete(e, now=now)
             self._sink_write(e)
             self.served_count += 1
+            if not self._checkpoint.mark_done(e.event_id):
+                metrics.observe_exactly_once_violation(
+                    e, "_serve_batch(): mark_done found no in-flight row"
+                )
         self.batched_count += len(batch)

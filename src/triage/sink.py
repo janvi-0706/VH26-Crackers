@@ -137,6 +137,20 @@ class SQLiteSink:
 
     get = read
 
+    def recent(self, n: int) -> list[Event]:
+        """The `n` most recently committed rows, newest first. Stage I's
+        chaos duplicate-flood reads from here rather than from any
+        in-memory ring buffer: this table already durably holds a full
+        `Event` payload per business fact, keyed by `idempotency_key`, so
+        "N recent events to replay" is a real read of what the pipeline
+        actually, durably processed — not a second, parallel notion of
+        "recent" this file would have to keep in sync with the first."""
+        rows = self.connection.execute(
+            "SELECT payload_json FROM events_sink ORDER BY committed_ts DESC LIMIT ?",
+            (n,),
+        ).fetchall()
+        return [Event.model_validate_json(row["payload_json"]) for row in rows]
+
     def count(self) -> int:
         row = self.connection.execute("SELECT COUNT(*) FROM events_sink").fetchone()
         return int(row[0])
@@ -210,6 +224,10 @@ def read(idempotency_key: str) -> Event | None:
     return _default_sink.read(idempotency_key)
 
 
+def recent(n: int) -> list[Event]:
+    return _default_sink.recent(n)
+
+
 def count() -> int:
     return _default_sink.count()
 
@@ -220,3 +238,18 @@ def write_rollup(rollup: Rollup, *, now: float | None = None) -> str:
 
 def rollup_count() -> int:
     return _default_sink.rollup_count()
+
+
+def reset_default_store() -> None:
+    """Tests only, mirroring deferral.reset_default_store()/ledger.reset().
+    Never called by Engine.reset(): `events_sink` is durable across a demo
+    reset by the same design choice `deferral.py`'s own buffer already
+    rests on (a completed business fact should not vanish because a
+    presenter clicked Reset) — this exists only so a test suite running
+    many independent real Engines back to back in one process (each
+    sharing this one ambient sink, same as they share metrics/ledger) can
+    give one test a clean, unambiguous view of "recent", the same reason
+    every other ambient store's own reset exists."""
+    global _default_sink
+    _default_sink.close()
+    _default_sink = SQLiteSink()

@@ -14,7 +14,10 @@ import { ShedLogPanel } from "./components/panels/ShedLogPanel";
 import { EventInspectorPanel } from "./components/panels/EventInspectorPanel";
 import { WorkerPoolGridPanel } from "./components/panels/WorkerPoolGridPanel";
 import { CostComparisonPanel } from "./components/panels/CostComparisonPanel";
+import { ChaosControlPanel } from "./components/panels/ChaosControlPanel";
+import { RecoveryPanel } from "./components/panels/RecoveryPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
+import { useState } from "react";
 import * as api from "./lib/api";
 
 /**
@@ -31,6 +34,7 @@ import * as api from "./lib/api";
  *   Row 3 (what happened to the backlog): Deferred(3) + Worker pool(3) +
  *     Cost comparison(3) + Shed log(3)
  *   Row 4 (interactive / reference): Event inspector(4) + Weights(8)
+ *   Row 5 (Stage I — chaos): Chaos control(6) + Recovery(6)
  *
  * `ModeByTierPanel` (Stage D) was dropped here, not just left off the
  * grid: `LadderPanel` (Stage E) reads the real `ladder_rung` field and
@@ -45,6 +49,7 @@ import * as api from "./lib/api";
  */
 export default function App() {
   const { status, latest, history, clearHistory } = useMetricsSocket();
+  const [workersKilled, setWorkersKilled] = useState(0);
 
   const handleReset = async () => {
     await api.reset();
@@ -68,7 +73,7 @@ export default function App() {
       </div>
 
       <div className="min-h-0 flex-1">
-        <PanelGrid rows={4}>
+        <PanelGrid rows={5}>
           {/* Row 1 */}
           <ConservationPanel latest={latest} />
           <P0ScoreboardPanel latest={latest} />
@@ -89,6 +94,12 @@ export default function App() {
           {/* Row 4 */}
           <EventInspectorPanel />
           <WeightsPanel />
+
+          {/* Row 5 — Stage I */}
+          <ChaosControlPanel
+            onWorkerKilled={() => setWorkersKilled((n) => n + 1)}
+          />
+          <RecoveryPanel latest={latest} workersKilled={workersKilled} />
         </PanelGrid>
       </div>
     </div>

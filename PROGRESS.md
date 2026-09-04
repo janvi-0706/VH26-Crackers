@@ -2127,3 +2127,129 @@ core build exactly as this prompt's own title says. Everything built
 after this tag is, from here on, explicitly "since the jury tag," not
 silently folded into what the tag already certifies as tested and
 demoed.
+
+## Stage I — write-ahead checkpoint: exactly-once across a worker death
+
+**Built**
+
+- `checkpoint.py` (new) — `CheckpointStore`, one per `WorkerPool` (NOT an
+  ambient module singleton like `sink.py`/`deferral.py` — worker_id 0..N-1
+  only means something within one pool, and sharing one global table
+  across every `WorkerPool` a test constructs would let unrelated tests'
+  reused event_ids collide). Per-EVENT `begin()`/`mark_done()`, even
+  inside a batch — `worker._serve_batch()` still issues one combined
+  `asyncio.sleep()` for cost-model reasons, but a deliberate
+  `asyncio.sleep(0)` at the TOP of each per-member iteration (before that
+  member is touched, not after) is the only point a real cancellation can
+  land, so a dying worker always leaves the loop cleanly between two
+  members — never mid-member, and never at risk of double-recording one
+  member's own `observe_complete`. `recover_worker(worker_id)` returns and
+  clears exactly what one specific worker still held, never a whole batch
+  for a few real stragglers, and never a still-alive worker's own
+  in-progress event.
+- `worker.py` — `WorkerPool` now supervises its own tasks
+  (`_spawn`/`_on_worker_done`): a task that ends for a real reason (not
+  because `stop()` asked it to) gets its checkpointed events recovered
+  (`metrics.observe_retry` + `queue.put_replayed`, the same two-step shape
+  a DEFER already uses) and a replacement task spawned under the same
+  `worker_id`, so the pool's own advertised capacity never silently
+  shrinks. The per-event exception path in `_run()` also recovers its own
+  worker's checkpoint (not just an outright task death) — a raised
+  exception aborting a batch partway through would otherwise leak those
+  rows and their events forever, which this mechanism existing would have
+  *caused*, not prevented.
+- `metrics.py` — `retries` and `exactly_once_violations` are real now, not
+  stub zeros. `exactly_once_violations` increments on a genuinely checked
+  signal (`checkpoint.begin()`/`mark_done()` reporting an unexpected row
+  state), the same way `critical_failure_count()` is a live, continuously
+  asserted invariant rather than a value nothing increments — "must always
+  read 0" is a checked claim, not an assumed one.
+- `app.py` — `Engine.reset()` now also calls `workers.reset_checkpoint()`
+  after `workers.stop()`: those workers' in-flight rows are for events the
+  reset is already discarding on purpose (same intent as `queue.clear()`),
+  not events to resurrect into the clean post-reset queue.
+
+**Tests**: `tests/test_checkpoint.py` (the store in isolation — the "3 of
+50, never 50" claim proved directly on the store, plus the never-touch-a-
+different-worker's-own-row guarantee) and
+`tests/test_stage_i_exactly_once.py` (through a real `WorkerPool`: a
+genuine `task.cancel()` mid-batch, timed via a `sink_write` side effect,
+retries only the unfinished members; the single-event STREAM_NOW path;
+and a dead worker gets replaced so pool capacity never shrinks).
+
+**Full suite, clean, no competing process: 973 passed** (948 + 25 new).
+
+## Stage I — chaos endpoints + ingest-time dedup
+
+**Built**
+
+- `dedup.py` (new) — a hand-rolled `BloomFilter` (double hashing off one
+  SHA-256 digest, sized from expected-items/false-positive-rate via the
+  standard formulas — no third-party probabilistic-filter library, per
+  CLAUDE.md's own originality rule) as a candidate check ONLY, backed by
+  `Deduplicator`'s bounded exact set (an `OrderedDict` LRU). THE rule the
+  whole file exists to uphold: an unconfirmed Bloom hit — a genuine hash
+  collision, or a real repeat that aged out of the bounded window,
+  deliberately treated as the same case — is never suppressed, for any
+  tier, P0 included; only an exact-set-CONFIRMED hit is. Proved from both
+  directions in `tests/test_dedup.py`: a forced real Bloom collision on a
+  P0-shaped key is still admitted (`test_an_unconfirmed_bloom_hit_is_never
+  _suppressed_for_any_tier_p0_included`), and a genuinely repeated P0
+  key still IS suppressed (`test_a_confirmed_p0_duplicate_is_still
+  _suppressed_this_is_not_hard_rule_3` — dedup is an identity check, a
+  different question from hard rule 3's own "once admitted, is P0 ever
+  batched/deferred/sampled/shed").
+- `app.py` — `Engine._ingest()` gates every event (organic traffic
+  included, not a chaos-only special case) through `self.dedup.check()`
+  before `queue.put()`: a confirmed duplicate never occupies a queue slot
+  or a worker's simulated service time. `Engine.chaos_kill_worker()` and
+  `Engine.chaos_duplicate_flood(n)` plus `POST /chaos/kill-worker` and
+  `POST /chaos/duplicate-flood`. The flood replays up to `n` of
+  `sink.recent()`'s most-recently-committed real events through
+  `generator.retry()` — the SAME identity-model primitive (new event_id,
+  same dedup_key/partition_key) this project has carried since Stage A,
+  not a chaos-specific shortcut — so a flood is indistinguishable, at
+  every field but event_id/seq, from a real duplicate delivery, and is
+  routed through the identical dedup gate `_ingest()` itself uses.
+- `sink.py` — `recent(n)` (durable "most recent N events" for the flood to
+  replay from) and `reset_default_store()` (tests-only isolation for the
+  ambient sink shared across many real-Engine tests in one suite run —
+  sink.py never had ANY reset before this; found because
+  `test_duplicate_flood_of_1000_leaves_the_sink_row_count_unchanged`
+  passed in isolation but failed in the full 973-test run: `sink.recent()`
+  was reading rows committed by an unrelated, already-finished test's own
+  engine, starving this test's own flood of the dedup_keys it had just
+  admitted. Not wired into `Engine.reset()` — `events_sink` stays durable
+  across a demo reset by the same design choice `deferral.py`'s own buffer
+  already rests on).
+- `worker.py`/`checkpoint.py` — `WorkerPool.kill_worker()` (real
+  `task.cancel()` on one live worker, preferring one `checkpoint
+  .busy_worker_ids()` reports as actually holding something, so the
+  demo's own most memorable ten seconds reliably shows a real recovery)
+  and `metrics.py`'s new `observe_duplicate_caught()` (`duplicates_caught`
+  real now, not stub).
+- Dashboard: `ChaosControlPanel` (KILL WORKER / DUPLICATE FLOOD, bold
+  styling matching SPIKE's own "unmissable" precedent) and `RecoveryPanel`
+  (workers killed — tracked client-side from the POST response, the only
+  place that number exists, exactly like Stage H's cost panel; events
+  retried, duplicates suppressed, exactly-once violations — the last one
+  latched red client-side the same way `ConservationPanel` already is, so
+  a judge walking up mid-demo can trust red means something really broke
+  during this run). Neither needed a `MetricsFrame` contract change —
+  `retries`/`duplicates_caught`/`exactly_once_violations` were already
+  frozen fields; "workers killed" only ever exists as a POST response, so
+  it lives in `App.tsx` state, not the wire schema. Added as a 5th
+  `PanelGrid` row (`rows={4}` → `rows={5}`); reverified live at 1920x1080,
+  still zero scroll.
+
+**Verified live**, real server: killed a worker mid-spike (dashboard
+showed "worker 1 killed — recovering…", pool healed), then a 1000-event
+duplicate flood immediately after (`replayed 1000 · suppressed 1000 ·
+admitted 0`, Recovery panel: workers killed 1, retried 6, suppressed
+1000, violations 0).
+
+**Full suite, clean, no competing process: 973 passed** — `tests/test_dedup.py`
+(10 tests) and `tests/test_chaos.py` (6 tests) account for 16 of the 25 new
+tests since Stage H; `checkpoint.py`'s own 9 (above) make up the rest.
+Both Stage I sub-prompts land in one git commit, below — see that
+commit's own message for why.

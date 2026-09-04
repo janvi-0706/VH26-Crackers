@@ -32,12 +32,13 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import decision, deferral, ledger, metrics
+from . import decision, deferral, ledger, metrics, sink
 from .classifier import Classifier
 from .config import Config, load_config
 from .contracts import Event, EventType, MetricsFrame
+from .dedup import Deduplicator
 from .fake_metrics import FakeSource
-from .generator import EventGenerator
+from .generator import EventGenerator, GeneratedEvent
 from .queue import EventQueue, Mode as QueueMode
 from .worker import WorkerPool
 
@@ -74,6 +75,10 @@ class Engine:
         self.classifier = Classifier(config=self.config)
         self.queue = EventQueue(config=self.config)
         self.workers = WorkerPool(self.queue, config=self.config)
+        # Per-Engine, not ambient — same reasoning as generator.admission
+        # (AdmissionControl): a fresh Engine, or a /control/reset, must not
+        # inherit another run's dedup state.
+        self.dedup = Deduplicator()
         self._stop = asyncio.Event()
         self._ingest_task: asyncio.Task[None] | None = None
         self._drain_stop: asyncio.Event | None = None
@@ -113,6 +118,20 @@ class Engine:
         Cancelling in-flight work here is safe: worker.py's `finally:
         queue.task_done()` still runs on cancellation, so the queue's
         unfinished-count stays correct either way.
+
+        Stage I: `workers.stop()` cancels every worker cleanly
+        (`WorkerPool._stopping` suppresses the death-recovery path — see
+        its own docstring), so none of those workers' in-flight checkpoint
+        rows get recovered-and-replayed here, on purpose: this reset
+        already intends to discard whatever those events were mid-serving
+        (the same intent `queue.clear()` already carries out for anything
+        still queued), not resurrect pre-reset events into the clean
+        post-reset queue. `workers.reset_checkpoint()` clears those
+        now-orphaned rows explicitly, the same way `ledger.reset()` clears
+        the ledger — leaving them would silently leak rows forever across
+        every future reset, and would still be sitting there, tagged to
+        worker_ids that now belong to brand-new post-reset tasks, the next
+        time any of THOSE workers happened to die for real.
         """
         current_mode = self.queue.mode
         self.generator.set_rate(self.config.baseline_eps)
@@ -123,7 +142,9 @@ class Engine:
         # every other piece of live control-loop state a clean demo
         # restart should not inherit.
         self.generator.admission.reset()
+        self.dedup = Deduplicator()
         await self.workers.stop()
+        self.workers.reset_checkpoint()
         self.queue.clear()
         metrics.reset()
         metrics.set_mode(current_mode)
@@ -141,6 +162,67 @@ class Engine:
         event = self.classifier.classify(raw)
         await self.queue.put(event)
         return event
+
+    async def chaos_kill_worker(self) -> int | None:
+        """`POST /chaos/kill-worker`'s own mechanism: real cancellation of
+        one live worker task, not a simulated effect — see
+        `WorkerPool.kill_worker`'s own docstring for why it prefers a
+        currently-busy worker, and `_on_worker_done` for the recovery and
+        respawn that follow automatically, exactly as they would for an
+        unplanned death."""
+        return self.workers.kill_worker()
+
+    async def chaos_duplicate_flood(self, n: int) -> dict[str, int]:
+        """`POST /chaos/duplicate-flood`'s own mechanism: replay up to `n`
+        of the most recently sink-committed events (`sink.recent()` — a
+        real durable read, not an in-memory guess at "recent"), each as a
+        genuinely new physical delivery of the SAME business fact —
+        `generator.retry()` mints a fresh `event_id` and `ingest_ts` for
+        the same `dedup_key`/`partition_key`, the exact identity-model
+        primitive this project has carried since Stage A (docs/DATA_MODEL.md,
+        ADR 0003), not a chaos-specific shortcut. `classifier.classify()`
+        then deterministically re-derives the SAME `idempotency_key` from
+        that `dedup_key` (see classifier.py), so a replayed event is
+        indistinguishable, at every field but `event_id` and `seq`, from a
+        real duplicate delivery.
+
+        Routed through `self.dedup.check()` — the identical gate
+        `_ingest()` itself uses on every real event, not a second, fake
+        check that only exists for this endpoint. A correctly-working
+        Deduplicator suppresses effectively all of them (each `dedup_key`
+        was, by construction, already inside the bounded exact-set window
+        from its own original admission); any that a genuine Bloom false
+        positive or an aged-out window entry lets through still land in
+        the sink safely, unduplicated, via `sink.write()`'s own
+        idempotency-key upsert — belt AND suspenders, not one covering for
+        the other's absence.
+        """
+        sources = sink.recent(n)
+        admitted = 0
+        suppressed = 0
+        for original in sources:
+            raw = GeneratedEvent(
+                event_id=original.event_id,
+                dedup_key=original.dedup_key,
+                partition_key=original.partition_key,
+                type=original.type,
+                payload_size=original.payload_size,
+                ingest_ts=original.ingest_ts,
+            )
+            replayed = self.generator.retry(raw)
+            event = self.classifier.classify(replayed)
+            if self.dedup.check(event.dedup_key):
+                metrics.observe_duplicate_caught(event)
+                suppressed += 1
+            else:
+                await self.queue.put(event)
+                admitted += 1
+        return {
+            "requested": n,
+            "replayed": len(sources),
+            "admitted": admitted,
+            "suppressed": suppressed,
+        }
 
     async def start(self) -> None:
         self.workers.start()
@@ -178,9 +260,28 @@ class Engine:
         Deciding as late as possible uses the freshest signal, and it is
         also the only point that can actually act on the answer — batch
         execution and deferral both live in worker.py now, not just their
-        audit trail."""
+        audit trail.
+
+        Stage I adds exactly one more gate here, before queue.put(): a
+        dedup check on `event.dedup_key`. This is deliberately NOT the
+        same kind of thing as the routing decisions this docstring's own
+        first paragraph says do not belong at ingest — those (batch vs.
+        defer) are about WHAT TO DO with an event this pipeline has
+        already agreed exists; dedup is about WHETHER this event is a
+        second physical delivery of a business fact already admitted
+        once. That question does not get better with a fresher signal the
+        way pressure-based routing does — it is exactly as answerable at
+        ingest as it will ever be — and answering it here, before
+        queue.put(), is the entire point: a confirmed duplicate never
+        occupies a queue slot or a worker's simulated service time.
+        `self.dedup.check()` never suppresses tier-blind: see dedup.py's
+        own docstring for why an unconfirmed Bloom hit is always admitted,
+        for every tier, P0 included."""
         async for raw in self.generator.events(self._stop):
             event = self.classifier.classify(raw)
+            if self.dedup.check(event.dedup_key):
+                metrics.observe_duplicate_caught(event)
+                continue
             await self.queue.put(event)
 
 
@@ -195,6 +296,10 @@ class ModeBody(BaseModel):
 class InjectBody(BaseModel):
     type: str
     partition_key: str | None = None
+
+
+class DuplicateFloodBody(BaseModel):
+    count: int = 1000
 
 
 class WeightsBody(BaseModel):
@@ -313,6 +418,29 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
                 "deadline_ts": event.deadline_ts,
             }
         )
+
+    @app.post("/chaos/kill-worker")
+    async def chaos_kill_worker() -> JSONResponse:
+        """Cancel one live worker task for real. `worker_id: null` means
+        the pool had no live worker to kill (called before start or after
+        stop) rather than an error — killing nothing is a valid, if
+        uninteresting, outcome."""
+        if fake:
+            return _fake_mode_error("chaos: kill-worker")
+        worker_id = await app.state.engine.chaos_kill_worker()
+        return JSONResponse({"worker_id": worker_id})
+
+    @app.post("/chaos/duplicate-flood")
+    async def chaos_duplicate_flood(body: DuplicateFloodBody) -> JSONResponse:
+        """Replay up to `count` of the most recently sink-committed events
+        as genuine new duplicate deliveries (same dedup_key/idempotency_key,
+        new event_id) — see Engine.chaos_duplicate_flood's own docstring."""
+        if fake:
+            return _fake_mode_error("chaos: duplicate-flood")
+        if body.count <= 0:
+            return JSONResponse({"error": "count must be positive"}, status_code=422)
+        result = await app.state.engine.chaos_duplicate_flood(body.count)
+        return JSONResponse(result)
 
     @app.get("/control/weights")
     async def get_control_weights() -> JSONResponse:
