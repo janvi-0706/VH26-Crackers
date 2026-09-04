@@ -2044,3 +2044,86 @@ machine.
 No tests to run for a docs-only prompt; verified instead by grep-checking
 every import claim in the component diagram against the real source
 files before writing the diagram, not after.
+
+## Stage H — final prompt of the core build: demo script, Q&A, round-2, jury tag
+
+**Built**
+
+- `docs/DEMO.md` — the 5-minute stage script, six timed beats (0:00
+  baseline, 0:30 naive+spike, 1:30 reset/adaptive+spike, 3:00
+  conservation/shed-log/inspector/audit.csv, 4:15 benchmark table, 4:45
+  closing + the one honest simulated-number sentence), each beat naming
+  the exact panel/button to touch and the line to say, not just "show the
+  dashboard."
+- `docs/QA.md` — seven answers, each under 100 words (checked by word
+  count, 64-87 words), each citing a real file/test rather than asserting
+  from memory: the "why not Kafka" and "is it real" answers point at ADRs
+  0001/0002; "what if critical events alone exceed capacity" and "where
+  does it actually break" both cite the same real number from this
+  prompt's own bench rerun (P0 alone exceeds capacity at 40x, 5.6%→ now
+  4.1% attainment — see below for why the exact number moved); "per-
+  customer ordering" answers honestly that `partition_key` exists but
+  ordering by it is not enforced, citing `RUNBOOK.md`'s own cut list
+  rather than implying it works; "how did you pick the weights" says
+  plainly that they were engineering judgment, not fitted from data.
+- `docs/rounds/round-2.md` — same four-section format as round-1 (what we
+  built / what we're showing / what's incomplete / next hours), plus the
+  requested `git log --oneline --decorate stage-c..HEAD`. **Found and
+  fixed a gap before writing it**: `stage-c` was never actually tagged
+  (only `stage-b` was, despite `RUNBOOK.md`'s own "tag at every stage
+  boundary" rule) — retroactively tagged at `7cee815`, the exact commit
+  `RUNBOOK.md` calls the Stage C boundary and round-1's own evidence log
+  already showed as its HEAD, not guessed at. The "what's incomplete"
+  section names the seven still-stub `MetricsFrame` fields
+  (`throughput`, `cost_adaptive`, `cost_naive`, `retries`,
+  `duplicates_caught`, `exactly_once_violations`, `spike_multiplier` —
+  confirmed by re-reading `metrics.py`'s own module docstring, not from
+  memory) plus the two other honest gaps (partition ordering, chaos
+  injection) already established in this session.
+
+**`make test` — final clean run, no other process competing (checked via
+`Get-CimInstance Win32_Process` before starting, unlike the P18 run):**
+
+```
+$ make test
+948 passed, 2 warnings in 468.59s (0:07:48)
+```
+
+Both tests that flaked under contention in the P18 run
+(`test_worker_pool_sustains_150_units_per_second_within_5_percent`,
+`test_a_real_gap_opens_between_offered_and_admitted_under_sustained_spike`)
+passed clean here — confirms the P18 diagnosis (environmental timer
+contention, not a code defect) rather than leaving it as an open
+question.
+
+**`make bench` — final run. Targets still not met; flagged immediately,
+per CLAUDE.md's own instruction, exactly as P17 did the first time:**
+
+| Target | Result | Met? |
+|---|---|---|
+| naive-at-spike P0 p99 in the seconds | 767ms | ❌ |
+| adaptive-at-spike P0 p99 under 200ms | 290ms | ❌ |
+| zero P0 events lost, any config | 0 lost, all 4 configs | ✅ |
+
+Both misses are the same two root causes already documented at P17, not
+new problems: naive's own p99 sits at hundreds of ms rather than
+"seconds" because `admission.py`'s AIMD throttling applies regardless of
+mode (Stage F did not exist yet when "seconds" was the calibration
+target); adaptive's own p99 sits above 200ms because of the
+already-documented worker-contention floor (6 non-preemptive workers,
+Stage C/D). The exact numbers moved slightly from P17's run (272ms →
+290ms adaptive; 765ms → 767ms naive; 40x P0 attainment 5.6% → 4.1%) —
+expected run-to-run variance from the same real, wall-clock-timed system,
+not a regression; the chain (naive worse than adaptive, zero P0 loss in
+every config, a sharp real cliff at 40x) is identical both times. Not
+retuned to pass — CLAUDE.md's own rule (`config/tiers.yaml` frozen,
+Stage G's own prompt was "build the harness," not "retune the system")
+still applies, and retuning belongs to a future prompt that the user
+explicitly chooses once they've seen this real number twice now, not one
+this prompt's own scope covers.
+
+**`git tag v1-jury`** — created at this commit, marking the end of the
+core build exactly as this prompt's own title says. Everything built
+after this tag is, from here on, explicitly "since the jury tag," not
+silently folded into what the tag already certifies as tested and
+demoed.

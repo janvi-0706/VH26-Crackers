@@ -1,0 +1,187 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PULSE benchmark report</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background: #0b0e14; color: #e6e9f2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          margin: 0; padding: 32px; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 15px; color: #8b93a7; text-transform: uppercase; letter-spacing: 0.05em;
+        border-bottom: 1px solid #232a3b; padding-bottom: 6px; margin-top: 40px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin: 12px 0; }
+  th, td { border: 1px solid #232a3b; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #12161f; color: #8b93a7; text-transform: uppercase; font-size: 10px; }
+  td.ok { color: #34d399; font-weight: 700; }
+  td.bad { color: #f87171; font-weight: 700; }
+  .banner { font-size: 22px; font-weight: 900; padding: 20px; border-radius: 10px; text-align: center;
+             margin: 16px 0; }
+  .banner.pass { background: rgba(52,211,153,0.12); color: #34d399; border: 2px solid #34d399; }
+  .banner.fail { background: rgba(248,113,113,0.12); color: #f87171; border: 2px solid #f87171; }
+  .chart { background: #12161f; border: 1px solid #232a3b; border-radius: 10px; padding: 8px; margin: 12px 0; }
+  .note { color: #8b93a7; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>PULSE benchmark report</h1>
+<p class="note">
+  Four configs (naive/adaptive x baseline/spike), 90s each, headless —
+  <code>bench/run.py</code>, driven directly against <code>Engine</code>, no HTTP involved.
+</p>
+
+<div class="banner fail">
+  TARGET(S) NOT MET — calibration problem, not a reporting problem
+</div>
+
+<h2>Target check</h2>
+<table>
+<tr><th>Target</th><th>Result</th><th>Met?</th></tr>
+<tr><td>naive-at-spike P0 p99 in the seconds</td><td>767ms</td>
+    <td class="bad">NO</td></tr>
+<tr><td>adaptive-at-spike P0 p99 under 200ms</td><td>290ms</td>
+    <td class="bad">NO</td></tr>
+<tr><td>zero critical (P0) events lost, any config</td><td>0 lost across 4 configs</td>
+    <td class="ok">yes</td></tr>
+</table>
+
+<h2>Four-config matrix</h2>
+<div class="chart"><svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace">
+<text x="320.0" y="16" text-anchor="middle" font-size="13" font-weight="700" fill="#e6e9f2">P0/P1/P2 p99 latency by config (log scale — naive-spike is seconds, everything else is ms)</text>
+<line x1="56" y1="260.0" x2="620" y2="260.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="202.5" x2="620" y2="202.5" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="145.0" x2="620" y2="145.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="87.5" x2="620" y2="87.5" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="30.0" x2="620" y2="30.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="38" text-anchor="end" font-size="10" fill="#5b6478">p99 (ms, log)</text>
+<rect x="73.6" y="132.6" width="28.2" height="127.4" fill="#60a5fa"/>
+<rect x="108.9" y="33.5" width="28.2" height="226.5" fill="#c084fc"/>
+<rect x="144.1" y="35.2" width="28.2" height="224.8" fill="#fb923c"/>
+<text x="126.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
+<rect x="214.6" y="91.4" width="28.2" height="168.6" fill="#60a5fa"/>
+<rect x="249.9" y="74.7" width="28.2" height="185.3" fill="#c084fc"/>
+<rect x="285.1" y="79.7" width="28.2" height="180.3" fill="#fb923c"/>
+<text x="267.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
+<rect x="355.6" y="132.8" width="28.2" height="127.2" fill="#60a5fa"/>
+<rect x="390.9" y="143.8" width="28.2" height="116.2" fill="#c084fc"/>
+<rect x="426.1" y="173.7" width="28.2" height="86.3" fill="#fb923c"/>
+<text x="408.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
+<rect x="496.6" y="116.0" width="28.2" height="144.0" fill="#60a5fa"/>
+<rect x="531.9" y="100.7" width="28.2" height="159.3" fill="#c084fc"/>
+<rect x="567.1" y="65.8" width="28.2" height="194.2" fill="#fb923c"/>
+<text x="549.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="56" y="286" width="8" height="8" fill="#60a5fa"/>
+<text x="67" y="294" font-size="10" fill="#8b93a7">P0</text>
+<rect x="88" y="286" width="8" height="8" fill="#c084fc"/>
+<text x="99" y="294" font-size="10" fill="#8b93a7">P1</text>
+<rect x="120" y="286" width="8" height="8" fill="#fb923c"/>
+<text x="131" y="294" font-size="10" fill="#8b93a7">P2</text>
+</svg></div>
+<table>
+<tr><th>Config</th><th>Rate (eps)</th><th>Throughput (eps)</th><th>p50</th><th>p95</th><th>p99</th>
+    <th>SLA attainment</th><th>Deferred</th><th>Batched</th><th>Sampled</th><th>Shed</th>
+    <th>Value delivered</th><th>Value shed</th><th>P0 lost</th><th>Chain OK</th></tr>
+<tr><td>naive-baseline</td><td>16.6</td><td>16.2</td><td>P0: 120ms<br>P1: 79ms<br>P2: 21ms</td><td>P0: 140ms<br>P1: 346ms<br>P2: 30ms</td><td>P0: 150ms<br>P1: 7.50s<br>P2: 7.02s</td><td>P0: 100.0%<br>P1: 95.0%<br>P2: 100.0%</td><td>24</td><td>156</td><td>0</td><td>24</td><td>24950</td><td>72</td><td class="ok">0</td><td class="ok">yes</td></tr>
+<tr><td>naive-spike</td><td>333.0</td><td>194.1</td><td>P0: 656ms<br>P1: 719ms<br>P2: 624ms</td><td>P0: 732ms<br>P1: 1.17s<br>P2: 889ms</td><td>P0: 767ms<br>P1: 1.48s<br>P2: 1.22s</td><td>P0: 1.8%<br>P1: 100.0%<br>P2: 100.0%</td><td>71</td><td>14520</td><td>12140</td><td>16</td><td>160866</td><td>68</td><td class="ok">0</td><td class="ok">yes</td></tr>
+<tr><td>adaptive-baseline</td><td>16.6</td><td>16.6</td><td>P0: 120ms<br>P1: 80ms<br>P2: 21ms</td><td>P0: 140ms<br>P1: 92ms<br>P2: 26ms</td><td>P0: 149ms<br>P1: 97ms<br>P2: 29ms</td><td>P0: 100.0%<br>P1: 100.0%<br>P2: 100.0%</td><td>1</td><td>123</td><td>0</td><td>0</td><td>24113</td><td>0</td><td class="ok">0</td><td class="ok">yes</td></tr>
+<tr><td>adaptive-spike</td><td>333.0</td><td>172.2</td><td>P0: 127ms<br>P1: 170ms<br>P2: 187ms</td><td>P0: 204ms<br>P1: 407ms<br>P2: 1.86s</td><td>P0: 290ms<br>P1: 531ms<br>P2: 2.11s</td><td>P0: 99.5%<br>P1: 100.0%<br>P2: 100.0%</td><td>12035</td><td>12441</td><td>214</td><td>88</td><td>469341</td><td>292</td><td class="ok">0</td><td class="ok">yes</td></tr>
+</table>
+
+<h2>Cost model</h2>
+<p class="note">
+  <code>actual_worker_seconds = worker_count * duration</code> — the fixed 6-worker pool,
+  paid for regardless of load. <code>naive_scaled_worker_seconds = (offered work-units/sec *
+  duration) / worker_capacity_ups</code> — workers needed, continuously scaled, to stream 100%
+  of that same offered load with zero triage. Both converted to USD at a stated, illustrative
+  $0.36/worker-hour (not tied to any vendor's real pricing —
+  the ratio is the argument, not the absolute figure).
+</p>
+<div class="chart"><svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace">
+<text x="320.0" y="16" text-anchor="middle" font-size="13" font-weight="700" fill="#e6e9f2">Worker-seconds: fixed 6-worker pool vs naive linear scaling</text>
+<line x1="56" y1="260.0" x2="620" y2="260.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="202.5" x2="620" y2="202.5" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="145.0" x2="620" y2="145.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="87.5" x2="620" y2="87.5" stroke="#232a3b" stroke-dasharray="3 3"/>
+<line x1="56" y1="30.0" x2="620" y2="30.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="38" text-anchor="end" font-size="10" fill="#5b6478">worker-seconds</text>
+<rect x="79.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
+<rect x="126.5" y="250.0" width="37.6" height="10.0" fill="#f87171"/>
+<text x="126.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-baseline</text>
+<rect x="220.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
+<rect x="267.5" y="60.0" width="37.6" height="200.0" fill="#f87171"/>
+<text x="267.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">naive-spike</text>
+<rect x="361.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
+<rect x="408.5" y="250.0" width="37.6" height="10.0" fill="#f87171"/>
+<text x="408.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-baseline</text>
+<rect x="502.5" y="155.8" width="37.6" height="104.2" fill="#34d399"/>
+<rect x="549.5" y="60.0" width="37.6" height="200.0" fill="#f87171"/>
+<text x="549.5" y="276" text-anchor="middle" font-size="10" fill="#8b93a7">adaptive-spike</text>
+<rect x="56" y="286" width="8" height="8" fill="#34d399"/>
+<text x="67" y="294" font-size="10" fill="#8b93a7">actual (fixed 6 workers)</text>
+<rect x="264" y="286" width="8" height="8" fill="#f87171"/>
+<text x="275" y="294" font-size="10" fill="#8b93a7">naive-scaled (linear)</text>
+</svg></div>
+<table>
+<tr><th>Config</th><th>Actual worker-s</th><th>Naive-scaled worker-s</th><th>Actual $</th>
+    <th>Naive-scaled $</th><th>Ratio</th></tr>
+<tr><td>naive-baseline</td><td>540</td><td>52</td><td>$0.0540</td><td>$0.0052</td><td>0.10x</td></tr>
+<tr><td>naive-spike</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
+<tr><td>adaptive-baseline</td><td>540</td><td>52</td><td>$0.0540</td><td>$0.0052</td><td>0.10x</td></tr>
+<tr><td>adaptive-spike</td><td>540</td><td>1037</td><td>$0.0540</td><td>$0.1037</td><td>1.92x</td></tr>
+</table>
+
+<h2>Sensitivity sweep — adaptive only, per-tier SLA attainment</h2>
+<p class="note">
+  Where the system actually breaks, not just that it survives the one spike level (20x) it is
+  calibrated for. The 20x row is the four-config matrix's own adaptive-spike result, not a
+  separate run.
+</p>
+<div class="chart"><svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace">
+<text x="320.0" y="16" text-anchor="middle" font-size="13" font-weight="700" fill="#e6e9f2">Per-tier SLA attainment vs spike multiplier (adaptive)</text>
+<line x1="56" y1="266.0" x2="620" y2="266.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="269.0" text-anchor="end" font-size="9" fill="#5b6478">0%</text>
+<line x1="56" y1="207.0" x2="620" y2="207.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="210.0" text-anchor="end" font-size="9" fill="#5b6478">25%</text>
+<line x1="56" y1="148.0" x2="620" y2="148.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="151.0" text-anchor="end" font-size="9" fill="#5b6478">50%</text>
+<line x1="56" y1="89.0" x2="620" y2="89.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="92.0" text-anchor="end" font-size="9" fill="#5b6478">75%</text>
+<line x1="56" y1="30.0" x2="620" y2="30.0" stroke="#232a3b" stroke-dasharray="3 3"/>
+<text x="48" y="33.0" text-anchor="end" font-size="9" fill="#5b6478">100%</text>
+<text x="56.0" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">5x</text>
+<text x="136.6" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">10x</text>
+<text x="297.7" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">20x</text>
+<text x="620.0" y="282" text-anchor="middle" font-size="10" fill="#8b93a7">40x</text>
+<polyline points="56.0,30.0 136.6,30.0 297.7,31.1 620.0,256.3" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
+<circle cx="56.0" cy="30.0" r="3" fill="#60a5fa"/>
+<circle cx="136.6" cy="30.0" r="3" fill="#60a5fa"/>
+<circle cx="297.7" cy="31.1" r="3" fill="#60a5fa"/>
+<circle cx="620.0" cy="256.3" r="3" fill="#60a5fa"/>
+<polyline points="56.0,30.3 136.6,30.0 297.7,30.0 620.0,30.0" fill="none" stroke="#c084fc" stroke-width="2.5"/>
+<circle cx="56.0" cy="30.3" r="3" fill="#c084fc"/>
+<circle cx="136.6" cy="30.0" r="3" fill="#c084fc"/>
+<circle cx="297.7" cy="30.0" r="3" fill="#c084fc"/>
+<circle cx="620.0" cy="30.0" r="3" fill="#c084fc"/>
+<polyline points="56.0,30.0 136.6,30.0 297.7,30.0 620.0,30.0" fill="none" stroke="#fb923c" stroke-width="2.5"/>
+<circle cx="56.0" cy="30.0" r="3" fill="#fb923c"/>
+<circle cx="136.6" cy="30.0" r="3" fill="#fb923c"/>
+<circle cx="297.7" cy="30.0" r="3" fill="#fb923c"/>
+<circle cx="620.0" cy="30.0" r="3" fill="#fb923c"/>
+<rect x="56" y="286" width="8" height="8" fill="#60a5fa"/>
+<text x="67" y="294" font-size="10" fill="#8b93a7">P0</text>
+<rect x="88" y="286" width="8" height="8" fill="#c084fc"/>
+<text x="99" y="294" font-size="10" fill="#8b93a7">P1</text>
+<rect x="120" y="286" width="8" height="8" fill="#fb923c"/>
+<text x="131" y="294" font-size="10" fill="#8b93a7">P2</text>
+</svg></div>
+<table>
+<tr><th>Multiplier</th><th>Rate (eps)</th><th>P0 SLA</th><th>P1 SLA</th><th>P2 SLA</th>
+    <th>P0 p99</th><th>P1 p99</th><th>P2 p99</th><th>P0 lost</th></tr>
+<tr><td>5x</td><td>83.2</td><td>100.0%</td><td>99.9%</td><td>100.0%</td><td>134ms</td><td>87ms</td><td>47ms</td><td class="ok">0</td></tr>
+<tr><td>10x</td><td>166.5</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>139ms</td><td>124ms</td><td>96ms</td><td class="ok">0</td></tr>
+<tr><td>20x</td><td>333.0</td><td>99.5%</td><td>100.0%</td><td>100.0%</td><td>290ms</td><td>531ms</td><td>2.11s</td><td class="ok">0</td></tr>
+<tr><td>40x</td><td>666.0</td><td>4.1%</td><td>100.0%</td><td>100.0%</td><td>41.39s</td><td>79ms</td><td>31ms</td><td class="ok">0</td></tr>
+</table>
+
+</body>
+</html>
