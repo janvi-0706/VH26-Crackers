@@ -683,3 +683,95 @@ def test_weighted_click_count_converges_to_true_click_count_after_a_real_spike()
         f"true_click_count {frame.true_click_count} — ratio {ratio:.1%}, "
         "expected >= 95% once the post-spike backlog has had time to drain"
     )
+
+
+# --------------------------------------------------------------------------
+# Stage F — admission.py's credit-based upstream backpressure, live
+# --------------------------------------------------------------------------
+
+
+def test_p0_is_never_denied_admission_even_under_a_real_spike():
+    """CLAUDE.md hard rule 3, enforced at a third, independent layer now
+    (decide()'s unconditional return, ladder.py's MAX_RUNG ceiling, and —
+    as of this stage — admission.py's own critical-bucket bypass): under a
+    real, sustained, calibrated overload, zero payment/order emission
+    attempts are ever denied a credit. Checked against the bucket's own
+    live denied_count, not a synthetic call — this is the actual generator
+    that actually fed the actual queue."""
+    import time as _time
+
+    from triage.contracts import Tier
+
+    app = create_app(fake=False, seed=31)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        _time.sleep(8.0)
+
+        p0_bucket = engine.generator.admission.bucket(Tier.P0)
+        assert p0_bucket.denied_count == 0
+
+        frame = metrics.snapshot()
+        assert frame.ingested > 0, "test setup: the spike must actually ingest something"
+
+
+def test_a_real_gap_opens_between_offered_and_admitted_under_sustained_spike():
+    """The acceptance line's own framing: "the gap between offered and
+    admitted IS the backpressure, made visible." Driven for real — not a
+    synthetic pressure value.
+
+    Asserted on the bucket's own `denied_count`, not a live ratio
+    threshold. A ratio threshold was the first version of this test — it
+    flaked under repeated runs (confirmed directly: 3 consecutive runs of
+    the *same* seeded scenario produced minimum admitted/offered ratios
+    that were sometimes well under 70% and sometimes never dipped below
+    90% at all). The real cause: wall-clock-paced code is not perfectly
+    reproducible even from a fixed seed — how hard and how long pressure
+    happens to cross HIGH_PRESSURE on any given run depends on real
+    completion timing (service_rate), not just the RNG draw sequence, so
+    exactly how wide the transient gap gets varies run to run. What does
+    NOT vary: given a real, sustained overload for long enough,
+    `CreditBucket.denied_count` for at least one bulk tier becomes nonzero
+    at some point — a discrete, one-way counter is a far more robust
+    thing to assert on than a continuously-fluctuating ratio's minimum
+    over an uncertain window. The AIMD math itself (additive increase,
+    multiplicative decrease, the floor, the critical bypass) is already
+    proven deterministically in test_admission.py; this test's only job is
+    confirming the real wiring — the actual generator, in a real engine —
+    genuinely exercises it.
+    """
+    import time as _time
+
+    from triage.contracts import Tier
+
+    app = create_app(fake=False, seed=32)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        _time.sleep(2.0)  # brief baseline warm-up — see the Stage E acceptance
+                           # test's own note on why a cold service_rate=0
+                           # start would otherwise distort the very first
+                           # pressure readings the AIMD gate reacts to.
+        engine.spike()
+        _time.sleep(20.0)
+
+        p1_denied = engine.generator.admission.bucket(Tier.P1).denied_count
+        p2_denied = engine.generator.admission.bucket(Tier.P2).denied_count
+
+    assert p1_denied > 0 or p2_denied > 0, (
+        "expected at least one bulk-tier admission denial under a real, "
+        f"sustained spike (P1 denied={p1_denied}, P2 denied={p2_denied})"
+    )
+
+
+def test_offered_rate_and_admitted_rate_are_both_real_and_never_negative():
+    import time as _time
+
+    app = create_app(fake=False, seed=33)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        _time.sleep(3.0)
+
+    frame = metrics.snapshot()
+    assert frame.offered_rate > 0.0
+    assert frame.admitted_rate >= 0.0

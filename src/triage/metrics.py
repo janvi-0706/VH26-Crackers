@@ -7,8 +7,10 @@ process (CLAUDE.md hard rule 1), so a registry object passed through six
 constructors would buy nothing and cost every call site an argument. Single
 threaded, single event loop: no locks needed, and none are taken.
 
-Eight observation points, called by the engine:
+Nine observation points, called by the engine:
 
+    observe_admission(cost, admitted)                   generator.py, before an Event
+                                                         even exists — see admission.py
     observe_ingest(event)                              at the door
     observe_replay(event)                               a deferred event re-enters
     observe_dequeue(event)                             worker picks it up; also feeds
@@ -24,7 +26,7 @@ Eight observation points, called by the engine:
     observe_rollup(rollup)                              a reservoir window finished (Stage E)
     snapshot() -> MetricsFrame                         4 Hz, to the dashboard
 
-STAGE E STATUS — what is real and what is not:
+STAGE F STATUS — what is real and what is not:
 
   REAL   latency percentiles (p50/p95/p99, per tier and pooled), queue-wait
          percentiles, queue depth per tier, the ledger counters, SLA
@@ -35,17 +37,18 @@ STAGE E STATUS — what is real and what is not:
          (sourced live from deferral.pending_count(), not a resettable
          in-memory counter — see observe_replay's own docstring for why),
          ladder_rung (the rung each tier's most recent real decision
-         actually landed on — see observe_decision), and
-         weighted_click_count (full-fidelity clicks counted at weight 1 in
-         observe_complete, plus reservoir-sampled clicks counted at their
-         rollup's sample_weight in observe_rollup — see codel.py/ladder.py
-         for the controller and the sampler this feeds from).
+         actually landed on — see observe_decision), weighted_click_count
+         (full-fidelity clicks counted at weight 1 in observe_complete,
+         plus reservoir-sampled clicks counted at their rollup's
+         sample_weight in observe_rollup — see codel.py/ladder.py for the
+         controller and the sampler this feeds from), and offered_rate /
+         admitted_rate (fed by observe_admission — see admission.py for
+         the AIMD credit gate upstream of it).
 
-  STUB   throughput, offered/admitted rate, cost_adaptive, cost_naive,
-         retries, duplicates_caught, exactly_once_violations,
-         spike_multiplier. These report 0 until the stage that owns them
-         lands. They are in the frame from day one so the dashboard never
-         has to be rewritten.
+  STUB   throughput, cost_adaptive, cost_naive, retries, duplicates_caught,
+         exactly_once_violations, spike_multiplier. These report 0 until
+         the stage that owns them lands. They are in the frame from day
+         one so the dashboard never has to be rewritten.
 """
 
 from __future__ import annotations
@@ -226,6 +229,13 @@ class _Ewma:
 
 _arrival_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
 _service_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
+# Stage F: offered vs admitted, at the generator's own admission boundary —
+# same half-life, same work-unit basis as arrival/service, so all three of
+# offered/admitted/service land on one directly-comparable dashboard chart
+# (the whole point of "the gap between offered and admitted IS the
+# backpressure, made visible").
+_offered_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
+_admitted_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
 _pressure_cache = 0.0
 _pressure_cache_ts = 0.0
 
@@ -261,6 +271,8 @@ def reset() -> None:
     _current_mode = Mode.ADAPTIVE
     _arrival_rate_ewma.reset()
     _service_rate_ewma.reset()
+    _offered_rate_ewma.reset()
+    _admitted_rate_ewma.reset()
     _pressure_cache = 0.0
     _pressure_cache_ts = 0.0
     _weighted_click_count = 0.0
@@ -340,6 +352,24 @@ def _percentiles(source: dict[str, deque[float]], q: float) -> dict[str, float]:
 # --------------------------------------------------------------------------
 # Observation points
 # --------------------------------------------------------------------------
+
+
+def observe_admission(cost: float, admitted: bool, now: float | None = None) -> None:
+    """generator.py calls this once per scheduled emission slot, whether or
+    not `admission.py` granted a credit — this is the ONE call site that
+    knows both halves of "offered vs admitted" at once, since a denied
+    attempt never creates an Event and so never reaches observe_ingest().
+
+    offered_rate always moves; admitted_rate only moves when `admitted` is
+    True. Both are work-unit rates (same basis as service_rate) so the
+    dashboard's one chart compares like with like — the gap between the
+    offered and admitted lines at any point in time is the live
+    backpressure this stage's own acceptance line asks to make visible.
+    """
+    now = time.time() if now is None else now
+    _offered_rate_ewma.observe_amount(cost, now)
+    if admitted:
+        _admitted_rate_ewma.observe_amount(cost, now)
 
 
 def observe_ingest(event: Event, now: float | None = None) -> None:
@@ -634,10 +664,8 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         latency_p50_all=round(percentile(_latency_ms[ALL], 0.50), 3),
         latency_p95_all=round(percentile(_latency_ms[ALL], 0.95), 3),
         latency_p99_all=round(percentile(_latency_ms[ALL], 0.99), 3),
-        # --- stubbed until the stage that owns them lands (Stage F) ---
+        # --- stubbed until the stage that owns them lands ---
         throughput=0.0,
-        offered_rate=0.0,
-        admitted_rate=0.0,
         spike_multiplier=1.0,
         # --- real as of Stage D ---
         service_rate=round(_service_rate_ewma.with_trend, 3),
@@ -647,6 +675,9 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         # --- real as of Stage E ---
         ladder_rung=dict(_ladder_rung),
         weighted_click_count=round(_weighted_click_count, 3),
+        # --- real as of Stage F ---
+        offered_rate=round(_offered_rate_ewma.with_trend, 3),
+        admitted_rate=round(_admitted_rate_ewma.with_trend, 3),
         # --- real since Stage A ---
         ingested=_counters["ingested"],
         processed=_counters["processed"],

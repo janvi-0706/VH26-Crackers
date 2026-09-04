@@ -1205,3 +1205,187 @@ flagged, not built silently); no dashboard panel for sampling fidelity
 named (the ladder widget) — the numbers are verified by the new
 `test_app.py` acceptance test and by hand above, not exposed as a new
 permanent panel this prompt didn't ask for.
+
+## Stage F — admission.py: credit-based upstream backpressure (AIMD)
+
+The mechanism CLAUDE.md hard rule 3 has referenced since Stage A ("under
+pressure we throttle the source instead") but that nothing had actually
+built: every earlier stage protected P0 *downstream* (decide() never
+batches it, ladder.py never samples/sheds it) — nothing yet stopped the
+*source* from continuing to try to emit at full rate regardless of load.
+This stage is that: friction applied before an event even exists.
+
+**Built**
+
+- `src/triage/admission.py` — new module:
+  - `CreditBucket` — one token bucket per tier. `rate_ups` (its own
+    sustainable admission rate, work-units/sec) and `capacity_units` (its
+    burst allowance) are themselves under **AIMD control**, not fixed:
+    additive increase (+`ADDITIVE_INCREASE_UPS`, checked at most once per
+    `INCREASE_CHECK_INTERVAL_SECONDS`) while pressure stays below
+    `HIGH_PRESSURE` (0.85, this stage's own spec); multiplicative decrease
+    (`x0.8`, this stage's own spec) checked far more often
+    (`DECREASE_CHECK_INTERVAL_SECONDS` — matching metrics.py's own
+    pressure-cache refresh cadence, so a decrease is never re-applied
+    against a pressure value that hasn't actually changed yet). That
+    asymmetry — slow climb, fast retreat — is what makes it AIMD rather
+    than a symmetric rate limiter. A decrease also claws back banked
+    credits above the new, smaller ceiling: a bulk source cannot ride out
+    a decrease on a reserve built up before pressure rose. A floor
+    (`MIN_BULK_RATE_UPS`) keeps a throttled bulk source alive, never
+    literally silent — the same "never silently to nothing" ethos this
+    project already applies to P0 downstream, applied upstream to the
+    least-favoured source instead.
+  - **Critical (P0) is exempt, not just favoured**: its bucket's
+    `try_acquire()` is unconditional (`if self.critical: return True`) and
+    `update_aimd()` is a no-op for it — CLAUDE.md hard rule 3 enforced a
+    third, independent way now (decide()'s unconditional return,
+    ladder.py's `MAX_RUNG` ceiling, and this). "Critical sources retain
+    credits far longer than bulk sources" (this stage's own spec) is
+    realised concretely: a critical bucket's capacity is never clawed
+    back, so whatever it has banked simply stays banked, while a bulk
+    bucket's own banked reserve shrinks together with its ceiling the
+    moment pressure crosses the line.
+  - `AdmissionControl` — per-Engine (not ambient, unlike
+    metrics/ledger/deferral/sink/codel/ladder): constructed straight from
+    a `Config`, so a future benchmark comparing two configs side by side
+    (Stage G's own `cost_adaptive`/`cost_naive` fields already exist for
+    exactly this) needs two independent instances, not one shared global.
+    Each tier's bucket is seeded from that tier's own calibrated spike
+    demand (`config.demand_ups(spike_eps, tier)`) — admission starts fully
+    open (nothing gated at t=0) and only clamps down reactively once
+    pressure actually crosses the line, and the additive-increase ceiling
+    (`max_rate_ups`) is the same number: a bulk bucket's rate should never
+    need to exceed the most that tier's own real traffic could ever
+    organically demand. `tier_of()`/`cost_of()` read
+    `config.tiers[event_type]` directly — the same frozen table
+    classifier.py itself reads — a read-only lookup admission control
+    needs, not a duplicate of classification.
+- `src/triage/generator.py` — `events()` (the real async stream the live
+  Engine consumes) now asks `admission.try_acquire()` for a credit before
+  creating each scheduled slot's event; denied, the slot is simply
+  skipped — no event, no classification, nothing reaches the queue.
+  `emit()`/`emit_single()` (synchronous benchmark setup, `inject_event()`'s
+  one-off drops) stay the raw, ungated path they always were — neither
+  represents the live pipeline's own organic arrival stream that upstream
+  backpressure exists to shape. Each `EventGenerator` now owns its own
+  `AdmissionControl` (constructor-injectable, defaulted).
+- `src/triage/metrics.py` — new `observe_admission(cost, admitted, now)`,
+  the one call site that knows both halves of offered-vs-admitted at once
+  (a denied attempt never creates an Event, so it never reaches
+  `observe_ingest()`). Two new EWMAs, same half-life and same work-unit
+  basis as `service_rate` (not raw event counts) — so all three of
+  offered/admitted/service land on one directly-comparable dashboard
+  chart, which is the whole point of "the gap between offered and
+  admitted IS the backpressure, made visible." `snapshot()` now reports
+  real `offered_rate`/`admitted_rate` (stubbed since Stage A).
+- `src/triage/app.py` — `Engine.reset()` now also resets the generator's
+  admission credits, explicitly (per-Engine state, so `metrics.reset()`
+  cannot reach it the way it reaches codel.py/ladder.py's ambient state).
+- Dashboard — `RatesPanel.tsx`: one chart, three lines (offered/admitted/
+  service), all real, all one work-unit basis.
+
+**Definitions, exactly as specified, and why they hold**
+
+- **offered_rate**: the rate presented at the *post-throttle* source
+  boundary — i.e., after the generator's own pacing (`/control/rate` or
+  SPIKE) has already decided how fast to *try*, `admission.py`'s credit
+  gate is what "throttle" now means for this number. Every scheduled slot
+  counts, whether or not it gets a credit.
+- **admitted_rate**: the rate actually accepted past the credit gate.
+  Always `<= offered_rate` at the level of what each EWMA is fed (every
+  admitted amount was necessarily also fed to offered) — not asserted as
+  a live-frame invariant in tests, since two independently-smoothed EWMAs'
+  own trend terms could in principle diverge for an instant even when
+  their underlying fed amounts never did; the real invariant lives in
+  `observe_admission()`'s own structure, not in comparing two already-
+  smoothed numbers after the fact.
+- **P0 admitted == P0 offered**: literal, by construction — a critical
+  bucket's `try_acquire()` never returns `False`, so every P0 attempt is
+  simultaneously offered and admitted. Proven directly:
+  `test_p0_types_always_admit_regardless_of_pressure` (synthetic,
+  `test_admission.py`) and `test_p0_is_never_denied_admission_even_under_a_real_spike`
+  (live, `test_app.py`, checked against the bucket's own `denied_count`
+  after a real spike).
+- **Pre-throttle demand is a separate diagnostic, not compared against
+  admitted P0 as an invariant**: nothing in this stage computes or wires a
+  "pre-throttle demand" number into `MetricsFrame` — it was not asked for,
+  and the sentence itself is read as a caution against a specific wrong
+  test (asserting raw configured eps times P0's mix fraction equals
+  admitted P0 count), not a request for a new field. Flagging this
+  reading explicitly rather than silently guessing which of two things
+  "diagnostic" meant.
+
+**One real, empirically-found timing subtlety, understood and worked
+through — not the AIMD math itself, which the unit tests already pin down
+exactly, but how a threshold-based live assertion of it behaves against
+real, wall-clock-paced traffic:**
+
+The first version of the live "gap" test polled for one instant where
+`admitted_rate < 0.95 * offered_rate`. It flaked — not randomly, but for a
+real, understood reason: a diagnostic trace (spike, sampled every 0.5s)
+showed the gap is genuinely there, sometimes wide (admitted at ~62-75% of
+offered for several real seconds right after a spike hits, while AIMD's
+decrease side reacts and before service_rate catches up), but it is a
+**transient** that closes once each bulk bucket settles back at its
+calibrated ceiling (bounded by `max_rate_ups`, which cannot exceed real
+demand) — and *how wide and how long* that transient lasts on any given
+run depends on real completion timing (`service_rate`), not just the RNG
+draw sequence, so it is not perfectly reproducible even from a fixed seed.
+Three consecutive runs of the identical seeded scenario produced minimum
+observed ratios anywhere from ~62% to never dipping under 90% at all.
+Fixed by testing what genuinely does not vary instead: `CreditBucket.
+denied_count` for at least one bulk tier becoming nonzero under a real,
+sustained spike — a discrete, monotonic counter, not a continuously
+fluctuating ratio's minimum over an uncertain window. The AIMD math itself
+stays proven deterministically in `test_admission.py`; the live test's
+only remaining job — confirming the real wiring actually exercises it —
+doesn't need the ratio to prove that.
+
+**Tests — 23 new (467 total)**
+
+- `tests/test_admission.py` (new, 20 tests) — the token bucket in
+  isolation (fresh-full, exact spend, denial, refill capped at capacity),
+  AIMD's own asymmetry (increase applies on the very first check rather
+  than requiring an interval to elapse first — a fresh bucket must not
+  need real time to pass before its first adjustment can register;
+  increase rate-limited to its own interval; increase capped at
+  `max_rate_ups`; decrease applies immediately and is checked far more
+  often than increase; decrease claws back banked credits; the floor), the
+  critical bypass (both `try_acquire()` and `update_aimd()` are true
+  no-ops for it, proven directly), `AdmissionControl`'s seeding from real
+  calibration, per-tier independence (P2 driven into the floor must not
+  move P1 at all), and reset.
+- `tests/test_app.py` (3 new) — the P0 invariant live, the bulk-denial
+  live test (redesigned per the timing finding above), and offered/
+  admitted both being real and non-negative after a real spike.
+
+**Verified live, in the browser, against the real backend**
+
+```
+POST /control/reset, then POST /control/spike, watched close to the
+transient:
+  Offered/admitted/service panel: all three visibly climb from ~0 as the
+  spike ramps; service (blue) sits clearly below offered/admitted
+  throughout (workers cannot keep pace with admitted demand — the same
+  1.9x-overload story every earlier stage's own numbers already tell);
+  offered and admitted track closely once past the first few seconds,
+  matching the transient-not-permanent finding above rather than
+  contradicting it.
+  Ladder-by-tier panel, same run: P1/P2 stepped to DEFER at pressure 0.78,
+  confirming Stage E's own machinery is still live and unaffected.
+POST /control/reset: rate back to 16.65, demo left at a clean baseline.
+```
+
+**A pre-existing environmental flake, confirmed NOT caused by this
+prompt's changes:** `test_worker_pool_sustains_150_units_per_second_
+within_5_percent` failed consistently (not just under full-suite load, as
+documented since Stage C/P5) during this session's later testing, even
+standalone with no other process running. Isolated directly with `git
+stash`: the identical failure reproduces on Stage E's own already-
+committed code with none of this stage's changes applied at all — this
+machine's real-time timer behaviour was measurably worse in this later
+part of the session than earlier in it (thermal or OS-level, not
+diagnosed further — out of this prompt's scope to fix a machine's own
+timer resolution). Not a regression from this prompt; not silently
+ignored either.

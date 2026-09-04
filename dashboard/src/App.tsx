@@ -10,6 +10,7 @@ import { ModeByTierPanel } from "./components/panels/ModeByTierPanel";
 import { DeferredBacklogPanel } from "./components/panels/DeferredBacklogPanel";
 import { WeightsPanel } from "./components/panels/WeightsPanel";
 import { LadderPanel } from "./components/panels/LadderPanel";
+import { RatesPanel } from "./components/panels/RatesPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
 import * as api from "./lib/api";
 
@@ -40,6 +41,7 @@ export default function App() {
         <PressureGaugePanel latest={latest} />
         <ModeByTierPanel latest={latest} />
         <LadderPanel latest={latest} />
+        <RatesPanel history={history} />
         <ThroughputPanel history={history} />
         <LatencyByTierPanel history={history} />
         <QueueDepthPanel history={history} />

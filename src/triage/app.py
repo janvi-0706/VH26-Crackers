@@ -116,6 +116,13 @@ class Engine:
         """
         current_mode = self.queue.mode
         self.generator.set_rate(self.config.baseline_eps)
+        # The generator's admission credits are per-Engine, not ambient
+        # (see admission.py's own AdmissionControl docstring), so
+        # metrics.reset() cannot reach them the way it reaches codel.py/
+        # ladder.py's module-level state — reset explicitly, here, same as
+        # every other piece of live control-loop state a clean demo
+        # restart should not inherit.
+        self.generator.admission.reset()
         await self.workers.stop()
         self.queue.clear()
         metrics.reset()
