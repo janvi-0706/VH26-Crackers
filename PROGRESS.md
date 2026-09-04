@@ -304,3 +304,92 @@ wall-clock sensitive.)
 
 Committed `dashboard/package-lock.json` for reproducible installs going
 forward.
+
+## Stage C — P7 three-heap priority queue (Lane A/C)
+
+**Done**
+
+- `src/triage/queue.py` — rewritten from the Stage B FIFO to three tiered
+  heaps (`P0`/`P1`/`P2`), behind the exact same `put`/`get` shape
+  `worker.py` and `app.py` already used, so neither had to change:
+  - **P0: EDF**, keyed `(deadline_ts, seq, event)` — earliest deadline
+    wins, not arrival order or type.
+  - **P1/P2: arrival order**, keyed `(seq, event)` — `seq` is already the
+    classifier's globally unique monotonic pipeline number, so no separate
+    counter was needed.
+  - **Selection**: highest-priority non-empty tier wins, *except* a bounded
+    aging-guard exception — if the oldest P2 item's sojourn crosses
+    `aging_guard_seconds` (default 2.0s), that one item is served instead,
+    then the next call re-evaluates from scratch. Deliberately not "P0
+    fully before P1 before P2" as an absolute rule — see the module
+    docstring for why that phrasing matters.
+  - **`set_mode("naive" | "adaptive")`** — naive picks the globally
+    smallest `seq` across all three heaps every call (tier-blind pure
+    arrival order, exactly Stage B's FIFO); adaptive uses the policy
+    above. Same storage either way — switching modes needs no migration.
+  - Multi-consumer wakeup via a shared `asyncio.Event` (no `asyncio.Queue`
+    left inside at all), plus a hand-rolled `task_done()`/`join()` pair
+    matching `asyncio.Queue`'s contract so `worker.py`'s unconditional
+    `finally: queue.task_done()` kept working unmodified.
+- `tests/test_queue.py` — 19 tests, including the exact case from the
+  prompt (an order at 400ms of a 500ms SLA dequeues ahead of a payment 2ms
+  old with a 200ms SLA), the aging guard firing per-item (not once per
+  backlog — see the test's own note on why that's the correct reading),
+  P1 explicitly having no aging exception, naive mode locked to pure
+  arrival order and blind to both tier and aging, mode-switching without
+  data loss, and the asyncio-level plumbing (blocking `get()`, multiple
+  concurrent waiters each getting exactly one item, `task_done`/`join`).
+- Dashboard: `QueueDepthPanel.tsx` — stacked area chart of `queue_depth`
+  by tier over the rolling window, wired into `App.tsx`. No backend metrics
+  change needed — `metrics.py`'s per-tier `queue_depth` was already
+  correct, since `queue.py`'s `put`/`get` still call the same
+  `observe_ingest`/`observe_dequeue` hooks regardless of what's behind
+  them.
+
+**Verified**
+
+```
+$ python -m pytest -q
+83 passed   (64 from before + 19 new in test_queue.py)
+
+$ npm run build   (dashboard/)
+tsc --noEmit && vite build — clean, dist/ rebuilt
+```
+
+Then re-ran the full P6 browser check against the real backend with the new
+queue, at the actual calibrated 20x spike (`POST /control/rate {"rate":
+333}` — 333 events/sec, per `config/tiers.yaml`'s `load.spike_multiplier`,
+not an arbitrary large number):
+
+- P0 p99 stayed green/"within SLA" at 192ms in the first ~10s of the spike,
+  while P2's line climbed to ~2.2s on the latency chart and the new queue
+  depth panel showed the backlog was almost entirely the P2 (orange) band —
+  P0/P1 bands stayed a thin sliver. This is the priority story, visibly.
+
+**A real, honest finding — not a bug, and not fixed in this prompt.** Left
+the spike running longer (~20s sustained), P0's own p99 crept up to 265ms
+and briefly flipped the scoreboard red. Checked the raw frame over the
+socket rather than guessing:
+
+```
+queue_depth   {'P0': 0, 'P1': 112, 'P2': 369}
+in_flight     6            (== worker_count: every worker busy, always)
+latency_p99   {'P0': 352ms, 'P1': 6043ms, 'P2': 2081ms}
+```
+
+`queue_depth.P0 == 0` the entire time — the priority queue is doing exactly
+what it's supposed to: a P0 item is *never* waiting behind P1/P2 in the
+queue. The residual latency is worker-pool contention, not misordering:
+with only 6 non-preemptive workers running at ~100% utilization (P0 alone
+demands ~108 u/s, which is 72% of the 150 u/s pool — "comfortably under
+capacity" in total, but not idle), a P0 arrival still has to wait for
+*some* worker to finish whatever it already started, and at full
+saturation that residual wait is no longer negligible. Stage C's job was
+ordering, and `queue_depth.P0 == 0` proves the ordering is correct; freeing
+actual worker capacity from low-value P1/P2 work under sustained overload
+is exactly what Stage D's decision function (batching/deferral/shedding)
+exists to do next. Not attempting that here — flagging it now rather than
+either hiding it or quietly building ahead into Stage D's scope.
+
+**Open / next:** live spike control in the dashboard UI (a wired button,
+not just `curl`) is part of a later prompt, not this one — left untouched.

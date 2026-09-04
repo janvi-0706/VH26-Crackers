@@ -12,8 +12,10 @@ Two modes, chosen once at process start, never mixed:
                     Stage C's priority/tiers exist — the reason
                     fake_metrics.py was built in Stage A.
 
-Stage B has no priority, no tiers, no batching: the queue is the single FIFO
-from queue.py, and the mix streams through unmodified from generator.py.
+Stage C: the queue is now the three-heap priority structure from queue.py
+(P0 by EDF, P1/P2 by arrival, a bounded aging exception for P2). This file
+did not need to change for that — Engine just constructs an EventQueue and
+never looks inside it.
 """
 
 from __future__ import annotations

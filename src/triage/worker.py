@@ -9,8 +9,10 @@ seconds and then considers it served. With the Stage A tier table that is 25
 work-units/sec per worker, 6 workers, 150 u/s total — the number every later
 stage's pressure signal is computed against.
 
-Stage B has no priority: workers pull whatever the single FIFO queue in
-queue.py hands them. Stage C changes what queue.get() returns, not this file.
+Workers only ever call ``queue.get()`` and know nothing about what decides
+what that returns. Stage B's single FIFO and Stage C's three-heap priority
+queue are interchangeable behind that one call — this file did not change
+between the two stages.
 """
 
 from __future__ import annotations

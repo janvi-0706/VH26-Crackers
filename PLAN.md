@@ -39,9 +39,10 @@ must be demoable at each one.
 - [x] `make dev` runs the whole slice end to end
 
 ## Stage C — First demoable state (H4–7) — Round 1
-- [ ] `queue.py`: three heaps, per-tier depth
+- [x] `queue.py`: three heaps, per-tier depth (EDF within P0, bounded P2
+      aging guard, naive/adaptive mode switch)
 - [ ] Generator: live spike control (baseline ↔ 20x)
-- [ ] Dashboard on the real backend, spike button wired
+- [x] Dashboard: per-tier stacked queue depth panel
 - [ ] Round 1 notes in `docs/rounds/`
 
 ## Stage D — Adaptive engine (H7–10)

@@ -3,6 +3,7 @@ import { ConnectionIndicator } from "./components/ConnectionIndicator";
 import { ThroughputPanel } from "./components/panels/ThroughputPanel";
 import { LatencyByTierPanel } from "./components/panels/LatencyByTierPanel";
 import { P0ScoreboardPanel } from "./components/panels/P0ScoreboardPanel";
+import { QueueDepthPanel } from "./components/panels/QueueDepthPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
         <P0ScoreboardPanel latest={latest} />
         <ThroughputPanel history={history} />
         <LatencyByTierPanel history={history} />
+        <QueueDepthPanel history={history} />
       </PanelGrid>
     </div>
   );
