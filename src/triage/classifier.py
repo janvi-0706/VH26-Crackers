@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import Config, load_config
 from .contracts import Event, EventType, SCHEMA_VERSION
+from .costmodel import true_cost
 
 
 def _get(raw: Any, name: str, default: Any = None) -> Any:
@@ -36,6 +37,7 @@ class Classifier:
         ingest_ts = float(_get(raw, "ingest_ts", None) or now or time.time())
         self._seq += 1
         dedup_key = str(_get(raw, "dedup_key"))
+        payload_size = int(_get(raw, "payload_size", 0))
         return Event(
             event_id=str(_get(raw, "event_id")),
             dedup_key=dedup_key,
@@ -44,9 +46,16 @@ class Classifier:
             idempotency_key=f"sink:{dedup_key}",
             type=event_type,
             tier=spec.tier,
-            payload_size=int(_get(raw, "payload_size", 0)),
+            payload_size=payload_size,
             value=spec.value,
-            cost=spec.cost,
+            # Stage I: the ground-truth simulated cost, a function of
+            # payload_size now, not the flat per-type prior directly — see
+            # costmodel.py's own docstring for why this is calibration-safe
+            # (its expectation over the generator's own payload_size draw
+            # is exactly `spec.cost`). decision.py's ordering math never
+            # sees this value directly any more; it uses CostModel's own
+            # LEARNED estimate instead (queue.py/worker.py wire that in).
+            cost=true_cost(self.config, event_type, payload_size),
             ingest_ts=ingest_ts,
             deadline_ts=ingest_ts + spec.sla_seconds,
             schema_version=SCHEMA_VERSION,

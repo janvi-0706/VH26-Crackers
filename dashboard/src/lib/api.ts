@@ -108,3 +108,25 @@ export async function duplicateFlood(count = 1000): Promise<DuplicateFloodResult
   const res = await post("/chaos/duplicate-flood", { count });
   return (await res.json()) as DuplicateFloodResult;
 }
+
+/** GET /control/costmodel — costmodel.py's own CostModel.summary(), one
+ * row per event type. */
+export interface CostModelRow {
+  event_type: string;
+  prior: number;
+  learned: number;
+  samples: number;
+  confidence: number;
+}
+
+export async function getCostModel(): Promise<CostModelRow[]> {
+  const res = await fetch(`${API_BASE}/control/costmodel`);
+  if (!res.ok) return [];
+  return (await res.json()) as CostModelRow[];
+}
+
+/** POST /control/payload-multiplier — Stage I's own demo beat: scale
+ * every subsequent draw's payload size by `multiplier` (1.0 = normal). */
+export async function setPayloadMultiplier(multiplier: number): Promise<void> {
+  await post("/control/payload-multiplier", { multiplier });
+}

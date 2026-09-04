@@ -427,10 +427,22 @@ def test_inject_drops_one_correctly_classified_event_into_the_stream():
         body = resp.json()
         assert body["type"] == "payment"
         assert body["tier"] == "P0"
-        # Economics come from config, not the caller: payment is worth 120,
-        # costs 3.5u, per CLAUDE.md's tier table.
+        # Economics come from config, not the caller: payment is worth 120
+        # unconditionally (CLAUDE.md's tier table). Cost is no longer that
+        # same flat 3.5u constant as of Stage I's learned cost model —
+        # costmodel.true_cost() scales it by the (randomly drawn, but
+        # config-range-bounded) payload_size, so the caller still supplies
+        # no economics of its own, but the exact number now varies within
+        # a known, computable range rather than being pinned to one value.
         assert body["value"] == 120
-        assert body["cost"] == 3.5
+        from triage.costmodel import true_cost
+        from triage.contracts import EventType
+        from triage.generator import PAYLOAD_SIZE_RANGES
+
+        low, high = PAYLOAD_SIZE_RANGES[EventType.PAYMENT]
+        lowest_possible_cost = true_cost(engine.config, EventType.PAYMENT, low)
+        highest_possible_cost = true_cost(engine.config, EventType.PAYMENT, high)
+        assert lowest_possible_cost <= body["cost"] <= highest_possible_cost
 
         assert metrics.snapshot().ingested == before + 1
 

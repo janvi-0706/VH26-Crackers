@@ -78,6 +78,7 @@ from . import codel, decision, deferral, ladder, metrics, sink
 from .checkpoint import CheckpointStore
 from .config import Config, load_config
 from .contracts import Decision, Event, Tier
+from .costmodel import CostModel
 from .queue import EventQueue
 
 logger = logging.getLogger(__name__)
@@ -128,11 +129,20 @@ class WorkerPool:
         sink_write: SinkWriter = sink.write,
         defer: Callable[[Event, str], None] = deferral.defer,
         checkpoint_store: CheckpointStore | None = None,
+        cost_model: CostModel | None = None,
     ) -> None:
         self.queue = queue
         self.config = config or load_config()
         self._sink_write = sink_write
         self._defer = defer
+        # Stage I: optional, defaults to None — every pre-Stage-I test
+        # constructing a WorkerPool without one is unaffected (`_resolve()`
+        # and `serve()`/`_serve_batch()` all fall back to `event.cost`
+        # exactly as decision.py's own functions do when handed no
+        # override). Real callers (app.py's Engine) pass the SAME
+        # CostModel instance the queue was given, so ordering and routing
+        # agree on one estimate.
+        self.cost_model = cost_model
         # One store per pool, not an ambient module-level singleton — see
         # checkpoint.py's own docstring ("Ownership") for why: worker_id
         # 0..N-1 only means something within one pool, and sharing one
@@ -333,8 +343,22 @@ class WorkerPool:
         has already fired: an event already forced to stream because it
         was given one chance and used it should actually stream, not be
         sampled or shed on its way out the door.
+
+        Stage I: `decide()` (and the `slack()` it calls internally) is
+        handed `cost_model`'s own LEARNED estimate for this event's type/
+        payload_size, not `event.cost` — routing reasons about the same
+        imperfect information a real scheduler actually has. See
+        costmodel.py's own docstring for why this cannot change P0's own
+        unconditional STREAM_NOW (that branch returns before `cost` is
+        ever consulted).
         """
-        result, reason = decision.decide(event, pressure_value, now, self.capacity_units_per_sec)
+        cost = (
+            self.cost_model.estimate(event.type, event.payload_size)
+            if self.cost_model else None
+        )
+        result, reason = decision.decide(
+            event, pressure_value, now, self.capacity_units_per_sec, cost=cost
+        )
         if result is Decision.DEFER and deferral.was_deferred(event.event_id):
             return (
                 Decision.STREAM_NOW,
@@ -450,6 +474,14 @@ class WorkerPool:
         metrics.observe_complete(event)
         self._sink_write(event)
         self.served_count += 1
+        if self.cost_model is not None:
+            # "Updated from observed service times": event.cost is the
+            # TRUE, ground-truth cost this worker just actually spent
+            # (unaffected by cost_model — the simulated sleep above always
+            # uses event.cost, never the estimate; see costmodel.py's own
+            # docstring on why the two must never be confused). This is
+            # the one real signal the learner is ever fed.
+            self.cost_model.observe(event.type, event.payload_size, event.cost)
         if not self._checkpoint.mark_done(event.event_id):
             metrics.observe_exactly_once_violation(
                 event, "serve(): mark_done found no in-flight row"
@@ -496,6 +528,8 @@ class WorkerPool:
             metrics.observe_complete(e, now=now)
             self._sink_write(e)
             self.served_count += 1
+            if self.cost_model is not None:
+                self.cost_model.observe(e.type, e.payload_size, e.cost)
             if not self._checkpoint.mark_done(e.event_id):
                 metrics.observe_exactly_once_violation(
                     e, "_serve_batch(): mark_done found no in-flight row"

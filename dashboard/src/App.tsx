@@ -16,6 +16,7 @@ import { WorkerPoolGridPanel } from "./components/panels/WorkerPoolGridPanel";
 import { CostComparisonPanel } from "./components/panels/CostComparisonPanel";
 import { ChaosControlPanel } from "./components/panels/ChaosControlPanel";
 import { RecoveryPanel } from "./components/panels/RecoveryPanel";
+import { CostModelPanel } from "./components/panels/CostModelPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
 import { useState } from "react";
 import * as api from "./lib/api";
@@ -35,6 +36,7 @@ import * as api from "./lib/api";
  *     Cost comparison(3) + Shed log(3)
  *   Row 4 (interactive / reference): Event inspector(4) + Weights(8)
  *   Row 5 (Stage I — chaos): Chaos control(6) + Recovery(6)
+ *   Row 6 (Stage I — the learned cost model): Cost model convergence(12)
  *
  * `ModeByTierPanel` (Stage D) was dropped here, not just left off the
  * grid: `LadderPanel` (Stage E) reads the real `ladder_rung` field and
@@ -73,7 +75,7 @@ export default function App() {
       </div>
 
       <div className="min-h-0 flex-1">
-        <PanelGrid rows={5}>
+        <PanelGrid rows={6}>
           {/* Row 1 */}
           <ConservationPanel latest={latest} />
           <P0ScoreboardPanel latest={latest} />
@@ -100,6 +102,9 @@ export default function App() {
             onWorkerKilled={() => setWorkersKilled((n) => n + 1)}
           />
           <RecoveryPanel latest={latest} workersKilled={workersKilled} />
+
+          {/* Row 6 — Stage I: the learned cost model */}
+          <CostModelPanel />
         </PanelGrid>
       </div>
     </div>

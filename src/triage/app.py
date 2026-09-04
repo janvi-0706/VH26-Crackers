@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,6 +37,7 @@ from . import decision, deferral, ledger, metrics, sink
 from .classifier import Classifier
 from .config import Config, load_config
 from .contracts import Event, EventType, MetricsFrame
+from .costmodel import CostModel
 from .dedup import Deduplicator
 from .fake_metrics import FakeSource
 from .generator import EventGenerator, GeneratedEvent
@@ -73,8 +75,15 @@ class Engine:
         self.config = config or load_config()
         self.generator = EventGenerator(config=self.config, seed=seed)
         self.classifier = Classifier(config=self.config)
-        self.queue = EventQueue(config=self.config)
-        self.workers = WorkerPool(self.queue, config=self.config)
+        # Per-Engine, not ambient — same reasoning as generator.admission
+        # (AdmissionControl): a fresh Engine, or a /control/reset, must not
+        # inherit another run's learned costs. The SAME instance is handed
+        # to both the queue (ordering) and the worker pool (routing +
+        # learning), so the two halves of decision-making never disagree
+        # about what "the current estimate" is.
+        self.cost_model = CostModel(config=self.config)
+        self.queue = EventQueue(config=self.config, cost_model=self.cost_model)
+        self.workers = WorkerPool(self.queue, config=self.config, cost_model=self.cost_model)
         # Per-Engine, not ambient — same reasoning as generator.admission
         # (AdmissionControl): a fresh Engine, or a /control/reset, must not
         # inherit another run's dedup state.
@@ -142,6 +151,8 @@ class Engine:
         # every other piece of live control-loop state a clean demo
         # restart should not inherit.
         self.generator.admission.reset()
+        self.generator.set_payload_multiplier(1.0)
+        self.cost_model.reset()
         self.dedup = Deduplicator()
         await self.workers.stop()
         self.workers.reset_checkpoint()
@@ -289,6 +300,10 @@ class RateBody(BaseModel):
     rate: float
 
 
+class PayloadMultiplierBody(BaseModel):
+    multiplier: float
+
+
 class ModeBody(BaseModel):
     mode: str
 
@@ -360,6 +375,34 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
             return JSONResponse({"error": "rate must be non-negative"}, status_code=422)
         app.state.engine.set_rate(body.rate)
         return JSONResponse({"rate": body.rate})
+
+    @app.post("/control/payload-multiplier")
+    async def control_payload_multiplier(body: PayloadMultiplierBody) -> JSONResponse:
+        """Stage I's own demo beat: scale every subsequent draw's payload
+        size by `multiplier` (1.0 = the documented, calibration-preserving
+        default). A sustained shift, not a one-off outlier — the point is
+        watching costmodel.py's own estimate re-adapt to it, live."""
+        if fake:
+            return _fake_mode_error("payload multiplier control")
+        try:
+            app.state.engine.generator.set_payload_multiplier(body.multiplier)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        return JSONResponse({"multiplier": body.multiplier})
+
+    @app.get("/control/costmodel")
+    async def get_costmodel() -> JSONResponse:
+        """Learned vs. prior cost per type — costmodel.py's own
+        `CostModel.summary()`. No fake-mode restriction (a read, like GET
+        /control/weights) — in --fake mode there is no engine, so this
+        simply 404s rather than 409ing like a fake-mode-guarded write
+        would, since there is genuinely nothing to read, not an action
+        being refused."""
+        if fake:
+            return JSONResponse({"error": "no cost model in --fake mode"}, status_code=404)
+        return JSONResponse(
+            [dataclasses.asdict(row) for row in app.state.engine.cost_model.summary()]
+        )
 
     @app.post("/control/spike")
     async def control_spike() -> JSONResponse:

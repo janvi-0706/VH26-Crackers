@@ -77,6 +77,7 @@ from typing import Literal
 from . import decision, metrics
 from .config import Config, load_config
 from .contracts import Event, Tier
+from .costmodel import CostModel
 
 Mode = Literal["adaptive", "naive"]
 
@@ -107,12 +108,20 @@ class EventQueue:
         config: Config | None = None,
         mode: Mode = "adaptive",
         aging_guard_seconds: float = DEFAULT_P2_AGING_GUARD_SECONDS,
+        cost_model: CostModel | None = None,
     ) -> None:
         if mode not in ("adaptive", "naive"):
             raise ValueError(f"unknown mode: {mode!r}")
         self.config = config or load_config()
         self._mode: Mode = mode
         self.aging_guard_seconds = aging_guard_seconds
+        # Stage I: optional, defaults to None (every pre-Stage-I caller and
+        # test is unaffected — `_score()` below falls back to `event.cost`
+        # exactly as `decision.score()` itself already does when handed no
+        # override). Real callers (app.py's Engine) pass a live CostModel
+        # so ordering scores against the LEARNED estimate, not the ground
+        # truth — see costmodel.py's own docstring for why.
+        self.cost_model = cost_model
 
         # _settled[tier]: ascending score order as of the last resort — the
         # best item is always the *last* element, so popping it is O(1).
@@ -269,6 +278,15 @@ class EventQueue:
         except ValueError:
             self._settled[tier].remove(event)
 
+    def _score(self, event: Event, now: float, capacity: float, weights) -> float:
+        """`decision.score()`, scored against `cost_model`'s own LEARNED
+        estimate when one is wired in, falling back to `event.cost`
+        (`cost=None`) otherwise — the exact same fallback `decision.score()`
+        itself already implements, so a queue built without a cost_model
+        (every pre-Stage-I test) behaves identically to before."""
+        cost = self.cost_model.estimate(event.type, event.payload_size) if self.cost_model else None
+        return decision.score(event, now, capacity, weights, cost=cost)
+
     def _maybe_resort(self, tier: Tier, now: float) -> None:
         if not self._pending[tier] and self._settled[tier]:
             # Nothing new since the last resort and there's still something
@@ -282,7 +300,7 @@ class EventQueue:
         capacity = self.config.worker_capacity_ups
         merged = self._settled[tier] + self._pending[tier]
         weights = decision.current_score_weights
-        merged.sort(key=lambda e: (decision.score(e, now, capacity, weights), -e.seq))
+        merged.sort(key=lambda e: (self._score(e, now, capacity, weights), -e.seq))
         self._settled[tier] = merged
         self._pending[tier] = []
         self._resort_ts[tier] = now
@@ -307,7 +325,7 @@ class EventQueue:
         best_pending: Event | None = None
         best_pending_score = -1.0
         for candidate in pending:
-            candidate_score = decision.score(candidate, now, capacity, weights)
+            candidate_score = self._score(candidate, now, capacity, weights)
             if best_pending is None or candidate_score > best_pending_score or (
                 candidate_score == best_pending_score and candidate.seq < best_pending.seq
             ):
@@ -319,7 +337,7 @@ class EventQueue:
             pending.remove(best_pending)
             return best_pending
 
-        settled_score = decision.score(settled[-1], now, capacity, weights)
+        settled_score = self._score(settled[-1], now, capacity, weights)
         if best_pending_score > settled_score or (
             best_pending_score == settled_score and best_pending.seq < settled[-1].seq
         ):

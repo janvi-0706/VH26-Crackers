@@ -2253,3 +2253,123 @@ admitted 0`, Recovery panel: workers killed 1, retried 6, suppressed
 tests since Stage H; `checkpoint.py`'s own 9 (above) make up the rest.
 Both Stage I sub-prompts land in one git commit, below — see that
 commit's own message for why.
+
+## Stage I — the learned cost model
+
+**Built**
+
+- `costmodel.py` (new) — two different numbers now share the name "cost",
+  kept deliberately distinct: `true_cost(config, type, payload_size)` is
+  the GROUND TRUTH `worker.py` actually simulates (`config`'s flat prior
+  scaled by `payload_size / that type's own PAYLOAD_SIZE_RANGES midpoint`
+  — its expectation over the generator's own uniform draw is exactly the
+  prior, so the three calibration invariants are untouched; proved
+  directly with 20,000 real random draws per type, not just algebra, in
+  `tests/test_costmodel.py`). `CostModel.estimate(type, payload_size)` is
+  the LEARNED PREDICTION `decision.py`'s ordering math uses INSTEAD —
+  what a real scheduler actually has (its own best guess, not omniscient
+  ground truth). A running estimate (`RunningEstimate`, an EWMA decaying
+  by SAMPLE count, not wall-clock time — deliberately, so a demo running
+  for an hour re-adapts to a distribution shift exactly as fast as one
+  running for a minute), per (type, payload-size bucket), blended smoothly
+  toward the config prior when confidence (sample count) is low. Not a
+  ridge regression — the prompt names both as acceptable, and this project
+  has no numpy/scipy dependency to lean on for the linear algebra; a
+  sample-recency running estimate answers the one thing a live demo needs
+  (converging visibly, re-adapting visibly) without new machinery. Not a
+  bandit, stated once and checked once
+  (`test_observe_never_influences_what_is_served_it_is_not_a_bandit`):
+  `observe()` only ever updates a passive record of what real traffic
+  already did; nothing here ever chooses what gets served in order to
+  learn faster.
+- `classifier.py` — `Event.cost` is now `true_cost(...)`, not the flat
+  `spec.cost` — real per-event variance the learner has something honest
+  to learn from.
+- `decision.py` — `score()`/`slack()`/`est_service_time()`/`decide()` all
+  gained an optional `cost: float | None = None` override, defaulting to
+  `event.cost` (every pre-Stage-I call site and test is byte-for-byte
+  unaffected). `queue.py`/`worker.py` pass `CostModel.estimate()`'s own
+  learned value instead — decision.py itself stays pure, still "only
+  numbers it is handed."
+- `queue.py`/`worker.py` — both accept an optional `cost_model`, defaulting
+  to `None` (unaffected pre-Stage-I behaviour). `worker.py` feeds the
+  learner at the exact point a worker's simulated service genuinely
+  finishes (`event.cost` — the TRUE cost, never the estimate — is the one
+  real signal `observe()` is ever fed; the actual simulated sleep also
+  always uses `event.cost`, never the estimate, so CLAUDE.md hard rule 2's
+  determinism is untouched no matter how converged or unconverged the
+  learner is at any instant).
+- `generator.py` — `set_payload_multiplier()`, the demo beat's own
+  mechanism: scales every subsequent payload_size draw by a constant
+  factor (1.0 = the documented, calibration-preserving default). A
+  sustained shift, not a one-off outlier, is what actually exercises
+  re-adaptation.
+- `app.py` — `Engine` owns one `CostModel`, shared by the queue (ordering)
+  and the worker pool (routing + learning) so the two never disagree about
+  "the current estimate"; reset on `/control/reset` (`CostModel.reset()`
+  clears in place — the queue/pool hold this exact instance, never
+  rebuilt on reset, so a new object would silently stop being the one
+  they actually read from). `GET /control/costmodel` (learned vs. prior
+  per type — a new, small, dedicated endpoint rather than a `MetricsFrame`
+  contract change, since "workers killed"-style dashboard-only numbers
+  already established that pattern this session) and `POST
+  /control/payload-multiplier` (the demo beat's own trigger).
+- Dashboard: `CostModelPanel` — a per-type tab row, one learned line (real
+  `recharts` `Line`) against the config prior as a `ReferenceLine` (dotted,
+  literally what the prompt asks for), polled from `/control/costmodel`
+  on its own 1s cadence (not `/ws` — the field isn't on `MetricsFrame`).
+  Includes the demo-beat trigger inline (normal / 3x heavier mix buttons)
+  since asking a presenter to `curl` a control mid-demo would undercut the
+  same "everything clickable" precedent SPIKE/RESET/KILL WORKER already
+  set. 6th `PanelGrid` row; reverified live at 1920x1080, zero scroll.
+
+**A real, reproducible bug found and fixed before this could ship**: a
+sequence of `client.get()`/`client.post()` calls interleaved with a tight
+polling loop calling `metrics.snapshot()` directly from the TEST's own
+thread — while `TestClient` runs the actual `Engine` on a different
+background thread — produced a genuine, repeatable (3/3) conservation-
+equation mismatch (`ingested != processed + ... `, off by exactly one, in
+both directions across different runs). Root-caused by direct
+reproduction outside pytest (a standalone asyncio script never showed
+it; the identical scenario through `TestClient` did, every time) to a
+torn cross-thread read of `metrics.py`'s module-level counters —
+`metrics.py`'s own docstring already documents "single threaded, single
+event loop: no locks needed" as a deliberate assumption (CLAUDE.md hard
+rule 1), which direct-from-test-thread polling against a `TestClient`-run
+engine genuinely violates. **Not this stage's bug to fix** — it predates
+the cost model (the exact same unsafe pattern already exists in several
+committed tests, `test_chaos.py` included, that simply haven't hit the
+unlucky interleaving yet) and fixing `metrics.py`'s own thread-safety is
+a different-sized change than "add a learned cost model." Worked around
+in this stage's own new tests by polling exclusively through the HTTP
+layer (`TestClient`'s own portal, which is thread-safe by construction)
+instead of calling `metrics.snapshot()` directly — confirmed clean, 3/3,
+once switched. **Flagged here explicitly rather than silently patched**:
+a future prompt should decide whether to add a lock to `metrics.py`'s
+counters/`snapshot()` or to declare direct cross-thread test polling
+out of bounds project-wide.
+
+**One pre-existing test's own assumption, updated, not broken**:
+`test_inject_drops_one_correctly_classified_event_into_the_stream`
+asserted `cost == 3.5` (payment's old flat constant) — genuinely no
+longer true by design once cost depends on payload_size. Fixed to assert
+`cost` falls within the type's own known, computable range
+(`true_cost` at the low and high ends of `PAYLOAD_SIZE_RANGES`), which is
+the real, current invariant ("value and cost still come from config, not
+the caller" — cost is just no longer a single pinned number).
+
+**Verified live**, real server: baseline traffic converged the payment
+estimate to within a few percent of the 3.5u prior at ~90%+ confidence;
+clicking "3x heavier mix" drove the learned estimate from ~3.65u to
+4.94u (prior unchanged at 3.5u, confidence 100%) within seconds, visibly
+crossing above the dotted prior line on the chart, with real, simultaneous
+system-wide effects (pressure 0.34→0.40, P0 p99 209ms→599ms/SLA breached,
+queue depth and worker-pool occupancy both climbing) — the re-adaptation
+is not cosmetic, it measurably changes what the pipeline actually does.
+
+**Full suite, clean, no competing process: 994 passed** (973 + 21 new: 16
+in `tests/test_costmodel.py`, 5 in `tests/test_costmodel_integration.py`
+— the demo beat, end to end through a real Engine, including the
+rerouting check against `decision.score()` directly. The one existing
+test touched, `test_inject_drops_one_correctly_classified_event_into_the_
+stream`, was updated in place, not added, so it isn't part of that 21).

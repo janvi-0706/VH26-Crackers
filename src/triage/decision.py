@@ -67,20 +67,33 @@ class ScoreWeights:
 DEFAULT_SCORE_WEIGHTS = ScoreWeights()
 
 
-def est_service_time(event: Event, capacity_units_per_sec: float) -> float:
+def est_service_time(
+    event: Event, capacity_units_per_sec: float, *, cost: float | None = None
+) -> float:
     """How long this event is expected to occupy one worker, in seconds.
-    The same cost-model division worker.py actually sleeps for — ordering
-    has to reason about the same "service time" the system will actually
-    spend, not an independent guess at it."""
-    return event.cost / max(capacity_units_per_sec, EPS)
+
+    ``cost`` defaults to ``event.cost`` (the true, simulated cost) when not
+    given — every call site before Stage I, and every test that doesn't
+    pass it, is unaffected. Stage I's callers (queue.py, worker.py) pass
+    ``costmodel.CostModel.estimate()``'s own LEARNED prediction instead: a
+    real scheduler does not know an event's true cost in advance, only its
+    best current estimate of it, and ordering math should reason about the
+    same imperfect information a real system would actually have — not an
+    omniscient peek at the ground truth worker.py itself only learns by
+    actually serving the event."""
+    c = event.cost if cost is None else cost
+    return c / max(capacity_units_per_sec, EPS)
 
 
-def slack(event: Event, now: float, capacity_units_per_sec: float) -> float:
+def slack(
+    event: Event, now: float, capacity_units_per_sec: float, *, cost: float | None = None
+) -> float:
     """Seconds of margin left before this event would breach its deadline,
     *after* accounting for the service time it still has to consume.
     Negative means the margin is already gone — the event will breach even
-    if a worker starts on it this instant."""
-    return event.deadline_ts - now - est_service_time(event, capacity_units_per_sec)
+    if a worker starts on it this instant. ``cost`` — see
+    est_service_time's own docstring."""
+    return event.deadline_ts - now - est_service_time(event, capacity_units_per_sec, cost=cost)
 
 
 def score(
@@ -88,6 +101,8 @@ def score(
     now: float,
     capacity_units_per_sec: float,
     weights: ScoreWeights = DEFAULT_SCORE_WEIGHTS,
+    *,
+    cost: float | None = None,
 ) -> float:
     """Higher score dequeues first, within a tier.
 
@@ -112,10 +127,16 @@ def score(
     time passes — a heap key frozen at insertion would silently freeze an
     event's aging at zero forever. See queue.py for the O(n)-per-dequeue
     consequence of that choice and why it is the right trade at this scale.
+
+    ``cost`` — Stage I: the value density is scored against, defaulting to
+    ``event.cost`` when not given (every pre-Stage-I call site). Real
+    callers pass `costmodel.py`'s own learned estimate instead — see
+    est_service_time's own docstring for why that is the honest thing to
+    score against, not the ground truth.
     """
-    s = slack(event, now, capacity_units_per_sec)
+    s = slack(event, now, capacity_units_per_sec, cost=cost)
     urgency = 1.0 / max(s, EPS)
-    density = event.value / max(event.cost, EPS)
+    density = event.value / max(event.cost if cost is None else cost, EPS)
 
     sla = max(event.deadline_ts - event.ingest_ts, EPS)
     age = max(now - event.ingest_ts, 0.0)
@@ -206,6 +227,8 @@ def decide(
     pressure_value: float,
     now: float,
     capacity_units_per_sec: float,
+    *,
+    cost: float | None = None,
 ) -> tuple[Decision, str]:
     """What to do with one event, right now.
 
@@ -220,6 +243,12 @@ def decide(
 
     Returns (Decision, reason) — the reason is a short human sentence,
     because a judge has to be able to read *why*, not just *what*.
+
+    ``cost`` — Stage I: the value slack's own est_service_time is computed
+    against, defaulting to ``event.cost`` (unaffected pre-Stage-I
+    behaviour). ``worker.py`` passes `costmodel.py`'s own learned estimate
+    — see `decision.score`'s own docstring for why using the estimate,
+    not the ground truth, is the honest choice.
     """
     if event.tier is Tier.P0:
         return (
@@ -233,7 +262,7 @@ def decide(
     # instead of silently being deferred.
     assert event.tier is not Tier.P0, "unreachable: P0 must return above"
 
-    event_slack = slack(event, now, capacity_units_per_sec)
+    event_slack = slack(event, now, capacity_units_per_sec, cost=cost)
     if event_slack < 0:
         return (
             Decision.DEFER,
