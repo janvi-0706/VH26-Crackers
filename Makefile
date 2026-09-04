@@ -1,18 +1,19 @@
 # PY defaults to whatever `python` is on PATH. On Windows we run a 3.11 venv:
-#   make fake PY=./.venv/Scripts/python.exe
+#   make dev PY=./.venv/Scripts/python.exe
 PY ?= python
 export PYTHONPATH := src
 
 .PHONY: dev fake test bench config
 
-# Run the pipeline + dashboard (Lane D, Stage B)
+# Run the real pipeline: generator -> classifier -> queue -> workers -> sink,
+# FastAPI serving /health, /control/rate and /ws on :8000.
 dev:
-	@echo "dev: not implemented yet"
+	$(PY) -m triage.app
 
-# Emit plausible MetricsFrames at 4 Hz so the dashboard can be built before
-# the engine exists (Lane D, Stage A)
+# Run the app in --fake mode: no engine, /ws streams triage.fake_metrics.
+# Lets the dashboard be built before the engine exists (Stage A onward).
 fake:
-	$(PY) -m triage.fake_metrics
+	$(PY) -m triage.app --fake
 
 # Print the tier table and re-check the three calibration invariants
 config:
@@ -22,6 +23,6 @@ config:
 test:
 	$(PY) -m pytest -q
 
-# Headless benchmark: adaptive vs naive (Lane D, Stage F)
+# Headless benchmark: adaptive vs naive (Lane D, Stage G)
 bench:
 	@echo "bench: not implemented yet"

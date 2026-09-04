@@ -121,3 +121,77 @@ sink_round_trip= True rows= 1
 
 P4 is complete. Queue, worker, FastAPI, dashboard, and Makefile wiring remain
 for P5 and later; no P5 implementation was started in this prompt.
+
+## Stage B — P5 queue, workers, app (Lane A/D)
+
+**Done**
+
+- `src/triage/queue.py` — `EventQueue` wraps one `asyncio.Queue`. `put`/
+  `put_nowait` call `metrics.observe_ingest`; `get` calls
+  `metrics.observe_dequeue`. No priority, no tiers — a single FIFO, as
+  scoped. Internals only; Stage C replaces them with three heaps without
+  touching `worker.py`'s call sites.
+- `src/triage/worker.py` — `WorkerPool` of `config.worker_count` (6) asyncio
+  tasks. Each loop is `queue.get()` -> `asyncio.sleep(event.cost /
+  worker_capacity_ups)` -> `metrics.observe_complete` -> `sink.write`, per
+  the cost model in `config/tiers.yaml` (25 u/s/worker, never hardcoded
+  twice). One bad event logs and does not kill the worker.
+- `src/triage/app.py` — FastAPI factory `create_app(fake=..., seed=...)`.
+  `GET /health`, `POST /control/rate` (422 on negative, 409 in `--fake`
+  mode), `WS /ws` pushing a frame at 4 Hz (`metrics.snapshot()` in real
+  mode, `FakeSource.tick()` in `--fake`). Real mode's `lifespan` starts an
+  `Engine` (generator -> classifier -> queue -> workers) as background
+  tasks on the app's own event loop and stores it on `app.state.engine`;
+  `--fake` starts no engine at all. `dashboard/dist` is mounted as static
+  when it exists; otherwise `/` returns a small JSON notice instead of
+  500ing — `dashboard/` has no build yet, so this is the live path today.
+- `Makefile` — `dev` (real engine), `fake` (`--fake`), `test` (pytest),
+  `config` (calibration printout), `bench` (still a stub; Stage G).
+- `tests/test_engine.py`, `tests/test_app.py` — 21 new tests: queue
+  instrumentation and FIFO order; worker cost-model timing and sink
+  wiring; the 150 u/s ceiling within 5%; `/health`, `/control/rate`,
+  `/ws` in both modes; a real-mode test that the whole pipeline actually
+  moves an event (not just imports cleanly).
+
+**Windows-specific finding, fixed, not worked around.** The first run of the
+throughput test measured ~128-140 u/s instead of 150 (7-15% low). Traced it
+to Windows' default ~7ms per-call overhead on `asyncio.sleep()` under
+`ProactorEventLoop` (confirmed directly: a bare loop of `asyncio.sleep(0.04)`
+overshoots by ~7ms/call regardless of concurrency). Since the whole cost
+model *is* `asyncio.sleep(cost/capacity)`, that overhead would have quietly
+inflated every latency number the demo shows on a Windows judge's machine.
+Fixed at the source in `worker.py` via `winmm.timeBeginPeriod(1)` (the
+standard fix for this, used by games/audio engines) — process-wide,
+reversible, a documented no-op on non-Windows. After the fix, the same
+measurement lands within 1% of 150 u/s.
+
+**Verified**
+
+```
+$ python -m triage.app --fake --port 8091   (then curl)
+GET  /health          {"status":"ok","mode":"fake","uptime_s":null}
+GET  /                {"info":"dashboard/dist not built yet; try /health or /ws"}
+POST /control/rate    409 {"error":"rate control has no effect in --fake mode"}
+
+$ python -m triage.app --port 8092 --seed 5   (then curl)
+GET  /health                          {"status":"ok","mode":"real","uptime_s":1.7}
+POST /control/rate {"rate":200}       200 {"rate":200.0}
+GET  /health (2s later)               {"status":"ok","mode":"real","uptime_s":4.0}
+
+$ python -m pytest -q
+64 passed
+```
+
+`make`/`make test`/`make dev` could not be exercised directly — this machine
+has no `make` binary (Windows, no build tools installed) — but the Makefile
+is plain GNU-make syntax and every recipe was run and verified via its
+underlying `python -m ...` command above.
+
+**Open / next**
+
+- `dashboard/` is still empty; Stage B's own acceptance line ("Vite + React
+  dashboard, real UI") is not yet built — next prompt, per the runbook.
+- Contract freeze (Stage A's last open item) is still pending team review.
+- `Event.payload` and the rollup/ledger/deferred/sink-only contracts flagged
+  in the data-model review are still outstanding — unrelated to this prompt,
+  carried forward.

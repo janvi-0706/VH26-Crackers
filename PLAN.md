@@ -29,14 +29,14 @@ must be demoable at each one.
 - [ ] Team review, then **freeze** `contracts.py` and `config/tiers.yaml`
 
 ## Stage B — Vertical slice (H1–4)
-- [ ] `queue.py`: single FIFO, instrumented
-- [ ] `worker.py`: pool with simulated service time from the cost model
+- [x] `queue.py`: single FIFO, instrumented
+- [x] `worker.py`: pool with simulated service time from the cost model
 - [x] `generator.py`: mix-correct event stream, baseline rate
 - [x] `classifier.py`: assigns seq, idempotency_key, cost, deadline
 - [x] `sink.py`: terminal write
-- [ ] `app.py`: FastAPI + WebSocket metrics at 4 Hz + static dashboard mount
+- [x] `app.py`: FastAPI + WebSocket metrics at 4 Hz + static dashboard mount
 - [ ] `dashboard/`: real UI against the frozen MetricsFrame
-- [ ] `make dev` runs the whole slice end to end
+- [x] `make dev` runs the whole slice end to end
 
 ## Stage C — First demoable state (H4–7) — Round 1
 - [ ] `queue.py`: three heaps, per-tier depth
