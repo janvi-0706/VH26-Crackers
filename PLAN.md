@@ -50,9 +50,14 @@ must be demoable at each one.
       identity, contract-first freeze) — done early, ahead of Stage G
 
 ## Stage D — Adaptive engine (H7–10)
-- [ ] `decision.py`: split decision function, pressure signal, per-event reason string
-- [ ] Decisions visible per event in the dashboard
-- [ ] P0-never-shed asserted in tests
+- [x] `decision.py`: split decision function (score/pressure, never combined),
+      real pressure signal wired from live EWMAs, per-event reason string
+- [x] queue.py: score-ordered dequeue within each tier (replaces EDF/arrival)
+- [x] P0-never-shed (non-STREAM_NOW) asserted in tests — 212-step invariant
+      sweep plus live-spike integration tests
+- [ ] Decisions visible per event in the *dashboard* — backend records them
+      (ledger + recent_decisions), no frontend panel yet; not asked for in
+      this prompt, left for the next one that asks for it
 
 ## Stage E — Backpressure, ladder, ledger (H10–12.5)
 - [ ] `codel.py`: queue-latency controller

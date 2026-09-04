@@ -260,3 +260,88 @@ def test_p0_and_p2_percentiles_are_computed_from_disjoint_sample_sets():
     frame = metrics.snapshot()
     assert frame.latency_p99["P0"] == pytest.approx(2000.0, abs=1.0)
     assert frame.latency_p99["P2"] < 50.0  # unmoved by the single P0 sample
+
+
+# --------------------------------------------------------------------------
+# Stage D: real pressure, wired from live signals
+# --------------------------------------------------------------------------
+
+
+def test_pressure_is_zero_on_a_freshly_reset_registry():
+    assert metrics.snapshot().pressure == 0.0
+
+
+def test_pressure_rises_as_queue_depth_grows():
+    base = time.time()
+    quiet = metrics.current_pressure(now=base)
+    for i in range(300):
+        metrics.observe_ingest(event(seq=i, tier=Tier.P2, ingest_ts=base), now=base)
+    # Force past the refresh throttle so the new depth is actually reflected.
+    loaded = metrics.current_pressure(now=base + 0.1)
+    assert loaded > quiet
+
+
+def test_pressure_is_throttled_between_refreshes():
+    """current_pressure() must not recompute (and re-sort/re-percentile)
+    on every call at spike rate — see the throttle's own docstring for why
+    that specific mistake already happened once in this project."""
+    base = time.time()
+    first = metrics.current_pressure(now=base)
+    for i in range(500):
+        metrics.observe_ingest(event(seq=i, tier=Tier.P1, ingest_ts=base), now=base)
+    # Within the throttle window: the cached value, not a fresh recompute.
+    still_cached = metrics.current_pressure(now=base + 0.001)
+    assert still_cached == first
+
+
+def test_worker_count_and_active_workers_are_real_in_the_frame():
+    from triage.config import load_config
+
+    cfg = load_config()
+    base = time.time()
+    ev = event(seq=1, tier=Tier.P1, ingest_ts=base)
+    metrics.observe_dequeue(ev, now=base)
+
+    frame = metrics.snapshot()
+    assert frame.worker_count == cfg.worker_count
+    assert frame.active_workers == 1
+
+
+def test_reset_clears_the_rate_ewmas_and_pressure_cache():
+    base = time.time()
+    for i in range(50):
+        metrics.observe_ingest(event(seq=i, tier=Tier.P2, ingest_ts=base), now=base)
+    assert metrics.current_pressure(now=base + 0.1) >= 0.0  # populate the cache
+
+    metrics.reset()
+
+    assert metrics._arrival_rate_ewma.level == 0.0
+    assert metrics._service_rate_ewma.level == 0.0
+    assert metrics.snapshot().pressure == 0.0
+
+
+def test_ewma_ignores_a_single_point_then_tracks_a_steady_rate():
+    ewma = metrics._Ewma(half_life_seconds=1.0)
+    t0 = time.time()
+    ewma.observe_amount(10.0, t0)
+    assert ewma.level == 0.0  # first point only anchors the clock
+
+    # A steady 10 units/sec, fed once a second for a while, should converge
+    # toward 10 - not explode, not stay at zero.
+    for i in range(1, 12):
+        ewma.observe_amount(10.0, t0 + i * 1.0)
+    assert ewma.level == pytest.approx(10.0, rel=0.05)
+
+
+def test_ewma_with_trend_reflects_a_rising_rate():
+    ewma = metrics._Ewma(half_life_seconds=1.0)
+    t0 = time.time()
+    ewma.observe_amount(5.0, t0)
+    for i in range(1, 6):
+        ewma.observe_amount(5.0, t0 + i * 1.0)  # steady at 5/s
+    steady_level = ewma.level
+
+    ewma.observe_amount(50.0, t0 + 6.0)  # a sudden burst
+    assert ewma.level > steady_level
+    assert ewma.trend > 0
+    assert ewma.with_trend > ewma.level  # leans into the ramp, not just behind it

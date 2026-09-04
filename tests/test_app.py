@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from triage import ledger, metrics
 from triage.app import SPIKE_EVENTS_PER_MINUTE, SPIKE_RATE_EPS, create_app
-from triage.contracts import MetricsFrame
+from triage.contracts import Decision, MetricsFrame, Tier
 
 
 def setup_function() -> None:
@@ -368,3 +368,64 @@ def test_inject_has_no_effect_in_fake_mode():
     with TestClient(app) as client:
         resp = client.post("/control/inject", json={"type": "payment"})
     assert resp.status_code == 409
+
+
+# --------------------------------------------------------------------------
+# Stage D — the live decision wiring, exercised for real, not just
+# synthetically in test_invariant.py / test_decision.py
+# --------------------------------------------------------------------------
+
+
+def test_live_pipeline_records_non_stream_decisions_under_a_real_spike():
+    """Drives the real, calibrated 20x spike until pressure genuinely
+    crosses into MICRO_BATCH/DEFER territory, then confirms the decision
+    trail (metrics.observe_decision -> recent_decisions, and the ledger
+    behind it) actually shows it. This is the live counterpart to
+    test_invariant.py's synthetic sweep: real pressure, real events, same
+    guarantee — and it doubles as proof the wiring in Engine._ingest is
+    real, not inert."""
+    import time as _time
+
+    app = create_app(fake=False, seed=25)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()  # the real, calibrated overload — not an arbitrary rate
+
+        deadline = _time.monotonic() + 6.0
+        seen_non_stream = False
+        while _time.monotonic() < deadline and not seen_non_stream:
+            frame = metrics.snapshot()
+            seen_non_stream = any(
+                d.decision is not Decision.STREAM_NOW for d in frame.recent_decisions
+            )
+            if not seen_non_stream:
+                _time.sleep(0.05)
+
+    assert seen_non_stream, "expected at least one non-STREAM_NOW decision under a real spike"
+    assert ledger.total_recorded() > 0, "non-STREAM_NOW decisions must reach the ledger"
+
+
+def test_live_pipeline_never_defers_p0_even_under_a_real_spike():
+    """The other half of the same run: whatever else happens under real
+    overload, no P0 event ever gets a non-STREAM_NOW decision — checked
+    against the ledger rather than recent_decisions, because only
+    non-STREAM_NOW decisions ever reach either one (STREAM_NOW is the
+    common case and is deliberately never recorded, so recent_decisions
+    can never hold a STREAM_NOW entry to inspect either way). Since the
+    ledger only ever contains non-STREAM_NOW rows by construction, a P0 row
+    appearing there at all — regardless of what it says — is exactly the
+    leak this test exists to catch, proven against events that actually
+    flowed through the real generator -> classifier -> decision -> queue
+    path, not just constructed synthetically."""
+    import time as _time
+
+    from triage import ledger as ledger_module
+
+    app = create_app(fake=False, seed=26)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        _time.sleep(4.0)  # let real pressure build and real decisions land
+
+    p0_rows = [row for row in ledger_module.records() if row["tier"] == Tier.P0.value]
+    assert p0_rows == [], f"P0 event(s) reached the ledger under a real spike: {p0_rows}"

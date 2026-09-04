@@ -15,19 +15,20 @@ Five observation points, called by the engine:
     observe_decision(event, decision, reason, pressure)  triage chose
     snapshot() -> MetricsFrame                         4 Hz, to the dashboard
 
-STAGE A STATUS — what is real and what is not:
+STAGE D STATUS — what is real and what is not:
 
   REAL   latency percentiles (p50/p95/p99, per tier and pooled), queue-wait
          percentiles, queue depth per tier, the ledger counters, SLA
-         attainment, value delivered vs value shed, true click count.
-         All of it falls out of the five call sites above at zero extra cost.
+         attainment, value delivered vs value shed, true click count,
+         worker_count, active_workers, and — new in Stage D — pressure and
+         service_rate, computed from live arrival/service rate EWMAs, p95
+         sojourn, queue depth and worker utilisation (see current_pressure).
 
-  STUB   throughput, offered/admitted/service rate, pressure, ladder_rung,
-         worker_count, active_workers, weighted_click_count, cost_adaptive,
-         cost_naive, retries, duplicates_caught, exactly_once_violations,
-         spike_multiplier. These report 0 until the stage that owns the
-         control loop or the component that measures them lands. They are in
-         the frame from day one so the dashboard never has to be rewritten.
+  STUB   throughput, offered/admitted rate, ladder_rung, weighted_click_count,
+         cost_adaptive, cost_naive, retries, duplicates_caught,
+         exactly_once_violations, spike_multiplier. These report 0 until the
+         stage that owns them lands. They are in the frame from day one so
+         the dashboard never has to be rewritten.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ import time
 from collections import deque
 from typing import Sequence
 
-from . import ledger
+from . import decision, ledger
+from .config import Config, load_config
 from .contracts import (
     TIER_KEYS,
     Decision,
@@ -63,6 +65,31 @@ RECENT = 50
 ALL = "ALL"
 _BUCKETS: tuple[str, ...] = TIER_KEYS + (ALL,)
 
+# Pressure calibration — deliberately not in config/tiers.yaml (frozen after
+# Stage A): these are properties of how we OBSERVE the system, not of the
+# event taxonomy itself.
+#
+# A queue depth beyond which the system is unambiguously saturated. Not
+# derived from the tier table; chosen from what sustained-spike testing in
+# Stage C actually showed (backlogs in the thousands under a true 20x spike).
+QDEPTH_SATURATION = 500.0
+
+# Half-life for the arrival/service rate EWMAs. Short enough that a spike
+# shows up within a couple of seconds — matching the demo's own pacing —
+# long enough that per-event noise doesn't make pressure flicker frame to
+# frame.
+_RATE_EWMA_HALF_LIFE_SECONDS = 2.0
+
+# current_pressure() calls queue_wait_percentile(), which sorts up to WINDOW
+# samples — far too expensive to pay on every single ingested event at spike
+# rate (333/sec). This project already found exactly this class of bug once
+# (the Stage C generator-pacing fix, see PROGRESS.md): a cheap-looking call
+# made once per event stops being cheap at spike rate. Pressure is instead
+# cached and recomputed at most this often; callers between refreshes get
+# the last computed value, which is a system-state gauge, not a per-event
+# fact — it does not need microsecond freshness to mean something.
+_PRESSURE_REFRESH_SECONDS = 0.05
+
 
 # --------------------------------------------------------------------------
 # State
@@ -79,6 +106,60 @@ _value_shed = 0.0
 _recent_decisions: deque[DecisionTrace] = deque(maxlen=RECENT)
 _recent_sheds: deque[ShedRecord] = deque(maxlen=RECENT)
 _started_at = 0.0
+
+
+class _Ewma:
+    """Exponentially-weighted moving average of a rate, plus a first-
+    difference trend term — the spec's "arrival_ewma_with_trend" is exactly
+    ``level + trend``: not just where the rate has been, but where it is
+    heading, so pressure can lean into a ramp instead of only reacting once
+    the backlog has already built.
+
+    Fed by amount-at-a-timestamp (e.g. "3.5 work-units arrived at t"), not a
+    pre-computed rate: it derives the instantaneous rate itself from the
+    true elapsed wall-clock time since the last observation, so it does not
+    care whether it is fed once a millisecond or once a second — the
+    smoothing constant (``half_life_seconds``) is a real time constant, not
+    a per-call weight.
+    """
+
+    def __init__(self, half_life_seconds: float) -> None:
+        self.half_life = half_life_seconds
+        self.level = 0.0
+        self.trend = 0.0
+        self._last_update: float | None = None
+
+    def observe_amount(self, amount: float, now: float) -> None:
+        if self._last_update is None:
+            self._last_update = now
+            return  # first point: no elapsed time yet to turn it into a rate
+        dt = now - self._last_update
+        if dt <= 0.0:
+            return  # clock didn't advance; skip rather than divide by zero
+        raw_rate = amount / dt
+        alpha = 1.0 - 0.5 ** (dt / self.half_life)
+        new_level = alpha * raw_rate + (1.0 - alpha) * self.level
+        self.trend = new_level - self.level
+        self.level = new_level
+        self._last_update = now
+
+    @property
+    def with_trend(self) -> float:
+        """The forward-looking estimate pressure actually wants: the
+        current smoothed level plus its own recent change, not just a
+        lagging average of where the rate used to be."""
+        return max(self.level + self.trend, 0.0)
+
+    def reset(self) -> None:
+        self.level = 0.0
+        self.trend = 0.0
+        self._last_update = None
+
+
+_arrival_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
+_service_rate_ewma = _Ewma(_RATE_EWMA_HALF_LIFE_SECONDS)
+_pressure_cache = 0.0
+_pressure_cache_ts = 0.0
 
 # The queue's live selection policy, mirrored here so the dashboard's mode
 # label is never a lie.
@@ -107,8 +188,13 @@ def reset() -> None:
     to its own "clear everything" contract.
     """
     global _value_delivered, _value_shed, _started_at, _current_mode
+    global _pressure_cache, _pressure_cache_ts
 
     _current_mode = Mode.ADAPTIVE
+    _arrival_rate_ewma.reset()
+    _service_rate_ewma.reset()
+    _pressure_cache = 0.0
+    _pressure_cache_ts = 0.0
     _latency_ms.clear()
     _queue_wait_ms.clear()
     for b in _BUCKETS:
@@ -183,8 +269,9 @@ def _percentiles(source: dict[str, deque[float]], q: float) -> dict[str, float]:
 # --------------------------------------------------------------------------
 
 
-def observe_ingest(event: Event) -> None:
+def observe_ingest(event: Event, now: float | None = None) -> None:
     """An event arrived and was admitted to the queue."""
+    now = time.time() if now is None else now
     tier = event.tier.value
     _counters["ingested"] += 1
     _counters["in_queue"] += 1
@@ -193,6 +280,10 @@ def observe_ingest(event: Event) -> None:
         # Ground truth for the sampling-fidelity panel: what the rollups will
         # later have to estimate correctly.
         _counters["true_click_count"] += 1
+
+    # Pressure's arrival-rate term: work-units, not event counts, so it is
+    # directly comparable to service_rate and to config.total_capacity_ups.
+    _arrival_rate_ewma.observe_amount(event.cost, now)
 
 
 def observe_dequeue(event: Event, now: float | None = None) -> None:
@@ -223,6 +314,11 @@ def observe_complete(event: Event, now: float | None = None) -> None:
     latency_ms = max(0.0, (now - event.ingest_ts) * 1000.0)
     _latency_ms[tier].append(latency_ms)
     _latency_ms[ALL].append(latency_ms)
+
+    # Pressure's service-rate term — same unit (work-units/sec) as the
+    # arrival EWMA above, so their ratio in decision.pressure() is
+    # dimensionless.
+    _service_rate_ewma.observe_amount(event.cost, now)
 
     if event.deadline_ts and now <= event.deadline_ts:
         _sla_met[tier] += 1
@@ -296,6 +392,49 @@ def observe_decision(
 
 
 # --------------------------------------------------------------------------
+# Pressure — real as of Stage D
+# --------------------------------------------------------------------------
+
+
+def current_pressure(config: Config | None = None, now: float | None = None) -> float:
+    """The live pressure value, per decision.pressure(). Throttled — see
+    _PRESSURE_REFRESH_SECONDS — so calling this once per ingested event at
+    spike rate does not repeat the mistake that constant already documents."""
+    global _pressure_cache, _pressure_cache_ts
+
+    now = time.time() if now is None else now
+    if now - _pressure_cache_ts >= _PRESSURE_REFRESH_SECONDS:
+        _pressure_cache = _compute_pressure(config or load_config(), now)
+        _pressure_cache_ts = now
+    return _pressure_cache
+
+
+def _compute_pressure(config: Config, now: float) -> float:
+    qdepth = sum(_queue_depth.values())
+
+    worker_util = 0.0
+    if config.worker_count > 0:
+        worker_util = min(_counters["in_flight"] / config.worker_count, 1.0)
+
+    # Pressure exists to gate P1/P2 — P0 is inherently protected by absolute
+    # priority regardless of pressure. P1's own SLA (the tighter of the two
+    # gated tiers) is the natural reference for "how close is a typical
+    # wait to breaching the tier we're actually trying to protect".
+    sla_reference = min(spec.sla_seconds for spec in config.tiers_of(Tier.P1))
+
+    signals = decision.PressureSignals(
+        qdepth=float(qdepth),
+        qmax=QDEPTH_SATURATION,
+        arrival_rate_ewma_with_trend=_arrival_rate_ewma.with_trend,
+        service_rate=_service_rate_ewma.with_trend,
+        p95_sojourn=queue_wait_percentile(ALL, 0.95) / 1000.0,  # ms -> s
+        sla_reference=sla_reference,
+        worker_util=worker_util,
+    )
+    return decision.pressure(signals)
+
+
+# --------------------------------------------------------------------------
 # Snapshot
 # --------------------------------------------------------------------------
 
@@ -303,6 +442,7 @@ def observe_decision(
 def snapshot(now: float | None = None) -> MetricsFrame:
     """The frame the dashboard reads, 4 times a second."""
     now = time.time() if now is None else now
+    cfg = load_config()
 
     return MetricsFrame(
         ts=now,
@@ -314,17 +454,18 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         latency_p50_all=round(percentile(_latency_ms[ALL], 0.50), 3),
         latency_p95_all=round(percentile(_latency_ms[ALL], 0.95), 3),
         latency_p99_all=round(percentile(_latency_ms[ALL], 0.99), 3),
-        # --- stubbed until the control loop lands (Stage D/E) ---
+        # --- stubbed until the stage that owns them lands (Stage E/F) ---
         throughput=0.0,
         offered_rate=0.0,
         admitted_rate=0.0,
-        service_rate=0.0,
-        pressure=0.0,
         ladder_rung=per_tier_int(),
         spike_multiplier=1.0,
-        worker_count=0,
-        active_workers=0,
-        # --- real ---
+        # --- real as of Stage D ---
+        service_rate=round(_service_rate_ewma.with_trend, 3),
+        pressure=round(current_pressure(cfg, now=now), 4),
+        worker_count=cfg.worker_count,
+        active_workers=_counters["in_flight"],
+        # --- real since Stage A ---
         ingested=_counters["ingested"],
         processed=_counters["processed"],
         in_queue=_counters["in_queue"],

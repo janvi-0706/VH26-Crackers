@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -32,10 +33,10 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import ledger, metrics
+from . import decision, ledger, metrics
 from .classifier import Classifier
 from .config import Config, load_config
-from .contracts import Event, EventType, MetricsFrame
+from .contracts import Decision, Event, EventType, MetricsFrame
 from .fake_metrics import FakeSource
 from .generator import EventGenerator
 from .queue import EventQueue, Mode as QueueMode
@@ -72,7 +73,7 @@ class Engine:
         self.config = config or load_config()
         self.generator = EventGenerator(config=self.config, seed=seed)
         self.classifier = Classifier(config=self.config)
-        self.queue = EventQueue()
+        self.queue = EventQueue(config=self.config)
         self.workers = WorkerPool(self.queue, config=self.config)
         self._stop = asyncio.Event()
         self._ingest_task: asyncio.Task[None] | None = None
@@ -145,9 +146,30 @@ class Engine:
         await self.workers.stop()
 
     async def _ingest(self) -> None:
-        """generator -> classifier -> queue, one event at a time."""
+        """generator -> classifier -> decision -> queue, one event at a time.
+
+        The routing decision is computed against real, live pressure right
+        here at admission — not a synthetic value only exercised by tests.
+        For Stage D this is deliberately observational: every event is
+        still enqueued exactly as before regardless of what decide()
+        returns. Actually *acting* on MICRO_BATCH (worker.py executing a
+        real batch) or DEFER (a real deferred buffer to park in and drain
+        from) is Stage E's machinery — building that now would be building
+        ahead of what this prompt asked for. What Stage D adds is real
+        anyway: the decision is genuinely computed from live system state,
+        and every non-STREAM_NOW one is recorded to the ledger via
+        metrics.observe_decision the moment pressure first crosses a
+        threshold, not retrofitted once Stage E lands.
+        """
         async for raw in self.generator.events(self._stop):
             event = self.classifier.classify(raw)
+            now = time.time()
+            pressure_value = metrics.current_pressure(self.config, now=now)
+            chosen, reason = decision.decide(
+                event, pressure_value, now, self.config.worker_capacity_ups
+            )
+            if chosen is not Decision.STREAM_NOW:
+                metrics.observe_decision(event, chosen, reason, pressure_value, now=now)
             await self.queue.put(event)
 
 
