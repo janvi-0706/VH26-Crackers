@@ -86,5 +86,7 @@ project's first line of code:
 ## Evidence: `git log --oneline --decorate v1-jury..v2-final`
 
 ```
-{{FINAL_LOG}}
+3b28f50 (HEAD -> main, tag: v2-final) Final prompt: bench chaos configs, ADRs 0009-0011, docs, submission page
+f0ca5ac Stage I: the learned cost model
+3053e2c Stage I: write-ahead checkpoint + chaos endpoints + ingest-time dedup
 ```
