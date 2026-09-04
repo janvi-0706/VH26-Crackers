@@ -17,7 +17,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-surface px-6 py-5">
+    <div className="min-h-screen bg-transparent px-6 py-5">
       <header className="mb-5 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-ink">PULSE</h1>

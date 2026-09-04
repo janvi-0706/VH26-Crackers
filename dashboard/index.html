@@ -4,8 +4,76 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PULSE</title>
+    <script>
+      // If the user double-clicks the file, redirect them to the local server
+      if (window.location.protocol === 'file:') {
+        window.location.href = 'http://localhost:8000';
+      }
+    </script>
+    <style>
+      .pixel-game-bg {
+        position: fixed;
+        inset: 0;
+        z-index: -10;
+        background-color: #2b2b3a; /* Dark night sky */
+      }
+      
+      .pixel-star {
+        position: absolute;
+        width: 4px;
+        height: 4px;
+        background-color: white;
+      }
+
+      .pixel-ground {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        height: 15vh;
+        background-color: #4b3424; /* Dirt */
+      }
+
+      .pixel-grass {
+        position: absolute;
+        top: 0;
+        width: 100%;
+        height: 20px;
+        background-color: #71b83d; /* Grass */
+        border-bottom: 4px solid #4f802b;
+      }
+
+      /* A simple checkered pattern for dirt texture */
+      .pixel-dirt-pattern {
+        position: absolute;
+        top: 20px;
+        bottom: 0;
+        width: 100%;
+        background-image: 
+          linear-gradient(45deg, #3d2a1d 25%, transparent 25%, transparent 75%, #3d2a1d 75%, #3d2a1d),
+          linear-gradient(45deg, #3d2a1d 25%, transparent 25%, transparent 75%, #3d2a1d 75%, #3d2a1d);
+        background-size: 20px 20px;
+        background-position: 0 0, 10px 10px;
+      }
+    </style>
   </head>
-  <body class="bg-surface text-ink">
+  <body class="text-ink text-shadow-sm">
+    <div class="pixel-game-bg">
+      <div class="pixel-star" style="top: 15%; left: 10%;"></div>
+      <div class="pixel-star" style="top: 8%; left: 25%;"></div>
+      <div class="pixel-star" style="top: 30%; left: 40%;"></div>
+      <div class="pixel-star" style="top: 20%; right: 35%;"></div>
+      <div class="pixel-star" style="top: 10%; right: 15%;"></div>
+      <div class="pixel-star" style="top: 40%; right: 25%;"></div>
+      <div class="pixel-star" style="top: 35%; left: 60%;"></div>
+      <div class="pixel-star" style="top: 50%; left: 15%;"></div>
+      <div class="pixel-star" style="top: 45%; right: 5%;"></div>
+      <div class="pixel-star" style="top: 55%; right: 45%;"></div>
+      
+      <div class="pixel-ground">
+        <div class="pixel-grass"></div>
+        <div class="pixel-dirt-pattern"></div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
