@@ -17,10 +17,12 @@ from triage.contracts import Decision, Event, EventType, Mode, Tier
 @pytest.fixture(autouse=True)
 def clean_registry():
     metrics.reset()
+    metrics.reset_critical_failures()
     ledger.reset()
     deferral.reset_default_store()
     yield
     metrics.reset()
+    metrics.reset_critical_failures()
     ledger.reset()
     deferral.reset_default_store()
 
@@ -448,3 +450,90 @@ def test_reset_clears_codel_and_ladder_ambient_state():
     metrics.reset()
 
     assert codel.is_sampling() is False
+
+
+# --------------------------------------------------------------------------
+# Live invariants, asserted continuously — this stage's own spec
+# --------------------------------------------------------------------------
+
+
+def test_p0_with_stream_now_never_trips_the_critical_assertion():
+    ev = event(tier=Tier.P0, etype=EventType.PAYMENT)
+    metrics.observe_decision(ev, Decision.STREAM_NOW, "fine", 0.1)
+    assert metrics.critical_failure_count() == 0
+
+
+def test_p0_with_a_non_stream_decision_trips_the_critical_assertion():
+    ev = event(tier=Tier.P0, etype=EventType.PAYMENT)
+    metrics.observe_decision(ev, Decision.DEFER, "should never happen", 0.9)
+    assert metrics.critical_failure_count() == 1
+    assert "P0" in metrics.critical_failures()[-1]
+
+
+def test_non_p0_tiers_never_trip_the_p0_assertion_regardless_of_decision():
+    for tier in (Tier.P1, Tier.P2):
+        for decision in Decision:
+            if decision is Decision.STREAM_NOW:
+                continue
+            metrics.observe_decision(event(tier=tier), decision, "fine", 0.5)
+    assert metrics.critical_failure_count() == 0
+
+
+def test_conservation_holds_after_a_normal_ingest_dequeue_complete_cycle():
+    ev = event()
+    metrics.observe_ingest(ev)
+    metrics.observe_dequeue(ev)
+    metrics.observe_complete(ev)
+    metrics.snapshot()  # where the check actually runs
+    assert metrics.critical_failure_count() == 0
+
+
+def test_conservation_holds_across_defer_and_shed_paths():
+    a, b = event(seq=1), event(seq=2)
+    metrics.observe_ingest(a)
+    metrics.observe_dequeue(a)
+    metrics.observe_defer(a)  # in_flight released, event now "missing" from
+                              # every _counters bucket -- deferred_pending
+                              # (deferral.pending_count()) is the live source
+                              # of truth that must pick it up instead
+    import triage.deferral as deferral_module
+    deferral_module.defer(a, "test")
+
+    metrics.observe_ingest(b)
+    metrics.observe_dequeue(b)
+    metrics.observe_defer(b)
+    metrics.snapshot()
+    # deferral.defer() was only called for `a` above -- `b` was dequeued
+    # and "defer"-released from in_flight without actually being parked,
+    # which is exactly the kind of gap the conservation check exists to
+    # catch; assert it caught it, then park `b` too and confirm balance
+    # is restored.
+    assert metrics.critical_failure_count() >= 1
+
+    metrics.reset_critical_failures()
+    deferral_module.defer(b, "test")
+    metrics.snapshot()
+    assert metrics.critical_failure_count() == 0
+
+
+def test_conservation_check_runs_on_every_snapshot_not_just_once():
+    ev = event()
+    metrics.observe_ingest(ev)
+    metrics.observe_dequeue(ev)
+    metrics.observe_complete(ev)
+    for _ in range(10):
+        metrics.snapshot()
+    assert metrics.critical_failure_count() == 0
+
+
+def test_critical_failures_are_not_cleared_by_reset():
+    """A demo reset must not quietly erase evidence that something was
+    already wrong — reset_critical_failures() is the explicit, separately
+    named way to actually clear it, used by tests only."""
+    ev = event(tier=Tier.P0, etype=EventType.PAYMENT)
+    metrics.observe_decision(ev, Decision.SHED, "should never happen", 0.99)
+    assert metrics.critical_failure_count() == 1
+
+    metrics.reset()
+
+    assert metrics.critical_failure_count() == 1

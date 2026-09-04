@@ -27,6 +27,7 @@ def _reset_live_weights() -> None:
 
 def setup_function() -> None:
     metrics.reset()
+    metrics.reset_critical_failures()
     ledger.reset()
     deferral.reset_default_store()
     _reset_live_weights()
@@ -34,6 +35,7 @@ def setup_function() -> None:
 
 def teardown_function() -> None:
     metrics.reset()
+    metrics.reset_critical_failures()
     ledger.reset()
     deferral.reset_default_store()
     _reset_live_weights()
@@ -775,3 +777,110 @@ def test_offered_rate_and_admitted_rate_are_both_real_and_never_negative():
     frame = metrics.snapshot()
     assert frame.offered_rate > 0.0
     assert frame.admitted_rate >= 0.0
+
+
+# --------------------------------------------------------------------------
+# Stage F (ledger) — the live invariants, the audit endpoints, live
+# --------------------------------------------------------------------------
+
+
+def test_get_audit_csv_returns_the_real_ledger_content():
+    app = create_app(fake=False, seed=40)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        import time as _time
+        _time.sleep(3.0)
+        resp = client.get("/audit.csv")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    lines = resp.text.strip().splitlines()
+    assert lines[0] == "ledger_id,recorded_ts,seq,decision,reason,pressure,tier,prev_hash,row_hash"
+    assert len(lines) > 1, "a real spike must have produced at least one ledger row"
+
+
+def test_get_audit_csv_works_even_in_fake_mode():
+    app = create_app(fake=True)
+    with TestClient(app) as client:
+        resp = client.get("/audit.csv")
+    assert resp.status_code == 200
+    assert resp.text.strip().splitlines()[0].startswith("ledger_id,")
+
+
+def test_get_audit_trace_returns_a_real_trace_by_event_id():
+    app = create_app(fake=False, seed=41)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        import time as _time
+        deadline = _time.monotonic() + 6.0
+        event_id = None
+        while _time.monotonic() < deadline and event_id is None:
+            traces = ledger.recent_traces()
+            if traces:
+                event_id = traces[0].event_id
+            else:
+                _time.sleep(0.05)
+        assert event_id is not None, "expected at least one decision trace under a real spike"
+
+        resp = client.get(f"/audit/trace/{event_id}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["event_id"] == event_id
+
+
+def test_get_audit_trace_404s_for_an_unknown_event_id():
+    app = create_app(fake=False, seed=42)
+    with TestClient(app) as client:
+        resp = client.get("/audit/trace/never-existed")
+    assert resp.status_code == 404
+
+
+def test_the_hash_chain_verifies_after_a_real_spike():
+    app = create_app(fake=False, seed=43)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        import time as _time
+        _time.sleep(5.0)
+
+    result = ledger.verify_chain()
+    assert result.ok is True
+    assert ledger.total_recorded() > 0
+
+
+def test_after_a_60s_spike_the_conservation_equation_balances_and_no_critical_assertion_fired():
+    """The literal acceptance line: a real 60-second spike, then the
+    conservation equation holds exactly and neither critical invariant
+    ever fired during the whole run — checked against
+    metrics.critical_failure_count(), which every snapshot() call along
+    the way (real mode pushes one over /ws at 4Hz — 240 of them over 60
+    real seconds) would have incremented the instant either invariant
+    broke, not just at the one instant this test happens to look."""
+    import time as _time
+
+    app = create_app(fake=False, seed=44)
+    with TestClient(app) as client:
+        engine = app.state.engine
+        engine.spike()
+        _time.sleep(60.0)
+
+        frame = metrics.snapshot()
+        total = (
+            frame.processed + frame.in_queue + frame.in_flight
+            + frame.deferred_pending + frame.sampled_out + frame.shed
+        )
+
+    assert frame.ingested > 0, "test setup: the spike must actually ingest something"
+    assert frame.ingested == total, (
+        f"conservation equation broken: ingested={frame.ingested} != "
+        f"processed({frame.processed}) + in_queue({frame.in_queue}) + "
+        f"in_flight({frame.in_flight}) + deferred_pending({frame.deferred_pending}) "
+        f"+ sampled_out({frame.sampled_out}) + shed({frame.shed}) = {total}"
+    )
+    assert metrics.critical_failure_count() == 0, (
+        f"critical invariant(s) fired during the spike: {metrics.critical_failures()}"
+    )
+    assert ledger.verify_chain().ok is True

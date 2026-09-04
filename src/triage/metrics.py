@@ -53,6 +53,7 @@ STAGE F STATUS — what is real and what is not:
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from typing import Sequence
@@ -84,6 +85,8 @@ RECENT = 50
 
 ALL = "ALL"
 _BUCKETS: tuple[str, ...] = TIER_KEYS + (ALL,)
+
+logger = logging.getLogger(__name__)
 
 # Pressure calibration — deliberately not in config/tiers.yaml (frozen after
 # Stage A): these are properties of how we OBSERVE the system, not of the
@@ -145,6 +148,75 @@ _weighted_click_count = 0.0
 # real decision most recently landed on, so it reflects CoDel/hard-shed
 # state that pressure alone cannot express.
 _ladder_rung: dict[str, int] = {}
+
+# --------------------------------------------------------------------------
+# Live invariants, asserted continuously — this stage's own spec.
+#
+# Deliberately NOT reset by reset(): a critical-invariant violation is
+# exactly the kind of evidence a demo reset must not quietly erase (the
+# same reasoning ledger.py's own audit trail is built on). A genuine wipe
+# between test runs uses reset_critical_failures() explicitly, named
+# differently on purpose so it can never be confused with the routine
+# per-test reset() every other piece of state here gets.
+# --------------------------------------------------------------------------
+_critical_failure_count = 0
+_critical_failures: deque[str] = deque(maxlen=100)
+
+
+def _record_critical_failure(message: str) -> None:
+    global _critical_failure_count
+    _critical_failure_count += 1
+    _critical_failures.append(message)
+    logger.error("CRITICAL INVARIANT VIOLATION: %s", message)
+
+
+def critical_failure_count() -> int:
+    return _critical_failure_count
+
+
+def critical_failures() -> tuple[str, ...]:
+    return tuple(_critical_failures)
+
+
+def reset_critical_failures() -> None:
+    """Tests only — see the module note above on why this is not part of
+    reset()."""
+    global _critical_failure_count
+    _critical_failure_count = 0
+    _critical_failures.clear()
+
+
+def _check_p0_never_non_stream(tier: Tier, decision: Decision) -> None:
+    """"no audit or decision-trace row for tier P0 has a non-STREAM_NOW
+    decision" (this stage's own spec), checked at the exact point every
+    decision is about to become such a row — observe_decision() is the
+    single choke point every decision already passes through (ledger.py's
+    own docstring), so this is the one call site that can see every
+    candidate violation without needing a separate sweep."""
+    if tier is Tier.P0 and decision is not Decision.STREAM_NOW:
+        _record_critical_failure(
+            f"P0 event received a non-STREAM_NOW decision: {decision.value} "
+            "(CLAUDE.md hard rule 3 violated)"
+        )
+
+
+def _check_conservation(
+    ingested: int, processed: int, in_queue: int, in_flight: int,
+    deferred_pending: int, sampled_out: int, shed: int,
+) -> None:
+    """"ingested == processed + in_queue + in_flight + deferred_pending +
+    sampled_out + shed" (this stage's own spec, and docs/DATA_MODEL.md's
+    own conservation equation since Stage A), checked on every snapshot()
+    — at 4Hz in real mode, which is what "asserted continuously" means in
+    a running pipeline, not a one-off test-only check."""
+    total = processed + in_queue + in_flight + deferred_pending + sampled_out + shed
+    if ingested != total:
+        _record_critical_failure(
+            f"conservation equation broken: ingested={ingested} != "
+            f"processed({processed}) + in_queue({in_queue}) + in_flight({in_flight}) "
+            f"+ deferred_pending({deferred_pending}) + sampled_out({sampled_out}) "
+            f"+ shed({shed}) = {total}"
+        )
 
 # event_id -> the wall-clock moment a replayed event re-entered the live
 # queue, so observe_dequeue can measure this pass's queue-wait from there
@@ -554,6 +626,12 @@ def observe_decision(
         ts=now,
     )
     _recent_decisions.appendleft(trace)
+    # The 500-item, event_id-queryable ring buffer — separate from the
+    # small dashboard-narration deque above (see ledger.py's own docstring
+    # on why the two are not the same structure).
+    ledger.record_trace(trace)
+
+    _check_p0_never_non_stream(event.tier, decision)
 
     if decision is Decision.SHED:
         _counters["shed"] += 1
@@ -650,9 +728,26 @@ def _compute_pressure(config: Config, now: float) -> float:
 
 
 def snapshot(now: float | None = None) -> MetricsFrame:
-    """The frame the dashboard reads, 4 times a second."""
+    """The frame the dashboard reads, 4 times a second.
+
+    Also where the conservation equation is checked, continuously — at
+    whatever rate something actually calls this (4Hz over /ws in real
+    mode), not as a one-off test assertion. See _check_conservation()'s
+    own docstring.
+    """
     now = time.time() if now is None else now
     cfg = load_config()
+
+    deferred_pending = deferral.pending_count()
+    _check_conservation(
+        ingested=_counters["ingested"],
+        processed=_counters["processed"],
+        in_queue=_counters["in_queue"],
+        in_flight=_counters["in_flight"],
+        deferred_pending=deferred_pending,
+        sampled_out=_counters["sampled_out"],
+        shed=_counters["shed"],
+    )
 
     return MetricsFrame(
         ts=now,
@@ -683,7 +778,7 @@ def snapshot(now: float | None = None) -> MetricsFrame:
         processed=_counters["processed"],
         in_queue=_counters["in_queue"],
         in_flight=_counters["in_flight"],
-        deferred_pending=deferral.pending_count(),
+        deferred_pending=deferred_pending,
         sampled_out=_counters["sampled_out"],
         shed=_counters["shed"],
         true_click_count=_counters["true_click_count"],

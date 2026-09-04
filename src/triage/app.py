@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -335,6 +335,32 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
         return JSONResponse(result)
+
+    @app.get("/audit.csv")
+    async def audit_csv() -> Response:
+        """The whole durable, hash-chained audit_ledger table, exported as
+        CSV. No fake-mode restriction (a read, like GET /control/weights)
+        — in --fake mode the ledger is simply empty, since nothing in
+        that mode ever calls metrics.observe_decision()."""
+        return Response(
+            content=ledger.export_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=audit_ledger.csv"},
+        )
+
+    @app.get("/audit/trace/{event_id}")
+    async def audit_trace(event_id: str) -> JSONResponse:
+        """One decision trace by event_id, from the 500-item ring buffer —
+        the query surface this stage's own spec asks for. 404, not an
+        empty 200, when the id is unknown or has aged out of the buffer:
+        the two cases are indistinguishable from here, and either way
+        there is nothing to return."""
+        trace = ledger.get_trace(event_id)
+        if trace is None:
+            return JSONResponse(
+                {"error": f"no decision trace for event_id {event_id!r}"}, status_code=404
+            )
+        return JSONResponse(trace.model_dump())
 
     @app.websocket("/ws")
     async def ws_metrics(websocket: WebSocket) -> None:

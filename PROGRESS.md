@@ -1389,3 +1389,182 @@ part of the session than earlier in it (thermal or OS-level, not
 diagnosed further — out of this prompt's scope to fix a machine's own
 timer resolution). Not a regression from this prompt; not silently
 ignored either.
+
+## Stage F (ledger) — ledger.py made real: audit trail, hash chain, live invariants
+
+Same "Stage F" label the user's prompt used a second time (admission.py was
+the previous one) — not renumbered here; PROGRESS.md just records what
+was actually built under each prompt in order.
+
+The Stage A stub said it plainly: "The real implementation lands in Stage
+E/F: a hash-chained, SQLite-backed ledger where each row carries the hash
+of the row before it, so a shed event cannot be quietly removed from the
+record after the fact." This prompt is that. Schema and hash-chain rule are
+exactly `docs/DATA_MODEL.md` section 6's own design contract, written back
+in the data-model documentation prompt — this file is that contract's
+first implementation, not a new design decided now.
+
+**Built**
+
+- `src/triage/ledger.py` — rewritten from the Stage A in-memory-deque stub:
+  - `SQLiteLedger` — durable `audit_ledger` table
+    (`ledger_id, recorded_ts, seq, decision, reason, pressure, tier,
+    prev_hash, row_hash`), matching `docs/DATA_MODEL.md`'s own DDL and
+    indexes exactly. `record()`'s public signature is frozen (per the
+    Stage A stub's own promise) — the body underneath it is now real I/O,
+    wrapped in `try/except` so an audit-write failure still cannot take
+    the pipeline down with it, the same guarantee the stub already made.
+  - Hash chain: `row_hash = SHA-256("ledger_id|recorded_ts|seq|decision|
+    reason|pressure|tier|prev_hash")`, `prev_hash` = the previous row's
+    own `row_hash`, genesis row = 64 zero hex characters. Fixed-precision
+    formatting (`%.6f`) on the two REAL columns is what makes this
+    reproducible — two logically-equal SQLite REAL values that happened
+    to round-trip through Python float formatting differently would
+    otherwise hash differently, and a verifier re-deriving the chain from
+    stored columns would then disagree with itself for no real reason.
+  - `verify_chain()` — walks the whole chain from the genesis hash,
+    re-deriving each row's hash from its own stored columns and checking
+    both that hash and the `prev_hash` link to the row before it. Returns
+    a `ChainVerification` (`ok`, `broken_at`, `reason`) — enough for an
+    operator to know both *that* the log was tampered with and *where* to
+    start looking, not just a bare boolean.
+  - `export_csv()` — the whole durable table, via `csv.writer` (not
+    hand-joined strings — a `reason` string containing a comma or newline
+    needs real quoting).
+  - The decision-trace ring buffer (this prompt's own addition, not in
+    the Stage A stub): 500 most recent `DecisionTrace` objects, newest
+    first, queryable by `event_id` via a parallel dict index. No table —
+    "ring buffer" is the literal spec, and this convenience index needs
+    none of the audit ledger's actual durability-across-restart guarantee.
+    Stores `DecisionTrace` objects verbatim, so "add derived fields only
+    after an explicit contract review" is satisfied by construction: there
+    is no wrapper type here that could carry anything beyond
+    `DecisionTrace`'s own nine frozen fields.
+  - `reset()` (tests only) swaps in a fully fresh `SQLiteLedger()` —
+    unchanged from the Stage A stub's own contract (a complete wipe), kept
+    that way deliberately: `Engine.reset()` (`/control/reset`) already
+    called `ledger.reset()` since Stage A, and changing that endpoint to
+    stop touching the audit trail on a live reset is a real, separate
+    design decision this prompt does not ask for — flagged here, not made
+    silently. (A first draft of this file *did* make that change
+    unprompted, reasoning that a tamper-evident audit trail should survive
+    a reset — reasonable in isolation, but it broke an existing, already-
+    passing test (`test_every_decision_writes_exactly_one_ledger_row`'s
+    exact-count assertion) that depends on `reset()` actually clearing
+    everything. Caught by running the existing suite before moving on,
+    reverted, and documented instead of silently kept.)
+- `src/triage/metrics.py` — `observe_decision()` now also calls
+  `ledger.record_trace(trace)` (the ring buffer) and
+  `_check_p0_never_non_stream()` (below) on every call — the same single
+  choke point every decision already passes through. New live-invariant
+  machinery, this prompt's own spec:
+  - `_check_p0_never_non_stream(tier, decision)` — "no audit or
+    decision-trace row for tier P0 has a non-STREAM_NOW decision," checked
+    at the exact point every such row is about to be written.
+  - `_check_conservation(...)` — "ingested == processed + in_queue +
+    in_flight + deferred_pending + sampled_out + shed," checked on every
+    `snapshot()` call — 4Hz over `/ws` in real mode, which is what
+    "asserted continuously" means for a running pipeline, not a one-off
+    test-only check.
+  - Both feed `_record_critical_failure()`, a counter plus a bounded
+    (100-item) log of messages, exposed via `critical_failure_count()` /
+    `critical_failures()`. Deliberately **not** cleared by `reset()` — a
+    critical-invariant violation is exactly the kind of evidence a demo
+    reset must not quietly erase, the same reasoning the audit ledger
+    itself is built on. A separately-named `reset_critical_failures()`
+    (tests only) is the explicit, unambiguous way to actually clear it.
+- `src/triage/app.py` — two new endpoints:
+  - `GET /audit.csv` — the whole durable ledger, `text/csv`,
+    `Content-Disposition: attachment`. No fake-mode restriction (a read,
+    like `GET /control/weights`) — in `--fake` mode the ledger is simply
+    empty, since nothing in that mode ever calls
+    `metrics.observe_decision()`.
+  - `GET /audit/trace/{event_id}` — one decision trace from the ring
+    buffer, 404 (not an empty 200) when the id is unknown or has aged out
+    — the two cases are indistinguishable from here and either way there
+    is nothing to return. Not explicitly named by this prompt (only
+    `/audit.csv` was) but a natural, minimal complement to it — the
+    ring buffer's own spec says "queryable by event_id," and an HTTP GET
+    is the obvious way to make that true for more than Python callers.
+
+**Tests — 38 new (505 total)**
+
+- `tests/test_ledger.py` (new, 25 tests) — the chain itself (genesis
+  linking, row-to-row linking, deterministic hashing, a changed reason
+  producing a different hash), **the explicit acceptance line: mutating
+  any single column (reason, pressure, decision, tier, seq) breaks
+  `verify_chain()`**, deleting a middle row breaks it, forging both
+  `reason` and `row_hash` together still breaks it at the *next* link
+  (whose `prev_hash` still points at the original, un-forged hash),
+  `verify_chain()` reports the *first* break rather than a later one, CSV
+  export (header + one row per record, an empty ledger is just the
+  header, a `reason` containing a comma round-trips correctly through
+  `csv.writer`), the ring buffer (found-by-event-id, not-found, newest-
+  first ordering, eviction at exactly 500, and — the one real bug this
+  file's own tests found empirically, not by inspection — eviction must
+  not clobber a *newer* re-recording of a duplicate `event_id` that
+  overwrote the index before the *original*, still-physically-present
+  older copy of that same id reaches the tail and gets evicted; the first
+  version of this test pushed enough further insertions to age out the
+  newer copy too, made the assertion fail for a reason that had nothing
+  to do with the code, and was rewritten to construct the actual race
+  instead), and `reset()`'s module-level wiring.
+- `tests/test_metrics.py` (7 new) — the P0 assertion firing exactly when
+  it should and never otherwise (across every non-P0 tier x every
+  non-STREAM_NOW decision), conservation holding after a normal ingest-
+  dequeue-complete cycle, conservation genuinely catching a real gap (an
+  event dequeued and "defer"-released from `in_flight` without actually
+  being parked in the deferred buffer — the same class of bug
+  Stage D/E's own `observe_defer()` fixes were about, reproduced here on
+  purpose to prove the check would have caught it) and confirming balance
+  restores once the gap is closed, the check running on every `snapshot()`
+  call (not just the first), and critical failures surviving `reset()`
+  (only `reset_critical_failures()` clears them).
+- `tests/test_app.py` (6 new) — `GET /audit.csv` with real spike-produced
+  rows and in `--fake` mode, `GET /audit/trace/{event_id}` found and
+  404-not-found, the hash chain verifying after a real spike, and **the
+  literal acceptance line**: a real 60-second spike, then the conservation
+  equation checked directly against the live `MetricsFrame`'s own counters
+  and `metrics.critical_failure_count() == 0` — meaning neither invariant
+  fired even once across the roughly 240 real `snapshot()` calls a 60-
+  second run at 4Hz actually makes, not just at the one instant the test
+  happens to look.
+
+**Verified**
+
+```
+$ python -m pytest -q
+505 passed (with the pre-existing, already-isolated-via-git-stash
+Stage-F/admission-prompt timer flake aside — re-confirmed clean with no
+competing process on the machine)
+```
+
+Live, against the real backend: `POST /control/spike`, then `GET
+/audit.csv` — real hash-chained rows, real reasons (including one
+containing a comma, correctly quoted by the CSV writer), chain intact.
+`GET /audit/trace/{event_id}` on an id read moments earlier from a live
+`/ws` frame — 404. Not a bug: measured the real cause directly rather than
+guessing, by reading `/audit.csv`'s row count one second apart under the
+same sustained spike: **~700 non-STREAM_NOW decisions/sec**. At that rate a
+500-item ring buffer rotates completely in under a second, so a real
+network round-trip (open a second connection, issue the GET) is enough
+real time for the specific id to have already aged out by the time the
+lookup lands — a property of a bounded ring buffer under genuinely high
+throughput, not a defect in it. Confirmed the mechanism itself is correct
+two ways that don't have that race: an in-process script reading
+`ledger.recent_traces()[0].event_id` and calling `ledger.get_trace()` on
+it with no `await` in between (zero elapsed time for anything else to run)
+found it every time; and `test_get_audit_trace_returns_a_real_trace_by_
+event_id` (which polls for the freshest id right before querying, in the
+same process, no real network latency) passes reliably. `verify_chain()`
+also re-checked directly after that same heavy run — still `ok`.
+
+**What this prompt deliberately does not do:** no change to
+`Engine.reset()`'s existing call to `ledger.reset()` (flagged above, not
+made unprompted); no SQLite-backed `decision_traces` table the way
+`docs/DATA_MODEL.md` originally mused about (10,000-row horizon) — this
+prompt's own wording ("ring buffer... 500") is more specific and more
+recent, and is what got built; no dashboard panel for the audit trail or
+critical-failure count — not asked for this prompt, and the ledger/
+invariant surface is already fully verifiable via `/audit.csv`,
+`/audit/trace/{event_id}`, and the Python API directly.
