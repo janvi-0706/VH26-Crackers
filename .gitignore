@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Data produced at runtime
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+bench/results/
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+npm-debug.log*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
