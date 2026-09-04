@@ -32,18 +32,18 @@ export function WorkerPoolGridPanel({ latest }: { latest: MetricsFrame | null })
   return (
     <Panel
       title="Worker pool"
-      cols={3}
+      cols={4}
       headline={waiting > 0 ? `${active}/${total} (+${waiting} waiting)` : `${active}/${total} busy`}
     >
-      <div className="flex h-full items-center justify-center gap-2">
+      <div className="flex h-full items-center justify-center gap-6">
         {Array.from({ length: total }, (_, i) => {
           const lit = i < active;
           return (
             <div
               key={i}
-              className={`aspect-square flex-1 max-w-14 rounded-lg border-2 transition-colors duration-150 ${
+              className={`aspect-square flex-1 max-w-40 rounded-2xl border-4 transition-colors duration-150 ${
                 lit
-                  ? "border-tier-p0 bg-tier-p0/30 shadow-[0_0_12px_rgba(96,165,250,0.6)]"
+                  ? "border-tier-p0 bg-tier-p0/30 shadow-[0_0_28px_rgba(96,165,250,0.7)]"
                   : "border-surface-border bg-surface"
               }`}
             />

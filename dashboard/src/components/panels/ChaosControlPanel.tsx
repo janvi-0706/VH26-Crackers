@@ -54,32 +54,32 @@ export function ChaosControlPanel({ onWorkerKilled }: ChaosControlPanelProps) {
 
   return (
     <Panel title="Chaos control" cols={6} accent="warn">
-      <div className="flex h-full items-center justify-center gap-4">
-        <div className="flex flex-1 flex-col items-center gap-2">
+      <div className="flex h-full items-center justify-center gap-10 px-8">
+        <div className="flex flex-1 flex-col items-center gap-4">
           <button
             type="button"
             onClick={runKill}
             disabled={busy !== null}
-            className="w-full rounded-xl bg-bad px-4 py-4 text-lg font-black uppercase tracking-widest text-white
+            className="w-full rounded-2xl bg-bad px-8 py-12 text-4xl font-black uppercase tracking-widest text-white
               shadow-lg shadow-bad/40 transition-transform hover:scale-[1.03] hover:shadow-bad/60
               active:scale-[0.98] disabled:opacity-60 disabled:hover:scale-100"
           >
             {busy === "kill" ? "Killing…" : "☠ Kill worker"}
           </button>
-          <span className="text-center text-[11px] text-ink-muted">{killStatus}</span>
+          <span className="text-center text-base text-ink-muted">{killStatus}</span>
         </div>
-        <div className="flex flex-1 flex-col items-center gap-2">
+        <div className="flex flex-1 flex-col items-center gap-4">
           <button
             type="button"
             onClick={runFlood}
             disabled={busy !== null}
-            className="w-full rounded-xl bg-warn px-4 py-4 text-lg font-black uppercase tracking-widest text-surface
+            className="w-full rounded-2xl bg-warn px-8 py-12 text-4xl font-black uppercase tracking-widest text-surface
               shadow-lg shadow-warn/40 transition-transform hover:scale-[1.03] hover:shadow-warn/60
               active:scale-[0.98] disabled:opacity-60 disabled:hover:scale-100"
           >
             {busy === "flood" ? "Flooding…" : "🌊 Duplicate flood"}
           </button>
-          <span className="text-center text-[11px] text-ink-muted">{floodStatus}</span>
+          <span className="text-center text-base text-ink-muted">{floodStatus}</span>
         </div>
       </div>
     </Panel>

@@ -100,7 +100,7 @@ export function CostModelPanel() {
   return (
     <Panel
       title="Cost model: learned vs. prior"
-      cols={12}
+      cols={8}
       headline={
         activeRow
           ? `${activeRow.learned.toFixed(3)}u learned · ${(activeRow.confidence * 100).toFixed(0)}% confidence`

@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { PanelGrid } from "./components/Panel";
 import { ConnectionIndicator } from "./components/ConnectionIndicator";
 import { ControlBar } from "./components/ControlBar";
+import { TabBar } from "./components/TabBar";
 import { LatencyByTierPanel } from "./components/panels/LatencyByTierPanel";
 import { P0ScoreboardPanel } from "./components/panels/P0ScoreboardPanel";
 import { QueueDepthPanel } from "./components/panels/QueueDepthPanel";
@@ -18,40 +20,47 @@ import { ChaosControlPanel } from "./components/panels/ChaosControlPanel";
 import { RecoveryPanel } from "./components/panels/RecoveryPanel";
 import { CostModelPanel } from "./components/panels/CostModelPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
-import { useState } from "react";
 import * as api from "./lib/api";
 
 /**
- * Stage H's own "final layout" pass: every panel below is placed in the
- * exact row-major order it renders in, four to a row-plan (see
- * Panel.tsx's own docstring for why the grid is now driven by an explicit
- * row count rather than emergent auto-flow) — each row's `cols` values
- * sum to exactly 12:
+ * Rebuilt from Stage H's own "everything in one 6-row grid" layout: with
+ * 16 panels, cramming all of them onto one 1920x1080 screen at once meant
+ * every chart got a slice barely 150px tall — technically "fits without
+ * scrolling", but not actually readable, and charts in particular need
+ * real vertical room to be more than a squint-and-guess trend line.
  *
- *   Row 1 (status, read from across the room): Conservation(5) +
- *     P0 scoreboard(3) + Pressure(2) + Ladder by tier(2)
- *   Row 2 (the three time-series that tell the triage story): Rates(4) +
- *     Latency by tier(4) + Queue depth(4)
- *   Row 3 (what happened to the backlog): Deferred(3) + Worker pool(3) +
- *     Cost comparison(3) + Shed log(3)
- *   Row 4 (interactive / reference): Event inspector(4) + Weights(8)
- *   Row 5 (Stage I — chaos): Chaos control(6) + Recovery(6)
- *   Row 6 (Stage I — the learned cost model): Cost model convergence(12)
+ * The fix is tabs, not a smaller grid: only ONE tab's own panels ever
+ * render at a time, each still using `PanelGrid`'s own fixed-row-count
+ * approach (so a tab's own panels always fill exactly the space
+ * available, no scrolling within a tab either) but now with `rows={1}`
+ * for every tab — a handful of panels each get the ENTIRE remaining
+ * height, not a sixth of it. Every panel component is unchanged from
+ * Stage H/I; only which tab renders it, and each one's own `cols` (still
+ * owned by the panel itself, not passed down), changed to fit its new
+ * row.
  *
- * `ModeByTierPanel` (Stage D) was dropped here, not just left off the
- * grid: `LadderPanel` (Stage E) reads the real `ladder_rung` field and
- * shows strictly more (SAMPLE_ROLLUP/SHED-aware) than ModeByTierPanel's
- * client-side pressure-band recomputation ever could — keeping both was
- * two panels answering the same question, one of them less accurately.
- * `ThroughputPanel` was dropped for a plainer reason: `throughput` is
- * still a stub (always 0) three stages after Stage D's own comment said
- * so, and a permanently-flat-zero panel reads as a bug to a judge, not as
- * "not implemented yet" — `RatesPanel`'s own `service` line already
- * covers real completions-per-second.
+ *   Status   — Conservation(5) + P0 scoreboard(3) + Pressure(2) + Ladder(2)
+ *   Traffic  — Rates(4) + Latency by tier(4) + Queue depth(4)
+ *   Backlog  — Deferred(4) + Worker pool(4) + Shed log(4)
+ *   Cost     — Cost comparison(4) + Cost model convergence(8)
+ *   Chaos    — Chaos control(6) + Recovery(6)
+ *   Controls — Event inspector(4) + Weights(8)
  */
+type TabId = "status" | "traffic" | "backlog" | "cost" | "chaos" | "controls";
+
+const TABS: readonly { id: TabId; label: string }[] = [
+  { id: "status", label: "Status" },
+  { id: "traffic", label: "Traffic" },
+  { id: "backlog", label: "Backlog" },
+  { id: "cost", label: "Cost" },
+  { id: "chaos", label: "Chaos" },
+  { id: "controls", label: "Controls" },
+];
+
 export default function App() {
   const { status, latest, history, clearHistory } = useMetricsSocket();
   const [workersKilled, setWorkersKilled] = useState(0);
+  const [tab, setTab] = useState<TabId>("status");
 
   const handleReset = async () => {
     await api.reset();
@@ -74,38 +83,56 @@ export default function App() {
         <ControlBar currentMode={latest?.mode ?? null} onReset={handleReset} />
       </div>
 
+      <div className="mb-3 shrink-0">
+        <TabBar tabs={TABS} active={tab} onChange={setTab} />
+      </div>
+
       <div className="min-h-0 flex-1">
-        <PanelGrid rows={6}>
-          {/* Row 1 */}
-          <ConservationPanel latest={latest} />
-          <P0ScoreboardPanel latest={latest} />
-          <PressureGaugePanel latest={latest} />
-          <LadderPanel latest={latest} />
+        {tab === "status" && (
+          <PanelGrid rows={1}>
+            <ConservationPanel latest={latest} />
+            <P0ScoreboardPanel latest={latest} />
+            <PressureGaugePanel latest={latest} />
+            <LadderPanel latest={latest} />
+          </PanelGrid>
+        )}
 
-          {/* Row 2 */}
-          <RatesPanel history={history} />
-          <LatencyByTierPanel history={history} />
-          <QueueDepthPanel history={history} />
+        {tab === "traffic" && (
+          <PanelGrid rows={1}>
+            <RatesPanel history={history} />
+            <LatencyByTierPanel history={history} />
+            <QueueDepthPanel history={history} />
+          </PanelGrid>
+        )}
 
-          {/* Row 3 */}
-          <DeferredBacklogPanel history={history} />
-          <WorkerPoolGridPanel latest={latest} />
-          <CostComparisonPanel latest={latest} />
-          <ShedLogPanel latest={latest} />
+        {tab === "backlog" && (
+          <PanelGrid rows={1}>
+            <DeferredBacklogPanel history={history} />
+            <WorkerPoolGridPanel latest={latest} />
+            <ShedLogPanel latest={latest} />
+          </PanelGrid>
+        )}
 
-          {/* Row 4 */}
-          <EventInspectorPanel />
-          <WeightsPanel />
+        {tab === "cost" && (
+          <PanelGrid rows={1}>
+            <CostComparisonPanel latest={latest} />
+            <CostModelPanel />
+          </PanelGrid>
+        )}
 
-          {/* Row 5 — Stage I */}
-          <ChaosControlPanel
-            onWorkerKilled={() => setWorkersKilled((n) => n + 1)}
-          />
-          <RecoveryPanel latest={latest} workersKilled={workersKilled} />
+        {tab === "chaos" && (
+          <PanelGrid rows={1}>
+            <ChaosControlPanel onWorkerKilled={() => setWorkersKilled((n) => n + 1)} />
+            <RecoveryPanel latest={latest} workersKilled={workersKilled} />
+          </PanelGrid>
+        )}
 
-          {/* Row 6 — Stage I: the learned cost model */}
-          <CostModelPanel />
-        </PanelGrid>
+        {tab === "controls" && (
+          <PanelGrid rows={1}>
+            <EventInspectorPanel />
+            <WeightsPanel />
+          </PanelGrid>
+        )}
       </div>
     </div>
   );

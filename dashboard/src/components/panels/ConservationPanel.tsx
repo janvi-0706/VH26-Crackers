@@ -47,20 +47,20 @@ export function ConservationPanel({ latest }: { latest: MetricsFrame | null }) {
       accent={!hasData ? "neutral" : broken ? "bad" : "good"}
     >
       <div
-        className={`flex h-full flex-col items-center justify-center gap-3 rounded-lg transition-colors ${
+        className={`flex h-full min-h-0 flex-col items-center justify-center gap-6 overflow-hidden rounded-lg transition-colors ${
           broken ? "bg-bad/10" : ""
         }`}
       >
-        <div className="flex items-center gap-5">
+        <div className="flex min-h-0 items-center gap-5">
           <span className={`font-mono text-8xl font-black leading-none ${statusColor}`}>
             {!hasData ? "—" : broken ? "✕" : "✓"}
           </span>
-          <span className={`text-3xl font-black uppercase tracking-widest ${statusColor}`}>
+          <span className={`text-4xl font-black uppercase tracking-widest ${statusColor}`}>
             {!hasData ? "waiting" : broken ? "broken" : "balanced"}
           </span>
         </div>
 
-        <div className="flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 px-4 font-mono text-sm text-ink-muted">
+        <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1.5 px-4 font-mono text-base text-ink-muted">
           <span className="font-semibold text-ink">ingested</span>
           <span className="tabular-nums text-ink">{lhs}</span>
           <span>=</span>

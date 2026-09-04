@@ -41,17 +41,17 @@ export function RecoveryPanel({ latest, workersKilled }: RecoveryPanelProps) {
 
   return (
     <Panel title="Recovery" cols={6} accent={everViolated ? "bad" : "neutral"}>
-      <div className="grid h-full grid-cols-4 gap-2">
+      <div className="grid h-full grid-cols-4 gap-4">
         {tiles.map((t) => (
-          <div key={t.label} className="flex flex-col items-center justify-center gap-1 rounded-lg bg-surface/60 px-2 text-center">
+          <div key={t.label} className="flex flex-col items-center justify-center gap-3 rounded-xl bg-surface/60 px-2 text-center">
             <span
-              className={`font-mono text-3xl font-black tabular-nums ${
+              className={`font-mono text-7xl font-black leading-none tabular-nums ${
                 t.accent === "bad" ? "text-bad" : t.accent === "good" ? "text-good" : "text-ink"
               }`}
             >
               {t.value}
             </span>
-            <span className="text-[10px] font-medium uppercase leading-tight tracking-wide text-ink-muted">
+            <span className="text-sm font-bold uppercase leading-tight tracking-wide text-ink-muted">
               {t.label}
             </span>
           </div>

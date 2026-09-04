@@ -19,7 +19,7 @@ export function ShedLogPanel({ latest }: { latest: MetricsFrame | null }) {
   const nowTs = latest?.ts ?? 0;
 
   return (
-    <Panel title="Shed log" cols={3} headline={`${latest?.shed ?? 0} total`}>
+    <Panel title="Shed log" cols={4} headline={`${latest?.shed ?? 0} total`}>
       <div className="flex h-full flex-col gap-1.5 overflow-y-auto pr-1">
         {sheds.length === 0 && (
           <p className="p-2 text-xs italic text-ink-faint">nothing shed yet</p>

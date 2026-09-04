@@ -109,12 +109,12 @@ export function WeightsPanel() {
       headline="live — /control/weights"
       footer={!loaded ? "loading current weights…" : undefined}
     >
-      <div className="grid h-full grid-cols-1 content-center gap-x-6 gap-y-2.5 sm:grid-cols-2">
+      <div className="grid h-full grid-cols-1 content-center gap-x-10 gap-y-8 sm:grid-cols-2">
         {SLIDERS.map(({ key, hint }) => (
-          <div key={key} className="flex items-center gap-3">
+          <div key={key} className="flex items-center gap-5">
             <label
               htmlFor={`weight-${key}`}
-              className="w-5 shrink-0 font-mono text-xs font-bold uppercase text-ink-muted"
+              className="w-8 shrink-0 font-mono text-xl font-bold uppercase text-ink-muted"
             >
               {key}
             </label>
@@ -126,12 +126,12 @@ export function WeightsPanel() {
               step={0.01}
               value={weights[key]}
               onChange={(e) => onChange(key, e.target.value)}
-              className="h-2 flex-1 cursor-pointer accent-tier-p1"
+              className="h-3 flex-1 cursor-pointer accent-tier-p1"
             />
-            <span className="w-11 shrink-0 text-right font-mono text-xs tabular-nums text-ink">
+            <span className="w-16 shrink-0 text-right font-mono text-xl tabular-nums text-ink">
               {weights[key].toFixed(2)}
             </span>
-            <span className="hidden w-36 shrink-0 truncate text-[11px] text-ink-faint xl:inline">
+            <span className="hidden w-40 shrink-0 truncate text-sm text-ink-faint xl:inline">
               {hint}
             </span>
           </div>

@@ -68,7 +68,13 @@ export function Panel({
           <span className="font-mono text-xs text-ink-muted tabular-nums">{headline}</span>
         )}
       </header>
-      <div className="min-h-0 flex-1 p-2">{children}</div>
+      {/* overflow-hidden here (not just min-h-0) is load-bearing: Stage I
+          grew the grid from 4 rows to 6, shrinking every row's own height,
+          and a panel whose content was sized for the taller 4-row era
+          (ConservationPanel's own text-8xl icon was the real case found
+          live) would otherwise visibly spill past this panel's own
+          border into whatever sits above it, instead of clipping. */}
+      <div className="min-h-0 flex-1 overflow-hidden p-2">{children}</div>
       {footer && (
         <footer className="shrink-0 border-t border-surface-border px-3 py-1 text-[10px] text-ink-faint">
           {footer}
