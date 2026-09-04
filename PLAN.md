@@ -25,7 +25,7 @@ must be demoable at each one.
 - [x] `config/tiers.yaml`: tier table, mix, worker capacity + loader
 - [x] `fake_metrics.py`: plausible frames at 4 Hz for the dashboard to build against
 - [x] `tests/test_contracts.py`: round-trip serialisation
-- [ ] `docs/DATA_MODEL.md`: identity model, envelope, SQLite DDL, rollups, hash chain, ER diagram
+- [x] `docs/DATA_MODEL.md`: identity model, envelope, SQLite DDL, rollups, hash chain, ER diagram
 - [ ] Team review, then **freeze** `contracts.py` and `config/tiers.yaml`
 
 ## Stage B — Vertical slice (H1–4)

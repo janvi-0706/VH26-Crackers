@@ -64,4 +64,29 @@ Everything runs as `.venv/Scripts/python.exe -m triage.<module>` with
   happens. Raise missing fields now; a field added here is free.
 - Stage D will need a publish path for the stubbed gauges (pressure, ladder
   rung, worker counts). Decide then whether that is a setter on `metrics` or a
-  callback the engine registers — not decided yet, deliberately.
+  callback the engine registers - not decided yet, deliberately.
+
+---
+
+## Data-model documentation (Lane D)
+
+**Done**
+
+- Added `docs/DATA_MODEL.md`: five-field identity lifecycle, event-envelope
+  boundary and versioning, YAML tier rationale, complete planned SQLite DDL
+  with query-specific indexes and growth bounds, rollup accounting, ledger
+  hash-chain limits, and a Mermaid ER diagram.
+- Performed a direct contract audit against `contracts.py`; all existing Event,
+  Decision, MetricsFrame, DecisionTrace, and ShedRecord fields described in
+  the document match the code.
+
+**Review finding — do not freeze yet**
+
+- `Event` does not have a `payload` field, only `payload_size`; the documented
+  envelope cannot presently serialize its type-specific body.
+- No Pydantic contracts yet represent rollups, durable ledger entries, or the
+  persistence-only deferred/sink/trace fields. The document lists the exact
+  missing fields and distinguishes the SQL-only `event_type` alias from
+  existing `Event.type`.
+
+No production code or frozen configuration changed in this prompt.
