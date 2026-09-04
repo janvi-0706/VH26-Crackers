@@ -59,7 +59,6 @@ Everything runs as `.venv/Scripts/python.exe -m triage.<module>` with
 
 **Open / next**
 
-- `docs/DATA_MODEL.md` not written yet — next prompt.
 - Contract is not frozen until all four have read it and the team review
   happens. Raise missing fields now; a field added here is free.
 - Stage D will need a publish path for the stubbed gauges (pressure, ladder
@@ -90,3 +89,35 @@ Everything runs as `.venv/Scripts/python.exe -m triage.<module>` with
   existing `Event.type`.
 
 No production code or frozen configuration changed in this prompt.
+
+## Stage B — P4 ingress and sink (Lane B)
+
+**Done**
+
+- `src/triage/generator.py` — seeded/configurable async source, configured type
+  mix, variable per-type payload sizes, 500-customer partition pool, and
+  explicit retry identity behavior.
+- `src/triage/classifier.py` — YAML-derived tier/value/cost/SLA enrichment,
+  absolute deadline, contiguous monotonic `seq`, and stable sink
+  `idempotency_key`. Classification does not record a routing decision because
+  no routing decision exists until a later stage.
+- `src/triage/sink.py` — SQLite `events_sink` table and the exact documented
+  indexes, full `Event` JSON round-trip, and idempotent upsert with attempt
+  counting.
+- `tests/test_ingress.py` — mix, retry identity, async source, sequence,
+  classification, and sink tests.
+
+**Verified**
+
+```
+$ python -m pytest -q
+48 passed in 1.07s
+
+mix= {'inventory': 1068, 'click': 5016, 'log': 2929,
+      'payment': 517, 'order': 470}
+seq= 1 10000 strict= True
+sink_round_trip= True rows= 1
+```
+
+P4 is complete. Queue, worker, FastAPI, dashboard, and Makefile wiring remain
+for P5 and later; no P5 implementation was started in this prompt.
