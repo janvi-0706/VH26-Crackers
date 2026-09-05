@@ -177,10 +177,27 @@ def create_server1_app(
     state.per_worker_rate = per_worker_rate
 
     async def _ack(event: Event) -> None:
+        """Phase J3's own transport-ack, plus (Phase J6) the richer,
+        additive `AckBody` fields — see that model's own docstring —
+        so ingress durably records this completion (sink + ledger +
+        decision trace + sla_outcomes) in the SAME request, without a
+        second round trip P0's own ~60ms queue budget cannot spare.
+        P0 is always STREAM_NOW (CLAUDE.md hard rule 3, decision.decide()'s
+        own unconditional first branch) — server1 never computes a
+        pressure value of its own, so it reports 0.0 rather than a number
+        that would misleadingly suggest otherwise.
+        """
         try:
             response = await resolved_ack_client.post(
                 f"{base_ingress_url}/ack",
-                json={"event_ids": [event.event_id]},
+                json={
+                    "event_ids": [event.event_id],
+                    "events": [event.model_dump(mode="json")],
+                    "decision": "STREAM_NOW",
+                    "reason": "P0 is never batched, deferred, sampled, or shed (CLAUDE.md hard rule 3)",
+                    "pressure": 0.0,
+                    "source": "server1",
+                },
             )
             response.raise_for_status()
         except Exception:  # noqa: BLE001 - a lost ack is what ingress's own

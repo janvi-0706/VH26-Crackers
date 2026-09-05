@@ -3017,3 +3017,201 @@ event only hard-sheds once pressure crosses `HARD_SHED_PRESSURE` AND
 CoDel is not already sampling (`ladder.escalate()`'s own precedence,
 unchanged, exercised through server2's real routing path rather than
 only against `ladder.py`'s own unit tests).
+
+## Phase J6 — history.db and the deferral store, single-writer at ingress
+
+**Built**
+
+- `src/triage/history_db.py` (new) — `open_history_db(path)`: one shared
+  `sqlite3.Connection`, WAL mode + `busy_timeout=5000`, opened once.
+  `wire_ambient_stores(connection)`: points sink.py/ledger.py/deferral.py's
+  own ambient defaults at that ONE connection instead of each module's
+  own separate `:memory:` default — the literal, executable version of
+  `docs/PHASE-J-INSPECTION.md` section 3's "every current table stays in
+  one SQLite file owned by ingress," now covering all five tables
+  (`events_sink`, `rollups`, `audit_ledger`, `deferred_buffer`, plus this
+  phase's own two new ones below) through one physical file. Deliberately
+  opt-in (`triage.app`'s new `--persist` flag, off by default) rather than
+  automatic for every real-mode `create_app()` call — hundreds of existing
+  tests construct `create_app(fake=False)` expecting today's isolated,
+  in-memory ambient behaviour; defaulting real mode to a real, persistent
+  file would have every one of them sharing one file across an entire test
+  run (and across runs, since the file outlives the process).
+- `sink.py`, `ledger.py`, `deferral.py` — each constructor now accepts
+  `connection: sqlite3.Connection | None`, used as is instead of opening a
+  new one when given; each module gained a `configure_default(store)`
+  setter (distinct from `reset_default_store()`/`reset()`, which always
+  build a fresh `:memory:` instance — `configure_default()` hands over a
+  caller-built store, whatever real history it may already carry).
+- `sink.py` — new `sla_outcomes` table (Phase J6's own answer to
+  "historical SLA outcomes": one durable row per terminal completion,
+  `met`/`latency_ms`/`source`, unlike `metrics.py`'s in-memory
+  `sla_met`/`sla_missed`, which are per-tier aggregates that reset on
+  every `/control/reset` and were never cross-process to begin with) —
+  `write_outcome()`, `sla_outcome_count(tier=, met=, source=)`.
+- `ledger.py` — `decision_traces` is now a real, durable table (`docs/
+  DATA_MODEL.md` documented this schema back in Stage A's own
+  data-model write-up; it was never implemented until this phase — only
+  the in-memory 500-item ring buffer existed). `record_trace()` now does
+  both: the ring buffer (dashboard's own fast path, unchanged) and a
+  durable insert, pruned back to 10,000 rows every 500 inserts (this
+  table's own documented bound, unlike `audit_ledger`'s deliberately
+  uncapped growth) — `decision_trace_count()`.
+- `deferral.py` — `deferred_buffer` gained an `origin` column
+  (`'local'` | `'server2'`). `'local'` rows come from THIS process's own
+  in-process `worker.py` (Engine's own pipeline, unchanged since Stage
+  E); `'server2'` rows arrived over HTTP from a real, separate server2
+  instance (`/defer`). The two replay to different destinations — a
+  `'local'` row re-enters Engine's own queue, a `'server2'` row must go
+  back OVER THE WIRE to server2, never processed locally instead (that
+  would silently violate "P1/P2 -> Server 2"). `run_drainer()`/
+  `_pop_ready_batch()` gained an `origin` filter (`None`, the default,
+  preserves every pre-J6 caller's own unfiltered behaviour).
+  `defer()` is now an UPSERT on `event_id`, not a bare INSERT: once a
+  deferred row can be redispatched back to a real, separate process
+  rather than only ever replayed into this same process's own queue, a
+  second DEFER of the same `event_id` (pressure still high, or high
+  again, by the time the redispatched event is re-decided) is a real,
+  reachable outcome — found while designing the redispatch path, not
+  observed as a live incident, and confirmed by writing
+  `tests/test_history_integration.py`'s own redispatch test before this
+  fix existed and watching a bare INSERT's `sqlite3.IntegrityError`
+  escape `/defer`'s own handler as an unhandled 500.
+- `app.py`:
+  - `AckBody` grows optional, additive fields (`events`, `decision`,
+    `reason`, `pressure`, `source`) — old callers (every existing test,
+    `--transport=direct`'s own loopback ack) that send bare `event_ids`
+    get exactly today's behaviour; a real server1/server2 completion
+    sends the richer shape too, in the SAME request, so `/ack`'s handler
+    can durably record the completion (`_record_completions()`: sink +
+    ledger + decision trace + `sla_outcomes`) without a second network
+    round trip P0's own ~60ms queue budget cannot spare.
+  - `/defer`'s handler now tags `origin='server2'` and — since a
+    successfully durable DEFER is a RESOLVED dispatch, not an
+    outstanding one — also calls `transport.ack_by_event_ids()`.
+    **A real, tested bug found while wiring this, not hypothetical:**
+    without this, `redispatch_expired()` would find a successfully
+    deferred event still "outstanding" once `ack_timeout_ms` passed and
+    redispatch it to server2 a SECOND time even though it was already,
+    correctly, durably deferred.
+  - `--persist` (new CLI flag, off by default): opens `history_db.py`'s
+    shared connection at `config/servers.yaml`'s own
+    `ingress.history_db` path and wires it in.
+  - A second, independent deferral drainer (`origin='server2'`), started
+    alongside Engine's own (now explicitly `origin='local'` — see the
+    real bug found below), gated on `_server2_pressure_safe_to_drain()`:
+    the MAX pressure among server2's own LIVE reported fragments
+    (`reporting.fragments("server2")`, never `aggregate()`, which sums —
+    correct for every other counter, wrong for a per-instance signal
+    this phase's own instruction says must never be averaged), 1.0
+    (maximally unsafe) when no live fragment exists at all. Replays via
+    `_redispatch_to_server2()`, a fire-and-forget `transport.submit()`
+    task — `run_drainer()`'s own `replay` contract has always been
+    synchronous (`queue.put_replayed`), and changing that shared
+    contract for one new caller is a bigger change than this phase asks
+    for.
+  - **A second real, tested bug found while building the above, not
+    hypothetical:** Engine's own EXISTING local drainer called
+    `deferral.run_drainer()` with no `origin` argument — this phase's own
+    backward-compatible default (`origin=None`, unfiltered, matching
+    every pre-J6 call site's actual behaviour) meant it would happily
+    scoop up `'server2'`-origin rows too and replay them into Engine's
+    OWN local queue — silently processing a real server2 pod's own
+    deferred work through Engine's own separate decision engine instead
+    of sending it back over the wire, exactly the violation `deferral.py`'s
+    own top docstring warns against. Found by writing
+    `tests/test_history_integration.py`'s own redispatch test, watching
+    a `'server2'`-origin event vanish from the deferred buffer within one
+    drain tick despite pressure staying at 0.8 the whole time, and
+    tracing the actual drain call site rather than assuming the pressure
+    gate itself was wrong — fixed with one line
+    (`origin=deferral.ORIGIN_LOCAL`) at Engine's own call site.
+  - `GET /control/conservation` (new, small, dedicated endpoint, matching
+    `/control/transport-latency`'s own precedent): `transport.dispatch_stats()`
+    (event-id-SET-based `dispatched == resolved + outstanding`, robust to
+    redispatch — a raw per-batch counter would double-count a
+    redispatch's own re-sent events), `reporting.aggregate()` for each
+    server (reported honestly, not folded into the dispatch identity
+    itself — `docs/PHASE-J-INSPECTION.md` section 4's own "aggregating
+    network-reported counters can leave the equation transiently wrong
+    purely from reporting lag" finding is a real, disclosed limitation,
+    not something this endpoint pretends to have solved), and
+    `shed_critical` (see below).
+  - `transport.py` — lifetime event_id SETS (not raw counts — a redispatch
+    of the same event_id must not double-count), `dispatch_stats()`.
+- `server1.py`/`server2.py` — both now send the richer `/ack` shape
+  (`source="server1"`/`"server2"`). `server2.py` additionally reports
+  `pressure` (a live GAUGE — read per-fragment by
+  `_server2_pressure_safe_to_drain()`, never via `aggregate()`) and
+  `shed_critical` (a lifetime counter, correctly summable across
+  instances) in its metrics fragment: a defensive, live-checked
+  invariant — `ladder.cap()` already forbids a P1 event from ever
+  reaching SHED, so this should always read 0; reported as continuously-
+  checked evidence rather than an assumption resting on code inspection
+  alone, the same spirit as `metrics._check_p0_never_non_stream`'s own
+  live check in the monolith.
+- `docs/DATA_MODEL.md` — `sla_outcomes` documented (new); `decision_traces`
+  marked implemented (was design-only since Stage A); `deferred_buffer`'s
+  new `origin` column and its UPSERT-on-re-defer behaviour documented.
+- `Makefile` — `make dev-persist` (`--transport http --persist`).
+  `.gitignore` — `*.db-wal`/`*.db-shm` alongside the existing `*.db`.
+- `tests/test_history_integration.py` (new, 2 tests):
+  - A real, paced (calibrated 20x-spike rate, ~333 eps combined — an
+    unpaced version was tried first and found, empirically, to back
+    server1 up WITHOUT BOUND: server1 never sheds or defers, CLAUDE.md
+    hard rule 3, so an arrival rate with no ceiling at all has nothing to
+    stop it, unlike server2's own DEFER/SAMPLE_ROLLUP/SHED-bounded
+    queue) 8-second spike across a real ingress + real server1 + real
+    server2 (all three over `httpx.ASGITransport`, Engine's own local
+    baseline traffic running concurrently on the SAME shared history.db —
+    a real, additional proof that multiple traffic sources can safely
+    share one write target). Against a REAL temp-file `history.db`:
+    confirms WAL mode is genuinely enabled, durable rows exist for both
+    split-topology servers' own completions (not only Engine's local
+    ones), `verify_chain()` passes, and `shed_critical` is zero.
+    (Scaled from the literal 60 seconds this phase's own prompt names —
+    at this harness's own per-request overhead, an unpaced 60s run
+    produces tens of thousands of individual completions, each four real
+    SQLite commits; the wall-clock cost of that volume dominates the
+    whole suite's own runtime without adding proportionally more
+    evidence for what this test actually checks, which is the WRITE
+    PATH's correctness, not a specific throughput number — `bench/run.py`'s
+    own job.)
+  - A real, deterministic redispatch test: a `'server2'`-origin deferred
+    event genuinely goes back OVER THE WIRE to a real server2 process
+    (via `transport.submit()`, ASGI-backed, no real socket) once
+    server2's own reported pressure drops below `DRAIN_PRESSURE_THRESHOLD`
+    (0.35) — this phase's own instruction, verbatim — and is actually
+    served on its second pass, not merely removed from the buffer. This
+    is the test that caught both real bugs named above.
+
+**Verified**
+
+```
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q tests/test_history_integration.py
+2 passed in 11.2s   (stable across 3 consecutive runs)
+
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
+1092 passed, 2 known-flaky pre-existing timing tests failed in 554.69s
+```
+
+The two failures
+(`test_engine.py::test_worker_pool_sustains_150_units_per_second_within_5_percent`,
+`test_transport_http.py::test_10000_events_via_http_zero_loss_and_transport_latency_under_10ms`)
+are real-time throughput/latency thresholds calibrated against a faster
+machine than this one, in files this phase never touched (`worker.py`,
+`queue.py` are untouched; `transport.py`'s own dispatch/ack hot path only
+gained two `set.add()`/`set.update()` calls). Confirmed pre-existing, not
+a regression: both fail identically against the pre-J6 committed baseline
+(`git stash` + re-run) and both pass cleanly in isolation — the same
+"known-flaky under a loaded machine" class Phase J3's own PROGRESS.md
+entry already documented for a different test.
+
+Not built in this phase, named rather than silently deferred: J7's own
+"wire generator -> classifier -> admission -> dispatch -> server1/server2"
+— `Engine._ingest()` still processes every event locally regardless of
+`--transport`, exactly as every phase since J3 has left it. This phase's
+own two integration tests drive traffic directly at server1's/server2's
+`/ingest` (matching every split-topology test since J4), which is what
+lets J6's own "single writer, real WAL file, real redispatch" claims be
+tested honestly today, without assuming J7's own wiring already exists.

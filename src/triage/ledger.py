@@ -81,6 +81,51 @@ CSV_COLUMNS = (
     "pressure", "tier", "prev_hash", "row_hash",
 )
 
+# Phase J6: the durable half of decision_traces, per docs/DATA_MODEL.md
+# section 4 — that DDL has named this table since Stage E's own data-model
+# write-up; this stage's own in-memory ring buffer (below) was always
+# documented as "a dashboard/API convenience index, not evidence," on the
+# understanding that the real, durable table would land once something
+# actually needed decision traces to survive a process restart. Three
+# processes now do (server1/server2's own completions durably recorded at
+# ingress via /ack — see app.py). Retained to a bounded recent horizon
+# (10,000 rows, this table's own documented bound, unlike audit_ledger's
+# deliberately uncapped growth) — pruned in record_trace() itself rather
+# than by a separate sweep, so the table never grows past that bound even
+# between prunes.
+DECISION_TRACES_DDL = """
+CREATE TABLE IF NOT EXISTS decision_traces (
+    trace_id INTEGER PRIMARY KEY,
+    recorded_ts REAL NOT NULL,
+    seq INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    decision TEXT NOT NULL CHECK (decision IN
+        ('STREAM_NOW', 'MICRO_BATCH', 'DEFER', 'SAMPLE_ROLLUP', 'SHED')),
+    reason TEXT NOT NULL,
+    pressure REAL NOT NULL,
+    value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_recent
+    ON decision_traces (recorded_ts DESC, trace_id DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_tier_decision_ts
+    ON decision_traces (tier, decision, recorded_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_event_id
+    ON decision_traces (event_id);
+"""
+
+DECISION_TRACE_RETENTION = 10_000
+
+# Prune every Nth insert, not every single one — a DELETE-by-subquery on
+# every trace at spike rate (hundreds/sec) would repeat the exact class of
+# mistake this codebase has already found once (a cheap-looking per-event
+# operation that stops being cheap at spike rate — see queue.py's own
+# RESORT_INTERVAL_SECONDS docstring for the precedent). Retention still
+# never exceeds DECISION_TRACE_RETENTION + this batch size rows at any
+# instant, which is a bound, not a promise of exactness.
+DECISION_TRACE_PRUNE_EVERY = 500
+
 # Ring buffer size for decision traces — this stage's own spec, literally.
 TRACE_BUFFER_SIZE = 500
 
@@ -148,23 +193,37 @@ class ChainVerification:
 
 class SQLiteLedger:
     """Durable, hash-chained, append-only. Defaults to `:memory:`, matching
-    sink.py/deferral.py's own demo-scale default."""
+    sink.py/deferral.py's own demo-scale default.
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    Phase J6: `connection`, when given, is used as is instead of opening a
+    new one — see `deferral.DeferralStore`'s own docstring for why."""
+
+    def __init__(
+        self, path: str | Path = ":memory:", *, connection: sqlite3.Connection | None = None
+    ) -> None:
         self.path = str(path)
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        if connection is not None:
+            self.connection = connection
+        else:
+            if self.path != ":memory:":
+                Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(AUDIT_LEDGER_DDL)
+        self.connection.executescript(DECISION_TRACES_DDL)
         self.connection.commit()
 
         self._last_hash = self._load_last_hash()
         self._next_id = self._load_next_id()
         self._total_recorded = self._count_rows()
+        self._trace_insert_count = 0
 
-        # The ring buffer of decision traces — separate from the durable
-        # SQL table above entirely (see this module's own docstring).
+        # The ring buffer of decision traces — a fast, in-memory index over
+        # the RECENT ones, separate from the durable SQL table (see this
+        # module's own docstring: this stays "a dashboard/API convenience
+        # index, not evidence" even now that a durable table also exists —
+        # the point of keeping both is exactly that a dashboard query never
+        # touches SQLite at all for its own hot path).
         self._trace_buffer: deque[DecisionTrace] = deque(maxlen=TRACE_BUFFER_SIZE)
         self._trace_by_event_id: dict[str, DecisionTrace] = {}
 
@@ -286,13 +345,20 @@ class SQLiteLedger:
     def close(self) -> None:
         self.connection.close()
 
-    # -- the decision-trace ring buffer ------------------------------------
+    # -- decision traces: durable table + in-memory ring buffer -----------
 
-    def record_trace(self, trace: DecisionTrace) -> None:
-        """Fold one DecisionTrace into the 500-item ring buffer, indexed by
-        event_id. No fields beyond DecisionTrace's own frozen ones are
-        read or stored here — this stage's own instruction: "add derived
-        fields only after an explicit contract review."""
+    def record_trace(self, trace: DecisionTrace, *, now: float | None = None) -> None:
+        """Two writes, deliberately: the durable `decision_traces` row
+        (Phase J6 — survives a restart, and is what a real multi-process
+        deployment's history actually rests on) and the 500-item in-memory
+        ring buffer (unchanged since Stage E — the dashboard's own fast
+        path, never touching SQLite). No fields beyond DecisionTrace's own
+        frozen ones are read or stored here — this stage's own original
+        instruction, still honoured: "add derived fields only after an
+        explicit contract review." Never raises, matching record()'s own
+        guarantee: a lost trace row must not take down the pipeline that
+        produced it.
+        """
         buf = self._trace_buffer
         if len(buf) == (buf.maxlen or 0):
             evicted = buf[-1]
@@ -306,8 +372,48 @@ class SQLiteLedger:
         buf.appendleft(trace)
         self._trace_by_event_id[trace.event_id] = trace
 
+        now = time.time() if now is None else now
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO decision_traces (
+                    recorded_ts, seq, event_id, event_type, tier,
+                    decision, reason, pressure, value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace.ts or now, trace.seq, trace.event_id,
+                    trace.type.value if trace.type else "",
+                    trace.tier.value if trace.tier else "",
+                    trace.decision.value if trace.decision else "",
+                    trace.reason, trace.pressure, trace.value,
+                ),
+            )
+            self._trace_insert_count += 1
+            if self._trace_insert_count % DECISION_TRACE_PRUNE_EVERY == 0:
+                self.connection.execute(
+                    """
+                    DELETE FROM decision_traces WHERE trace_id NOT IN (
+                        SELECT trace_id FROM decision_traces
+                        ORDER BY trace_id DESC LIMIT ?
+                    )
+                    """,
+                    (DECISION_TRACE_RETENTION,),
+                )
+            self.connection.commit()
+        except Exception:  # noqa: BLE001 - see record()'s own docstring
+            logger.exception("failed to append decision_traces row (event_id=%s)", trace.event_id)
+
     def get_trace(self, event_id: str) -> DecisionTrace | None:
         return self._trace_by_event_id.get(event_id)
+
+    def decision_trace_count(self) -> int:
+        """The durable table's own row count — distinct from
+        `len(recent_traces())`, which is capped at TRACE_BUFFER_SIZE (500)
+        regardless of how many decisions this ledger has actually durably
+        recorded."""
+        row = self.connection.execute("SELECT COUNT(*) FROM decision_traces").fetchone()
+        return int(row[0])
 
     def recent_traces(self) -> tuple[DecisionTrace, ...]:
         """Newest first, matching _recent_decisions' own convention."""
@@ -334,8 +440,8 @@ def record(
     _default_ledger.record(seq, decision, reason, pressure, tier, now=now)
 
 
-def record_trace(trace: DecisionTrace) -> None:
-    _default_ledger.record_trace(trace)
+def record_trace(trace: DecisionTrace, *, now: float | None = None) -> None:
+    _default_ledger.record_trace(trace, now=now)
 
 
 def get_trace(event_id: str) -> DecisionTrace | None:
@@ -344,6 +450,10 @@ def get_trace(event_id: str) -> DecisionTrace | None:
 
 def recent_traces() -> tuple[DecisionTrace, ...]:
     return _default_ledger.recent_traces()
+
+
+def decision_trace_count() -> int:
+    return _default_ledger.decision_trace_count()
 
 
 def records() -> Iterable[dict[str, Any]]:
@@ -384,3 +494,15 @@ def reset() -> None:
     global _default_ledger
     _default_ledger.close()
     _default_ledger = SQLiteLedger()
+
+
+def configure_default(ledger: SQLiteLedger) -> None:
+    """Phase J6: swap the ambient default ledger for one already wired
+    onto ingress's own shared, WAL-mode `history.db` connection — see
+    `deferral.configure_default()`'s own docstring for the full reasoning;
+    this is the same mechanism for this module. NOT the same thing as
+    `reset()`: this hands over a caller-built ledger (whatever hash-chain
+    history it already has, e.g. resumed from a real file across a
+    restart) rather than always starting a fresh one."""
+    global _default_ledger
+    _default_ledger = ledger

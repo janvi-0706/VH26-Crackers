@@ -31,6 +31,26 @@ this phase's own instruction is "implement transport.py and reporting.py
 over HTTP," not "make Engine dispatch through them," and CLAUDE.md's own
 working-style rule ("if you think a later feature is needed now, say so
 and wait") is why that wiring is named here rather than done silently.
+
+Phase J6: ingress is the SINGLE WRITER for history.db. `--persist` (off
+by default — see `history_db.py`'s own docstring for why this is opt-in,
+not automatic) opens one real, WAL-mode SQLite file and points
+sink.py/ledger.py/deferral.py's own ambient defaults at it. `/ack`'s own
+wire shape grows optional fields (`events`, `decision`, `reason`,
+`pressure`, `source`) so a real server1/server2 completion can durably
+write `events_sink` + `audit_ledger` + `decision_traces` + `sla_outcomes`
+here in the SAME request that already clears transport's own dispatch
+bookkeeping — old callers that send only `event_ids` (existing tests,
+`--transport=direct`'s own loopback ack) are unaffected; `/ack` still
+just clears transport bookkeeping for them. `/defer` now also clears that
+bookkeeping (a successfully-durable DEFER is a resolved dispatch, not an
+outstanding one) and tags the row `origin='server2'`, so a SEPARATE
+background drainer (started here, not inside `Engine`, since this is
+ingress's own cross-process concern) can redispatch it back to a real
+server2 — gated on server2's own reported pressure via
+`reporting.fragments("server2")`, never on Engine's local
+`metrics.current_pressure()`, and never averaged across server2
+instances (Phase J5's own rule).
 """
 
 from __future__ import annotations
@@ -39,6 +59,7 @@ import argparse
 import asyncio
 import dataclasses
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -48,16 +69,17 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import decision, deferral, ledger, metrics, reporting, sink, transport
+from . import decision, deferral, history_db, ledger, metrics, reporting, sink, transport
 from .classifier import Classifier
 from .config import Config, load_config
-from .contracts import Event, EventType, MetricsFrame
+from .contracts import Decision, DecisionTrace, Event, EventType, MetricsFrame, Tier
 from .costmodel import CostModel
 from .dedup import Deduplicator
 from .fake_metrics import FakeSource
 from .generator import EventGenerator, GeneratedEvent
 from .ladder import Rollup as LadderRollup
 from .queue import EventQueue, Mode as QueueMode
+from .servers_config import load_servers_config
 from .worker import WorkerPool
 
 logger = logging.getLogger(__name__)
@@ -260,6 +282,17 @@ class Engine:
                 replay=self.queue.put_replayed,
                 current_pressure=lambda: metrics.current_pressure(self.config),
                 stop_event=self._drain_stop,
+                # Phase J6: without this, Engine's own local drainer (the
+                # unfiltered origin=None default every pre-J6 call site
+                # relies on) would happily scoop up 'server2'-origin rows
+                # too and replay them into ITS OWN local queue — silently
+                # processing a real server2 pod's own deferred work
+                # through Engine's own separate decision engine instead of
+                # sending it back over the wire, exactly the violation
+                # deferral.py's own top docstring warns against. Found
+                # while testing the second drainer this phase adds, not
+                # assumed.
+                origin=deferral.ORIGIN_LOCAL,
             ),
             name="pulse-drainer",
         )
@@ -356,9 +389,31 @@ def _fake_mode_error(action: str) -> JSONResponse:
 class AckBody(BaseModel):
     """`POST /ack`'s own wire shape — a server never knows ingress's own
     internal `dispatch_id` (see transport.py's own docstring on
-    `ack_by_event_ids`), only the `event_id`s it actually finished."""
+    `ack_by_event_ids`), only the `event_id`s it actually finished.
 
-    event_ids: list[str]
+    Phase J6: `events`/`decision`/`reason`/`pressure`/`source` are
+    optional and additive. Old callers (existing tests, the
+    `--transport=direct` loopback deliver, anything that only ever knew
+    about transport bookkeeping) send bare `event_ids` and get exactly
+    today's behaviour — this body's own defaults make that shape still
+    valid. A real server1/server2 completion sends the richer shape too,
+    in the SAME request, so ingress can durably record the completion
+    (sink + ledger + decision trace + SLA outcome — see
+    `_record_completions()`) without a second network round trip (a real
+    concern for P0's own 200ms SLA — see transport.py's own docstring on
+    the ~60ms queue budget that leaves). `events` is a full `Event`
+    payload per completed id, in no particular correspondence to
+    `event_ids`' own order — matched by `event_id` field, not position,
+    so a partial ack (transport.py's own documented case) cannot
+    silently pair the wrong event with the wrong id.
+    """
+
+    event_ids: list[str] = []
+    events: list[dict] = []
+    decision: str | None = None
+    reason: str = ""
+    pressure: float = 0.0
+    source: str = ""
 
 
 class MetricsReportBody(BaseModel):
@@ -401,6 +456,53 @@ class RollupBody(BaseModel):
     seq_high: int
 
 
+_VALID_COMPLETION_SOURCES = frozenset({"ingress", "server1", "server2"})
+
+
+def _record_completions(
+    events: list[Event], *, decision: str | None, reason: str, pressure: float, source: str,
+) -> None:
+    """Phase J6's own durable-write path, triggered by `/ack`'s richer
+    optional shape (`AckBody`'s own docstring): sink (the processed
+    event), ledger (an audit row + decision trace), and a durable
+    `sla_outcomes` row, per completed event. This mirrors, for a REMOTE
+    completion arriving over the wire, exactly what `worker.py`'s own
+    `serve()`/`_serve_batch()` already do locally for Engine's own
+    pipeline (`metrics.observe_complete` + `sink.write`;
+    `metrics.observe_decision`, which itself calls
+    `ledger.record`/`record_trace`) — the same durability contract,
+    reached by a different path.
+
+    Never raises: an unparseable `decision` string, like a failed audit
+    write (`ledger.record`'s own guarantee), must not fail an otherwise-
+    successful ack — the caller (`/ack`'s own handler) has already
+    validated the events themselves before this is called.
+    """
+    now = time.time()
+    try:
+        decision_enum = Decision(decision) if decision else Decision.STREAM_NOW
+    except ValueError:
+        decision_enum = Decision.STREAM_NOW
+    resolved_source = source if source in _VALID_COMPLETION_SOURCES else "ingress"
+
+    for event in events:
+        sink.write(event)
+        ledger.record(
+            seq=event.seq, decision=decision_enum, reason=reason, pressure=pressure, tier=event.tier,
+            now=now,
+        )
+        ledger.record_trace(
+            DecisionTrace(
+                seq=event.seq, event_id=event.event_id, type=event.type, tier=event.tier,
+                decision=decision_enum, reason=reason, pressure=pressure, value=event.value, ts=now,
+            ),
+            now=now,
+        )
+        met = (now <= event.deadline_ts) if event.deadline_ts else True
+        latency_ms = max(0.0, (now - event.ingest_ts) * 1000.0)
+        sink.write_outcome(event, met=met, latency_ms=latency_ms, source=resolved_source, now=now)
+
+
 def _make_direct_deliver() -> transport.DeliverFn:
     """The `--transport=direct` demo fallback's own `deliver`: no HTTP, and
     no separate process that could die independently of ingress — CLAUDE.md
@@ -424,8 +526,52 @@ def _make_direct_deliver() -> transport.DeliverFn:
     return _deliver
 
 
+def _server2_pressure_safe_to_drain() -> float:
+    """Phase J6's own redispatch gate for `origin='server2'` deferred
+    rows: the MAX pressure among server2's own LIVE reported fragments —
+    never the average (Phase J5's own rule: ingress reports every
+    instance's pressure separately and never averages them), and
+    conservative on purpose: a Kubernetes Service could route the very
+    next dispatch to ANY live instance, so resuming the moment even one
+    happens to read calm, while others are still saturated, would just
+    relocate the overload rather than actually relieve it.
+
+    No live fragment at all (server2 has not pushed one yet, or every one
+    has aged out — `reporting.py`'s own TTL) returns 1.0, the maximally
+    unsafe reading, on purpose: an unknown pressure must never be treated
+    as "safe to send more work into," the same fail-closed reasoning
+    `ladder.cap()` already applies to a routing decision it cannot
+    verify.
+    """
+    fragments = reporting.fragments("server2")
+    if not fragments:
+        return 1.0
+    return max(f.counters.get("pressure", 1.0) for f in fragments)
+
+
+def _redispatch_to_server2(event: Event) -> None:
+    """The `replay` callable Phase J6's own second drainer passes to
+    `deferral.run_drainer(..., origin=deferral.ORIGIN_SERVER2)` — fires a
+    background task rather than awaiting inline, because
+    `DeferralStore.run_drainer()`'s own loop calls `replay(event)`
+    synchronously (queue.put_replayed, its original, Stage D-era
+    contract, is synchronous too) and changing that shared contract for
+    one new caller is a bigger change than this phase asks for. The task
+    itself does the real work: `transport.submit()` re-enters the exact
+    same batching/dispatch/ack machinery a fresh arrival would, so a
+    redispatched, once-deferred event is indistinguishable, on the wire,
+    from a brand-new one — idempotency (docs/DATA_MODEL.md's own identity
+    model) is what makes that safe rather than a double-charge, the same
+    guarantee transport.py's own `redispatch_expired()` already rests on.
+    """
+    asyncio.create_task(
+        transport.submit("server2", event), name=f"pulse-redispatch-server2-{event.event_id}"
+    )
+
+
 def create_app(
-    *, fake: bool = False, seed: int | None = None, transport_mode: str = "direct"
+    *, fake: bool = False, seed: int | None = None, transport_mode: str = "direct",
+    persist: bool = False,
 ) -> FastAPI:
     """Build one FastAPI app in either mode. Kept as a factory (rather than a
     single module-level app) so tests can construct independent instances.
@@ -433,7 +579,18 @@ def create_app(
     `transport_mode` ("direct" or "http") governs transport.py's own
     ambient configuration for this process acting as ingress — see this
     module's own top docstring and `_make_direct_deliver`'s own docstring
-    for exactly what it does and does not affect."""
+    for exactly what it does and does not affect.
+
+    `persist` (Phase J6, default off) opens one real, WAL-mode
+    `history.db` file (`config/servers.yaml`'s own `ingress.history_db`
+    path) and points sink.py/ledger.py/deferral.py's own ambient defaults
+    at it, instead of each module's own separate `:memory:` default —
+    see `history_db.py`'s own docstring for why this is opt-in rather
+    than automatic. Also starts the second, `origin='server2'` deferral
+    drainer, which only means anything once real traffic is actually
+    dispatched to a real server2 (today: direct test traffic against
+    server2's own `/ingest`, or a future prompt's own real dispatch
+    wiring — see this module's own top docstring)."""
 
     if transport_mode not in ("direct", "http"):
         raise ValueError(f"unknown transport_mode: {transport_mode!r}")
@@ -442,12 +599,30 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        history_connection = None
+        server2_drain_stop: asyncio.Event | None = None
+        server2_drain_task: asyncio.Task[None] | None = None
         if not fake:
+            if persist:
+                history_connection = history_db.open_history_db(
+                    load_servers_config().ingress.history_db
+                )
+                history_db.wire_ambient_stores(history_connection)
             if transport_mode == "http":
                 transport.configure_http()
                 await transport.start_http()
             else:
                 transport.configure(_make_direct_deliver())
+            server2_drain_stop = asyncio.Event()
+            server2_drain_task = asyncio.create_task(
+                deferral.run_drainer(
+                    replay=_redispatch_to_server2,
+                    current_pressure=_server2_pressure_safe_to_drain,
+                    stop_event=server2_drain_stop,
+                    origin=deferral.ORIGIN_SERVER2,
+                ),
+                name="pulse-drainer-server2-origin",
+            )
         if fake:
             yield
             return
@@ -458,8 +633,15 @@ def create_app(
             yield
         finally:
             await engine.stop()
+            if server2_drain_stop is not None:
+                server2_drain_stop.set()
+            if server2_drain_task is not None:
+                server2_drain_task.cancel()
+                await asyncio.gather(server2_drain_task, return_exceptions=True)
             if transport_mode == "http":
                 await transport.stop_http()
+            if history_connection is not None:
+                history_connection.close()
 
     app = FastAPI(title="PULSE", lifespan=lifespan)
     app.state.mode = "fake" if fake else "real"
@@ -477,10 +659,26 @@ def create_app(
     @app.post("/ack")
     async def ack_endpoint(body: AckBody) -> JSONResponse:
         """A server's own completion signal — see transport.py's own
-        docstring. Not fake-mode-gated: it only ever touches transport.py's
-        ambient state, which is harmless (a no-op on unknown event_ids) to
-        call regardless of engine mode."""
-        await transport.ack_by_event_ids(body.event_ids)
+        docstring, and AckBody's own docstring for the Phase J6 additions.
+        Not fake-mode-gated: it only ever touches transport.py's ambient
+        state (plus, now, sink/ledger/deferral's — all three already
+        ambient regardless of mode), which is harmless (a no-op on
+        unknown event_ids, an ordinary durable write otherwise) to call
+        regardless of engine mode."""
+        event_ids = list(body.event_ids)
+        if body.events:
+            try:
+                events = [Event.model_validate(e) for e in body.events]
+            except Exception as exc:  # noqa: BLE001 - a malformed payload is a
+                # caller bug, not a pipeline fault; report it, don't 500.
+                return JSONResponse({"error": f"invalid event: {exc}"}, status_code=422)
+            if not event_ids:
+                event_ids = [e.event_id for e in events]
+            _record_completions(
+                events, decision=body.decision, reason=body.reason,
+                pressure=body.pressure, source=body.source,
+            )
+        await transport.ack_by_event_ids(event_ids)
         return JSONResponse({"status": "ok"})
 
     @app.post("/metrics/report")
@@ -505,18 +703,28 @@ def create_app(
         fake-mode-gated: it only touches `deferral.py`'s own already-
         ambient store, the same store `/control/reset` already knows how
         to leave alone/clear regardless of which mode produced the row.
-        Re-dispatching a deferred event once server2's own reported
-        pressure drops is real, separate scope this endpoint does not
-        implement — see server2.py's own top docstring."""
+
+        Phase J6: tagged `origin='server2'` (`deferral.py`'s own
+        docstring on why a 'server2'-origin row must redispatch back over
+        the wire, never into Engine's local queue), and — since a
+        successfully durable DEFER is a RESOLVED dispatch attempt, not an
+        outstanding one — this also clears transport's own bookkeeping
+        for it. Without this, `redispatch_expired()` would find this
+        event still "outstanding" once `ack_timeout_ms` passed and
+        redispatch it to server2 a second time even though it was
+        already, correctly, durably deferred — a real, tested bug found
+        while wiring this phase, not a hypothetical.
+        """
         try:
             event = Event.model_validate(body.event)
         except Exception as exc:  # noqa: BLE001 - a malformed payload is a
             # caller bug, not a pipeline fault; report it, don't 500.
             return JSONResponse({"error": f"invalid event: {exc}"}, status_code=422)
         try:
-            deferral.defer(event, body.reason)
+            deferral.defer(event, body.reason, origin=deferral.ORIGIN_SERVER2)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=422)
+        await transport.ack_by_event_ids([event.event_id])
         return JSONResponse({"status": "ok"})
 
     @app.post("/rollup")
@@ -536,6 +744,49 @@ def create_app(
         )
         rollup_id = sink.write_rollup(rollup)
         return JSONResponse({"status": "ok", "rollup_id": rollup_id})
+
+    @app.get("/control/conservation")
+    async def get_conservation() -> JSONResponse:
+        """Phase J6's own cross-process conservation view: "counters live
+        in three processes; each pushes its own in its metrics fragment,
+        ingress sums across all live fragments plus its own
+        outstanding-dispatch table" (this phase's own instruction,
+        verbatim) — a new, small, dedicated endpoint, matching
+        `/control/transport-latency`'s own precedent for a real number
+        `contracts.py`'s frozen `MetricsFrame` was never going to carry.
+
+        `dispatch` is transport.py's own event-id-SET-based identity
+        (`dispatched == resolved + outstanding`, robust to redispatch —
+        see `Transport.dispatch_stats()`'s own docstring), which is the
+        one exact, non-stale signal ingress has for cross-process
+        traffic; `server1`/`server2` are each server's own summed live
+        fragment counters (`reporting.aggregate()`), included for
+        visibility, not folded into the `dispatch` identity itself
+        (`docs/PHASE-J-INSPECTION.md` section 4's own "aggregating
+        network-reported counters can leave the equation transiently
+        wrong purely from reporting lag" finding — this endpoint reports
+        both signals honestly rather than pretending a single perfect
+        number exists). `shed_critical` sums `shed_critical` across every
+        live server2 fragment — architecturally always 0 (`ladder.cap()`
+        already forbids a P1 event from ever reaching SHED), reported as
+        a live, continuously-checked invariant rather than merely assumed
+        from code inspection, the same spirit as
+        `metrics._check_p0_never_non_stream`'s own live check.
+        """
+        server1_counters = reporting.aggregate("server1")
+        server2_counters = reporting.aggregate("server2")
+        return JSONResponse(
+            {
+                "dispatch": transport.dispatch_stats(),
+                "server1": server1_counters,
+                "server2": server2_counters,
+                "deferred_pending": deferral.pending_count(),
+                "deferred_pending_server2_origin": deferral.pending_count_by_origin(
+                    deferral.ORIGIN_SERVER2
+                ),
+                "shed_critical": server2_counters.get("shed_critical", 0.0),
+            }
+        )
 
     @app.get("/control/transport-latency")
     async def get_transport_latency() -> JSONResponse:
@@ -755,12 +1006,24 @@ def main(argv: list[str] | None = None) -> None:
             "for exactly what this does and does not wire up yet."
         ),
     )
+    parser.add_argument(
+        "--persist", action="store_true",
+        help=(
+            "Phase J6: open config/servers.yaml's own ingress.history_db as "
+            "a real, WAL-mode SQLite file and point sink/ledger/deferral's "
+            "ambient defaults at it, instead of each module's own separate "
+            "in-memory default. Off by default — see history_db.py's own "
+            "docstring for why this is opt-in."
+        ),
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
 
     uvicorn.run(
-        create_app(fake=args.fake, seed=args.seed, transport_mode=args.transport),
+        create_app(
+            fake=args.fake, seed=args.seed, transport_mode=args.transport, persist=args.persist,
+        ),
         host=args.host, port=args.port,
     )
 

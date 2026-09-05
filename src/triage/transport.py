@@ -138,6 +138,18 @@ class Transport:
         # the "transport latency" this phase's own prompt asks to expose
         # separately from queue wait (metrics.py's own, different number).
         self._latency_ms: list[float] = []
+        # Phase J6: lifetime event_id SETS, not counts — what the
+        # cross-process conservation check needs. A raw dispatched-events
+        # counter would double-count a redispatch (the SAME event_id
+        # dispatched again after `ack_timeout_ms`, still tracked under a
+        # brand-new dispatch_id — see `redispatch_expired()`'s own
+        # docstring), which would break the identity `dispatched ==
+        # resolved + outstanding` the moment even one redispatch happened.
+        # Sets are naturally idempotent under a repeat dispatch of the same
+        # event_id, so the identity holds regardless of how many times
+        # anything was retried.
+        self._all_dispatched_event_ids: set[str] = set()
+        self._all_resolved_event_ids: set[str] = set()
 
     def _fresh_dispatch_id(self) -> str:
         self._next_id += 1
@@ -162,6 +174,7 @@ class Transport:
         )
         for e in events:
             self._event_index[e.event_id] = dispatch_id
+        self._all_dispatched_event_ids.update(e.event_id for e in events)
         await self._deliver(server, events)
         return DispatchResult(
             dispatch_id=dispatch_id,
@@ -188,6 +201,7 @@ class Transport:
                 if len(self._latency_ms) > LATENCY_WINDOW:
                     del self._latency_ms[: len(self._latency_ms) - LATENCY_WINDOW]
                 self._event_index.pop(event_id, None)
+                self._all_resolved_event_ids.add(event_id)
         if not record.events:
             del self._outstanding[dispatch_id]
 
@@ -273,12 +287,26 @@ class Transport:
             "p99": round(percentile(self._latency_ms, 0.99), 3),
         }
 
+    def dispatch_stats(self) -> dict[str, int]:
+        """Phase J6's own cross-process conservation identity:
+        `dispatched == resolved + outstanding`, always — regardless of how
+        many redispatches happened along the way (see the set-based
+        counters' own docstring). `outstanding` here is the TOTAL count
+        across every server this transport reaches, not per-server (see
+        `outstanding(server)` for that)."""
+        dispatched = len(self._all_dispatched_event_ids)
+        resolved = len(self._all_resolved_event_ids)
+        outstanding = len(self._event_index)
+        return {"dispatched": dispatched, "resolved": resolved, "outstanding": outstanding}
+
     def reset(self) -> None:
         """Tests only."""
         self._outstanding.clear()
         self._event_index.clear()
         self._latency_ms.clear()
         self._next_id = 0
+        self._all_dispatched_event_ids.clear()
+        self._all_resolved_event_ids.clear()
 
 
 # --------------------------------------------------------------------------
@@ -573,6 +601,10 @@ async def handle_ack_payload(payload: dict) -> None:
 
 def outstanding(server: str) -> list[Event]:
     return _default.outstanding(server)
+
+
+def dispatch_stats() -> dict[str, int]:
+    return _default.dispatch_stats()
 
 
 async def redispatch_expired() -> int:

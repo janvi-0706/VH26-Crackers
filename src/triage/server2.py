@@ -336,6 +336,15 @@ class _ServerState:
     deferred_count: int = 0
     sampled_count: int = 0
     shed_count: int = 0
+    # Phase J6: a defensive, live-checked invariant, not a routing branch
+    # that should ever actually fire — ladder.cap() already forbids a P1
+    # event from ever reaching a SHED decision (MAX_RUNG[P1] == DEFER).
+    # Reported in the metrics fragment so ingress's own
+    # GET /control/conservation can assert "shed_critical == 0" as
+    # continuously-checked evidence rather than an assumption resting on
+    # code inspection alone — the same spirit as
+    # metrics._check_p0_never_non_stream's own live check in the monolith.
+    shed_critical_count: int = 0
     rollups_persisted_count: int = 0
     true_click_count: int = 0
     weighted_click_count: float = 0.0
@@ -456,10 +465,33 @@ def create_server2_app(
             state.codel.update(wait_ms / 1000.0, now)
         state.in_flight += 1
 
-    async def _ack_many(event_ids: list[str]) -> None:
+    async def _ack_many(
+        events: list[Event], *, decision: str, reason: str, pressure: float,
+    ) -> None:
+        """Phase J3's own transport-ack, plus (Phase J6) the richer,
+        additive `AckBody` fields (that model's own docstring) so ingress
+        durably records this completion in the SAME request. `decision`
+        is a single string for the whole call, not per-event — every
+        member of a batch this call ever covers reached the identical
+        decision (STREAM_NOW for `_serve`'s own single-event call,
+        MICRO_BATCH for `_serve_batch`'s own multi-event one) under the
+        SAME `pressure_value`, so `reason`'s own text is identical across
+        every member too (see `decision.decide()`'s own formatting) —
+        nothing is lost by sending it once per call instead of once per
+        event.
+        """
+        event_ids = [e.event_id for e in events]
         try:
             response = await resolved_ack_client.post(
-                f"{base_ingress_url}/ack", json={"event_ids": event_ids},
+                f"{base_ingress_url}/ack",
+                json={
+                    "event_ids": event_ids,
+                    "events": [e.model_dump(mode="json") for e in events],
+                    "decision": decision,
+                    "reason": reason,
+                    "pressure": pressure,
+                    "source": "server2",
+                },
             )
             response.raise_for_status()
         except Exception:  # noqa: BLE001 - a lost ack is what ingress's own
@@ -515,7 +547,7 @@ def create_server2_app(
         capped_rung = ladder.cap(event.tier, ladder.DECISION_RUNG[result])
         return ladder.RUNG_DECISION[capped_rung], reason
 
-    async def _serve(event: Event) -> None:
+    async def _serve(event: Event, *, reason: str, pressure: float) -> None:
         await asyncio.sleep(event.cost / state.per_worker_rate)
         now = time.time()
         state.in_flight -= 1
@@ -524,9 +556,9 @@ def create_server2_app(
         state.service_ewma.observe_amount(event.cost, now)
         if event.type is EventType.CLICK:
             state.weighted_click_count += 1.0
-        await _ack_many([event.event_id])
+        await _ack_many([event], decision=Decision.STREAM_NOW.value, reason=reason, pressure=pressure)
 
-    async def _serve_batch(batch: list[Event]) -> None:
+    async def _serve_batch(batch: list[Event], *, reason: str, pressure: float) -> None:
         """One combined sleep for the whole batch — decision.batch_cost()
         is what makes this genuinely cheaper, not merely labelled
         differently. Matches worker.py's own _serve_batch reasoning."""
@@ -541,7 +573,7 @@ def create_server2_app(
             if e.type is EventType.CLICK:
                 state.weighted_click_count += 1.0
         state.batched_count += len(batch)
-        await _ack_many([e.event_id for e in batch])
+        await _ack_many(batch, decision=Decision.MICRO_BATCH.value, reason=reason, pressure=pressure)
 
     async def _dispatch_off_path(
         event: Event, result: Decision, reason: str, now: float
@@ -562,6 +594,10 @@ def create_server2_app(
                 await _post_rollup(rollup)
         elif result is Decision.SHED:
             state.shed_count += 1
+            if event.tier is Tier.P1:
+                # Unreachable given ladder.cap()'s own enforcement — see
+                # shed_critical_count's own docstring on _ServerState.
+                state.shed_critical_count += 1
 
     _OFF_PATH: frozenset[Decision] = frozenset(
         {Decision.DEFER, Decision.SAMPLE_ROLLUP, Decision.SHED}
@@ -573,7 +609,7 @@ def create_server2_app(
         result, reason = _resolve(event, pressure_value, now)
 
         if result is Decision.STREAM_NOW:
-            await _serve(event)
+            await _serve(event, reason=reason, pressure=pressure_value)
             return
         if result in _OFF_PATH:
             await _dispatch_off_path(event, result, reason, now)
@@ -594,10 +630,10 @@ def create_server2_app(
                 batch.append(extra)
                 continue
             if extra_result is Decision.STREAM_NOW:
-                await _serve(extra)
+                await _serve(extra, reason=extra_reason, pressure=pressure_value)
             else:
                 await _dispatch_off_path(extra, extra_result, extra_reason, extra_now)
-        await _serve_batch(batch)
+        await _serve_batch(batch, reason=reason, pressure=pressure_value)
 
     async def _worker(worker_id: int) -> None:
         while True:
@@ -630,6 +666,17 @@ def create_server2_app(
             "in_flight": float(state.in_flight),
             "sampled_out": float(state.sampled_count),
             "shed": float(state.shed_count),
+            # Phase J6: a live GAUGE, not a lifetime counter — ingress's
+            # own redispatch gate (_server2_pressure_safe_to_drain in
+            # app.py) reads this PER FRAGMENT via reporting.fragments(),
+            # never via reporting.aggregate() (which sums — correct for
+            # every other key here, wrong for a per-instance signal this
+            # phase's own instruction says must never be averaged across
+            # server2 pods).
+            "pressure": _pressure_value(state, time.time()),
+            # A lifetime counter (correctly summable across instances,
+            # unlike pressure) — see shed_critical_count's own docstring.
+            "shed_critical": float(state.shed_critical_count),
         }
 
     reporting_client = reporting.ReportingClient(
@@ -725,6 +772,7 @@ def create_server2_app(
             "deferred": state.deferred_count,
             "sampled_out": state.sampled_count,
             "shed": state.shed_count,
+            "shed_critical": state.shed_critical_count,
             "rollups_persisted": state.rollups_persisted_count,
             "true_click_count": state.true_click_count,
             "weighted_click_count": round(state.weighted_click_count, 3),

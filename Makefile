@@ -42,6 +42,13 @@ dev-http:
 	@echo "Using interpreter: $(PY)"
 	$(PY) -m triage.app --transport http
 
+# Phase J6: same as dev-http, plus a real, WAL-mode data/history.db instead
+# of sink/ledger/deferral's own in-memory default — see history_db.py's
+# own docstring for why --persist is opt-in rather than dev's own default.
+dev-persist:
+	@echo "Using interpreter: $(PY)"
+	$(PY) -m triage.app --transport http --persist
+
 # Phase J5: the real three-process split, all in one command — ingress
 # (--transport http, :8000), server1 (the dedicated, hardened P0-only
 # process, :8001), and server2 (the dedicated P1/P2 process, :8002, with

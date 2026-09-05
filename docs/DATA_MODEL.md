@@ -140,6 +140,14 @@ CREATE INDEX IF NOT EXISTS idx_events_sink_committed_ts
     ON events_sink (committed_ts);
 
 -- P1/P2 work parked until capacity returns. P0 is forbidden in the database.
+-- `origin` (Phase J6): 'local' rows came from THIS process's own in-process
+-- worker.py (Engine's own pipeline, unchanged since Stage E); 'server2'
+-- rows arrived over HTTP from a real, separate server2 instance (Phase
+-- J5's own POST /defer). The two replay to different destinations — a
+-- 'local' row re-enters Engine's own queue, a 'server2' row must go back
+-- OVER THE WIRE to server2, never processed locally instead (that would
+-- silently violate "P1/P2 -> Server 2"). Two independent drainers, one
+-- per origin, run off this one table.
 CREATE TABLE IF NOT EXISTS deferred_buffer (
     defer_id INTEGER PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE,
@@ -154,7 +162,8 @@ CREATE TABLE IF NOT EXISTS deferred_buffer (
     ready_at REAL NOT NULL,
     defer_reason TEXT NOT NULL,
     event_json TEXT NOT NULL,
-    schema_version INTEGER NOT NULL
+    schema_version INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'server2'))
 );
 CREATE INDEX IF NOT EXISTS idx_deferred_ready_priority
     ON deferred_buffer (ready_at, tier, deadline_ts, seq);
@@ -162,6 +171,8 @@ CREATE INDEX IF NOT EXISTS idx_deferred_partition_seq
     ON deferred_buffer (partition_key, seq);
 CREATE INDEX IF NOT EXISTS idx_deferred_deadline
     ON deferred_buffer (deadline_ts);
+CREATE INDEX IF NOT EXISTS idx_deferred_origin_ready
+    ON deferred_buffer (origin, ready_at);
 
 -- Append-only decision evidence. ledger_id defines hash-chain order.
 CREATE TABLE IF NOT EXISTS audit_ledger (
@@ -203,6 +214,12 @@ CREATE INDEX IF NOT EXISTS idx_rollups_window
     ON rollups (window_start DESC, window_end DESC);
 
 -- Short-horizon, query-friendly feed for the decision explanation panel.
+-- Implemented (Phase J6): ledger.py durably inserts here on every
+-- record_trace() call, pruned back to DECISION_TRACE_RETENTION (10,000)
+-- rows every DECISION_TRACE_PRUNE_EVERY (500) inserts, alongside the
+-- in-memory ring buffer this table was originally documented next to
+-- (that buffer stays the dashboard's own fast, non-SQL path; this table
+-- is what survives a restart).
 CREATE TABLE IF NOT EXISTS decision_traces (
     trace_id INTEGER PRIMARY KEY,
     recorded_ts REAL NOT NULL,
@@ -222,6 +239,31 @@ CREATE INDEX IF NOT EXISTS idx_decision_traces_tier_decision_ts
     ON decision_traces (tier, decision, recorded_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_decision_traces_event_id
     ON decision_traces (event_id);
+
+-- Phase J6: "historical SLA outcomes" — one row per terminal completion,
+-- durable and cross-process (unlike metrics.py's own sla_met/sla_missed,
+-- which are in-memory, per-tier aggregates that reset on every
+-- /control/reset). `source` names whichever process actually served the
+-- event, so a query can ask "how did P0 do, specifically on server1"
+-- rather than only "how did P0 do, in aggregate".
+CREATE TABLE IF NOT EXISTS sla_outcomes (
+    outcome_id INTEGER PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    event_type TEXT NOT NULL,
+    value REAL NOT NULL,
+    met INTEGER NOT NULL CHECK (met IN (0, 1)),
+    latency_ms REAL NOT NULL,
+    recorded_ts REAL NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('ingress', 'server1', 'server2'))
+);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_tier_met_ts
+    ON sla_outcomes (tier, met, recorded_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_event_id
+    ON sla_outcomes (event_id);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_source_ts
+    ON sla_outcomes (source, recorded_ts DESC);
 ```
 
 ### Primary keys, indexes, and bounded growth
@@ -229,10 +271,20 @@ CREATE INDEX IF NOT EXISTS idx_decision_traces_event_id
 | Table | Primary key / invariant | Index and query served | Bounded-growth strategy |
 |---|---|---|---|
 | `events_sink` | `idempotency_key`; an upsert makes repeated delivery target one terminal result | PK: sink upsert; `dedup_key`: investigate/suppress business duplicates; `(partition_key, latest_seq)`: ordering audit; `committed_ts`: retention/export scan | Keep the active window; export verified historical results before pruning by `committed_ts`. This is not an unbounded event log. |
-| `deferred_buffer` | `defer_id`; `event_id` unique; `tier` check forbids P0 | `(ready_at, tier, deadline_ts, seq)`: eligible work in urgency order; `(partition_key, seq)`: order guard; `deadline_ts`: expiry/alert scan | Explicit capacity cap. Delete only after successful sink persistence, rollup, or auditable shed. P0 cannot enter. |
+| `deferred_buffer` | `defer_id`; `event_id` unique (UPSERT on re-defer, Phase J6 — see below); `tier` check forbids P0 | `(ready_at, tier, deadline_ts, seq)`: eligible work in urgency order; `(partition_key, seq)`: order guard; `deadline_ts`: expiry/alert scan; `(origin, ready_at)`: each of the two per-origin drainers scans only its own rows | Explicit capacity cap. Delete only after successful sink persistence, rollup, or auditable shed. P0 cannot enter. |
 | `audit_ledger` | `ledger_id` gives immutable chain order; `row_hash` unique | `seq`: trace one decision; `(tier, decision, recorded_ts)`: explain/shedding queries | Keep the 30-hour run. For longer operation, archive verified contiguous segments with their end hash and retain the checkpoint/root hash. |
 | `rollups` | `rollup_id`; type/window unique index prevents duplicate window output | type/window: chart series; sequence coverage: reconcile an interval; window index: retention compaction | Fixed windows cap rows. Age out fine-grained windows only after compacting to a coarser rollup and retaining coverage bounds. |
 | `decision_traces` | `trace_id` | recent: dashboard last-N feed; tier/decision: explain degradation; `event_id`: trace a retry/emission | Retain a bounded recent horizon, e.g. 10,000 rows. The ledger, not this convenience table, remains durable evidence. |
+| `sla_outcomes` | `outcome_id` | `(tier, met, recorded_ts)`: attainment-over-time queries; `event_id`: trace one event's own outcome; `(source, recorded_ts)`: per-process attainment (Phase J6's own "how did server1 do" question) | One row per terminal completion; not deduplicated across a genuine retry (a retried event's own new completion is a real, separate fact worth keeping, matching `audit_ledger`'s own append-only stance). |
+
+**`deferred_buffer.event_id` is UPSERTed, not merely unique (Phase J6).**
+Once a deferred row can be redispatched back to a real, separate process
+(`origin = 'server2'`) rather than only ever replayed into this same
+process's own queue, a second DEFER of the same `event_id` — pressure still
+high, or high again, by the time the redispatched event is re-decided — is a
+real, reachable outcome, not a bug: the row is updated in place (new
+`deferred_ts`/`ready_at`/`defer_reason`/`event_json`, same `defer_id`) rather
+than the bare `INSERT` (pre-J6) raising a uniqueness violation.
 
 ## 5. Rollups: loss with accounting
 

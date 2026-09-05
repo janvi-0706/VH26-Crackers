@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS deferred_buffer (
     ready_at REAL NOT NULL,
     defer_reason TEXT NOT NULL,
     event_json TEXT NOT NULL,
-    schema_version INTEGER NOT NULL
+    schema_version INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'server2'))
 );
 CREATE INDEX IF NOT EXISTS idx_deferred_ready_priority
     ON deferred_buffer (ready_at, tier, deadline_ts, seq);
@@ -60,7 +61,25 @@ CREATE INDEX IF NOT EXISTS idx_deferred_partition_seq
     ON deferred_buffer (partition_key, seq);
 CREATE INDEX IF NOT EXISTS idx_deferred_deadline
     ON deferred_buffer (deadline_ts);
+CREATE INDEX IF NOT EXISTS idx_deferred_origin_ready
+    ON deferred_buffer (origin, ready_at);
 """
+
+# Phase J6: `origin` distinguishes a row deferred by THIS process's own
+# in-process worker.py ('local' — the monolith/Engine's own pipeline,
+# unchanged since Stage E) from one deferred by a real, separate server2
+# instance over HTTP ('server2' — Phase J5's own /defer POST). The two
+# need different replay destinations: a 'local' row re-enters Engine's own
+# queue.put_replayed() exactly as before; a 'server2' row must go back
+# OVER THE WIRE to server2 (transport.submit()), never into Engine's local
+# queue — Engine's own decision engine is a different, independent
+# instance from whichever real server2 pod actually deferred it, and
+# CLAUDE.md's "P1/P2 -> Server 2" boundary would be silently violated by
+# quietly processing it locally instead. Two independent drain loops, one
+# per origin, run off the SAME store (see run_drainer's own `origin`
+# filter) rather than one loop guessing a destination per row.
+ORIGIN_LOCAL = "local"
+ORIGIN_SERVER2 = "server2"
 
 # The drainer's own pacing — separate from the pressure threshold it waits
 # for. "Rate-limited so replay cannot re-trigger pressure and oscillate"
@@ -100,14 +119,29 @@ _DRAIN_RATE_WINDOW_SECONDS = 5.0
 
 class DeferralStore:
     """SQLite-backed. Defaults to `:memory:`, matching sink.py's own
-    demo-scale default — a real deployment would point this at a file for
-    persistence across process restarts, out of scope here."""
+    demo-scale default.
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    Phase J6: `connection`, when given, is used AS IS instead of opening a
+    new one — this is how `history_db.py` wires this store onto ingress's
+    one shared, WAL-mode `history.db` connection alongside `sink.py` and
+    `ledger.py`, rather than each module opening its own separate file
+    (`path` is then informational only, for `__repr__`/logging; the
+    connection already IS whatever file it was opened against). `path` on
+    its own, unchanged, still means what it always did — open a fresh
+    connection there — for every existing caller that never heard of the
+    shared-connection wiring.
+    """
+
+    def __init__(
+        self, path: str | Path = ":memory:", *, connection: sqlite3.Connection | None = None
+    ) -> None:
         self.path = str(path)
-        if self.path != ":memory:":
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        if connection is not None:
+            self.connection = connection
+        else:
+            if self.path != ":memory:":
+                Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(DEFERRED_BUFFER_DDL)
         self.connection.commit()
@@ -155,9 +189,32 @@ class DeferralStore:
         row = self.connection.execute("SELECT COUNT(*) FROM deferred_buffer").fetchone()
         return int(row[0])
 
-    def defer(self, event: Event, reason: str, *, now: float | None = None) -> None:
+    def defer(
+        self, event: Event, reason: str, *, now: float | None = None, origin: str = ORIGIN_LOCAL,
+    ) -> None:
         """Park one event. Synchronous, like sink.write() — a SQLite insert
-        at this scale is not worth an await."""
+        at this scale is not worth an await.
+
+        UPSERT, not a bare INSERT, on `event_id` — Phase J6's own
+        cross-process re-dispatch (this store's `origin='server2'` rows
+        replay by POSTing the event back to a real server2 over the wire,
+        not into a local queue this process controls) makes a genuine
+        re-defer of the SAME event_id a real, reachable case for the first
+        time: pressure can easily still be high (or have gone high again)
+        by the time server2 finishes deciding what to do with a
+        redispatched event, and DEFERring it AGAIN is the correct,
+        expected outcome, not a bug. A bare INSERT would raise
+        `sqlite3.IntegrityError` against this table's own `event_id
+        UNIQUE` constraint the second time — found while designing this
+        exact redispatch path, not observed as a live incident (the
+        Stage D-era, single-process redefer trap `already_deferred`/
+        `was_deferred` below already prevented worker.py from ever
+        double-deferring the SAME event within one process; a real
+        network round trip out to server2 and back is what makes it
+        reachable now). The UPSERT keeps `defer_id` and the original
+        `dedup_key`/`idempotency_key`/`schema_version` stable while
+        refreshing everything else to the new attempt's own values.
+        """
         if event.tier is Tier.P0:
             raise ValueError("P0 must never be deferred (CLAUDE.md hard rule 3)")
         now = time.time() if now is None else now
@@ -166,18 +223,35 @@ class DeferralStore:
             INSERT INTO deferred_buffer (
                 event_id, dedup_key, seq, partition_key, idempotency_key,
                 event_type, tier, deadline_ts, deferred_ts, ready_at,
-                defer_reason, event_json, schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                defer_reason, event_json, schema_version, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                seq = excluded.seq,
+                deadline_ts = excluded.deadline_ts,
+                deferred_ts = excluded.deferred_ts,
+                ready_at = excluded.ready_at,
+                defer_reason = excluded.defer_reason,
+                event_json = excluded.event_json,
+                origin = excluded.origin
             """,
             (
                 event.event_id, event.dedup_key, event.seq, event.partition_key,
                 event.idempotency_key, event.type.value, event.tier.value,
                 event.deadline_ts, now, now, reason,
-                event.model_dump_json(), event.schema_version,
+                event.model_dump_json(), event.schema_version, origin,
             ),
         )
         self.connection.commit()
-        self._pending_count += 1
+        # A genuine re-defer (the ON CONFLICT branch) does not grow the
+        # table or the live backlog — it was already counted pending from
+        # its first defer, still is, and cursor.rowcount is 1 either way
+        # for an upsert, so re-deriving "was this actually new" from the
+        # row count would silently double count. already_deferred (a set)
+        # is the one source that already answers "have we seen this
+        # event_id before" for free.
+        is_new = event.event_id not in self.already_deferred
+        if is_new:
+            self._pending_count += 1
         self.total_deferred += 1
         self.already_deferred.add(event.event_id)
 
@@ -187,6 +261,15 @@ class DeferralStore:
         metrics.py: reset() clears the live queue and dashboard counters,
         but this buffer is durable and untouched by it)."""
         return self._pending_count
+
+    def pending_count_by_origin(self, origin: str) -> int:
+        """A real query, not the cached `_pending_count` total — used by
+        the two independent drainers (and tests) to see their own share
+        of the backlog without the other origin's rows in the way."""
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM deferred_buffer WHERE origin = ?", (origin,)
+        ).fetchone()
+        return int(row[0])
 
     def drain_rate(self, now: float | None = None) -> float:
         """Events/sec actually drained, averaged over the last
@@ -201,20 +284,29 @@ class DeferralStore:
             self._drain_timestamps.popleft()
         return len(self._drain_timestamps) / _DRAIN_RATE_WINDOW_SECONDS
 
-    def _pop_ready_batch(self, limit: int) -> list[Event]:
+    def _pop_ready_batch(self, limit: int, *, origin: str | None = None) -> list[Event]:
         """Up to `limit` events, oldest-deferred first, P1 before P2, then
         by deadline urgency then arrival — exactly the
         idx_deferred_ready_priority index's own ordering. Removes them from
         the table as part of the same operation: once popped, an event is
-        the caller's responsibility, not this store's."""
-        rows = self.connection.execute(
-            """
-            SELECT defer_id, event_json FROM deferred_buffer
-            ORDER BY ready_at ASC, tier ASC, deadline_ts ASC, seq ASC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        the caller's responsibility, not this store's.
+
+        `origin=None` (every existing caller before Phase J6) pops across
+        BOTH origins, unchanged. Phase J6's two independent drainers each
+        pass their own origin so a 'local' drain tick can never pop a
+        'server2' row (which must go back over the wire, not into
+        Engine's own queue) or vice versa — seeing the wrong origin's row
+        here would be silently doing the wrong thing with it, not a
+        merely suboptimal ordering choice.
+        """
+        query = "SELECT defer_id, event_json FROM deferred_buffer"
+        params: list[object] = []
+        if origin is not None:
+            query += " WHERE origin = ?"
+            params.append(origin)
+        query += " ORDER BY ready_at ASC, tier ASC, deadline_ts ASC, seq ASC LIMIT ?"
+        params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
         if not rows:
             return []
         ids = [row["defer_id"] for row in rows]
@@ -237,13 +329,25 @@ class DeferralStore:
         replay: Callable[[Event], None],
         current_pressure: Callable[[], float],
         stop_event: asyncio.Event,
+        *,
+        origin: str | None = None,
     ) -> None:
         """Background loop: every DRAIN_TICK_SECONDS, if pressure has
         fallen below DRAIN_PRESSURE_THRESHOLD, hand up to
-        DRAIN_BATCH_PER_TICK events back to `replay` (queue.put_replayed,
-        in practice) and record the drain. Otherwise does nothing and
-        waits for the next tick — the whole rate limit is exactly these
-        two constants, no separate backoff logic needed.
+        DRAIN_BATCH_PER_TICK events back to `replay` (queue.put_replayed
+        for a 'local' origin; a POST back to server2 for a 'server2'
+        origin — see this module's own top docstring) and record the
+        drain. Otherwise does nothing and waits for the next tick — the
+        whole rate limit is exactly these two constants, no separate
+        backoff logic needed.
+
+        `current_pressure` is deliberately a caller-supplied callable, not
+        this store reading some ambient signal itself: a 'local' drainer
+        gates on Engine's own `metrics.current_pressure()`, while a
+        'server2' drainer gates on that real process's own reported
+        pressure (`reporting.fragments("server2")`, never averaged across
+        instances — Phase J5's own rule) — two different signals, and this
+        store has no business knowing which one applies to which origin.
         """
         while not stop_event.is_set():
             try:
@@ -254,7 +358,7 @@ class DeferralStore:
                 return
             if current_pressure() >= DRAIN_PRESSURE_THRESHOLD:
                 continue
-            batch = self._pop_ready_batch(DRAIN_BATCH_PER_TICK)
+            batch = self._pop_ready_batch(DRAIN_BATCH_PER_TICK, origin=origin)
             if not batch:
                 continue
             now = time.time()
@@ -276,12 +380,18 @@ class DeferralStore:
 _default_store = DeferralStore()
 
 
-def defer(event: Event, reason: str, *, now: float | None = None) -> None:
-    _default_store.defer(event, reason, now=now)
+def defer(
+    event: Event, reason: str, *, now: float | None = None, origin: str = ORIGIN_LOCAL,
+) -> None:
+    _default_store.defer(event, reason, now=now, origin=origin)
 
 
 def pending_count() -> int:
     return _default_store.pending_count()
+
+
+def pending_count_by_origin(origin: str) -> int:
+    return _default_store.pending_count_by_origin(origin)
 
 
 def drain_rate(now: float | None = None) -> float:
@@ -296,8 +406,10 @@ async def run_drainer(
     replay: Callable[[Event], None],
     current_pressure: Callable[[], float],
     stop_event: asyncio.Event,
+    *,
+    origin: str | None = None,
 ) -> None:
-    await _default_store.run_drainer(replay, current_pressure, stop_event)
+    await _default_store.run_drainer(replay, current_pressure, stop_event, origin=origin)
 
 
 def reset_default_store() -> None:
@@ -307,3 +419,16 @@ def reset_default_store() -> None:
     global _default_store
     _default_store.close()
     _default_store = DeferralStore()
+
+
+def configure_default(store: DeferralStore) -> None:
+    """Phase J6: swap the ambient default store for one already wired onto
+    ingress's own shared, WAL-mode `history.db` connection
+    (`history_db.py`'s own job) — real-mode startup only, called once,
+    before anything else touches this module. Distinct from
+    `reset_default_store()` (tests only, always a fresh `:memory:` store):
+    this one takes the store to use, and is how a real deployment's
+    `data/history.db` actually gets adopted rather than the demo-scale
+    `:memory:` default this module would otherwise keep forever."""
+    global _default_store
+    _default_store = store
