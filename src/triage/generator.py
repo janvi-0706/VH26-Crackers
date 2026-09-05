@@ -19,7 +19,7 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from . import metrics
 from .admission import AdmissionControl
@@ -72,6 +72,7 @@ class EventGenerator:
         seed: int | None = None,
         customer_count: int = 500,
         admission: AdmissionControl | None = None,
+        pressure_source: Callable[[EventType, float], float] | None = None,
     ) -> None:
         if customer_count <= 0:
             raise ValueError("customer_count must be positive")
@@ -88,6 +89,13 @@ class EventGenerator:
         # generator already has, unless the caller (Engine, or a test)
         # supplies one explicitly.
         self.admission = admission or AdmissionControl(config=self.config)
+        # Phase J7: monolith default unchanged (metrics.current_pressure,
+        # tier-blind). Engine, when dispatching to a real server1/server2
+        # split, injects a per-tier function instead: P0 reads server1's
+        # own reported pressure, P1/P2 read server2's — never averaged.
+        self._pressure_source = pressure_source or (
+            lambda _event_type, now: metrics.current_pressure(self.config, now=now)
+        )
         # Stage I's own demo beat: "inject a heavier payload mix mid-run".
         # 1.0 is the documented, calibration-preserving default (see
         # costmodel.py's own docstring: true_cost's expectation over the
@@ -242,7 +250,7 @@ class EventGenerator:
             while next_emit_time <= now and burst < self._MAX_BURST:
                 event_type = self._choose_type()
                 wall_now = time.time()
-                pressure = metrics.current_pressure(self.config, now=wall_now)
+                pressure = self._pressure_source(event_type, wall_now)
                 cost = self.admission.cost_of(event_type)
                 admitted = self.admission.try_acquire(event_type, pressure, now=wall_now)
                 metrics.observe_admission(cost, admitted, now=wall_now)

@@ -65,13 +65,15 @@ dev-persist:
 # `make` target has to do by hand.
 dev-split:
 	@echo "Using interpreter: $(PY)"
-	@echo "ingress (:8000, --transport http) + server1 (:8001) + server2 (:8002)"
+	@echo "ingress (:8000, --transport http --persist) + server1 (:8001) + server2 (:8002)"
 	@trap 'kill 0' EXIT INT TERM; \
-	$(PY) -m triage.app --transport http & \
+	$(PY) -m triage.app --transport http --persist & \
 	sleep 1; \
 	$(PY) -m triage.server1 & \
 	$(PY) -m triage.server2 & \
-	wait
+	wait -n; \
+	kill 0 2>/dev/null; \
+	true
 
 # The two downstream servers config/servers.yaml names — real, runnable
 # FastAPI apps, each deriving its own worker count and per-worker rate

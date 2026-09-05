@@ -150,6 +150,7 @@ class Transport:
         # anything was retried.
         self._all_dispatched_event_ids: set[str] = set()
         self._all_resolved_event_ids: set[str] = set()
+        self.total_redispatched = 0
 
     def _fresh_dispatch_id(self) -> str:
         self._next_id += 1
@@ -272,6 +273,7 @@ class Transport:
                 continue
             await self.dispatch(record.server, events)
             redispatched_count += len(events)
+        self.total_redispatched += redispatched_count
         return redispatched_count
 
     def latency_percentiles(self) -> dict[str, float]:
@@ -297,7 +299,10 @@ class Transport:
         dispatched = len(self._all_dispatched_event_ids)
         resolved = len(self._all_resolved_event_ids)
         outstanding = len(self._event_index)
-        return {"dispatched": dispatched, "resolved": resolved, "outstanding": outstanding}
+        return {
+            "dispatched": dispatched, "resolved": resolved, "outstanding": outstanding,
+            "redispatched": self.total_redispatched,
+        }
 
     def reset(self) -> None:
         """Tests only."""
@@ -307,6 +312,7 @@ class Transport:
         self._next_id = 0
         self._all_dispatched_event_ids.clear()
         self._all_resolved_event_ids.clear()
+        self.total_redispatched = 0
 
 
 # --------------------------------------------------------------------------
@@ -417,6 +423,31 @@ class Batcher:
     async def submit(self, server: str, event: Event) -> None:
         await self._queues[server].put(event)
 
+    async def _flush(self, server: str, buffer: list[Event]) -> None:
+        """A real, tested bug found running this against real sockets for
+        the first time (Phase J7's own `make dev-split`), not hypothetical:
+        the main loop below used to call `self._dispatch_fn` directly, with
+        no exception guard except at cancel time. `dispatch()` records the
+        attempt (outstanding + the dispatched-event-id set) BEFORE it ever
+        calls the injected `deliver` — so a transient failure (a real HTTP
+        POST, unlike a batch failing during an ASGI-transport test, has a
+        real connection to refuse or time out, e.g. if this loop's very
+        first flush races server2's own startup) still leaves the events
+        correctly tracked for `redispatch_expired()` to retry later. But an
+        UNCAUGHT exception here doesn't just lose that one batch — it
+        propagates out of `_flush_loop`'s own `while True`, silently
+        killing the ENTIRE task for that server permanently: every event
+        submitted afterward piles into a queue nothing is ever reading
+        from again, with no crash, no log, and no visible symptom beyond
+        "traffic mysteriously never leaves ingress." Caught here instead,
+        matching every other "one bad X must not kill the whole loop"
+        guard already in this codebase (worker.py's own per-event
+        exception handling is the closest precedent)."""
+        try:
+            await self._dispatch_fn(server, buffer)
+        except Exception:  # noqa: BLE001 - see docstring above
+            logger.exception("batcher dispatch failed for %s (%d events)", server, len(buffer))
+
     async def _flush_loop(self, server: str, queue: asyncio.Queue[Event]) -> None:
         buffer: list[Event] = []
         deadline: float | None = None
@@ -428,7 +459,7 @@ class Batcher:
                     event = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     if buffer:
-                        await self._dispatch_fn(server, buffer)
+                        await self._flush(server, buffer)
                         buffer = []
                         deadline = None
                     continue
@@ -436,7 +467,7 @@ class Batcher:
                 if deadline is None:
                     deadline = loop.time() + self._batch_window_seconds
                 if len(buffer) >= self._batch_size:
-                    await self._dispatch_fn(server, buffer)
+                    await self._flush(server, buffer)
                     buffer = []
                     deadline = None
         except asyncio.CancelledError:

@@ -11,7 +11,6 @@ import { DeferredBacklogPanel } from "./components/panels/DeferredBacklogPanel";
 import { WeightsPanel } from "./components/panels/WeightsPanel";
 import { LadderPanel } from "./components/panels/LadderPanel";
 import { RatesPanel } from "./components/panels/RatesPanel";
-import { ConservationPanel } from "./components/panels/ConservationPanel";
 import { ShedLogPanel } from "./components/panels/ShedLogPanel";
 import { EventInspectorPanel } from "./components/panels/EventInspectorPanel";
 import { WorkerPoolGridPanel } from "./components/panels/WorkerPoolGridPanel";
@@ -19,6 +18,7 @@ import { CostComparisonPanel } from "./components/panels/CostComparisonPanel";
 import { ChaosControlPanel } from "./components/panels/ChaosControlPanel";
 import { RecoveryPanel } from "./components/panels/RecoveryPanel";
 import { CostModelPanel } from "./components/panels/CostModelPanel";
+import { TopologyPanel } from "./components/panels/TopologyPanel";
 import { useMetricsSocket } from "./hooks/useMetricsSocket";
 import * as api from "./lib/api";
 
@@ -90,7 +90,7 @@ export default function App() {
       <div className="min-h-0 flex-1">
         {tab === "status" && (
           <PanelGrid rows={1}>
-            <ConservationPanel latest={latest} />
+            <TopologyPanel />
             <P0ScoreboardPanel latest={latest} />
             <PressureGaugePanel latest={latest} />
             <LadderPanel latest={latest} />

@@ -445,6 +445,19 @@ def create_server2_app(
         per_worker_rate=per_worker_rate,
         sla_reference=sla_reference,
     )
+    # Cold-start guard, real deployment not just tests: decision.pressure()'s
+    # own b term (arrival/service, service floored at EPS) reads a huge
+    # ratio the instant real traffic arrives but service_rate is still
+    # genuinely 0 (nothing served yet), misreporting a brand-new pod as
+    # saturated before it has served a single event. That one bad reading
+    # gets pushed in this pod's own metrics fragment and read by ingress's
+    # admission AIMD (Phase J7), which reacts to ANY pressure >= 0.85 with
+    # a fast multiplicative decrease and only a slow additive recovery —
+    # a single cold-start spike can throttle real admitted throughput for
+    # several real seconds afterward. Matters doubly once HPA (Phase K)
+    # scales server2 up: every new pod hits this at the exact moment it
+    # is supposed to be relieving load, not adding to the appearance of it.
+    state.service_ewma.level = per_worker_rate
 
     def _record_latency(latency_ms: float) -> None:
         state.latency_ms.append(latency_ms)
@@ -514,6 +527,29 @@ def create_server2_app(
             response.raise_for_status()
         except Exception:  # noqa: BLE001 - see docstring above
             logger.debug("defer post failed for %s", event.event_id, exc_info=True)
+
+    async def _post_shed(event: Event, reason: str, pressure_value: float) -> None:
+        """Phase J8 (live-demo fix): a SHED decision otherwise tells
+        ingress nothing at all (unlike DEFER/SAMPLE_ROLLUP, it has no
+        durable store of its own to write into) — which starves the
+        dashboard's own Shed Log panel of any individual record to show,
+        even though the AGGREGATE `shed` counter (this instance's own
+        pushed fragment) is real. Same fire-and-forget, no-local-retry
+        shape as `_post_defer` — a lost POST here is one narration-panel
+        entry missing, not a durable-state loss (the event was already,
+        correctly, genuinely shed either way)."""
+        try:
+            response = await resolved_ack_client.post(
+                f"{base_ingress_url}/shed",
+                json={
+                    "event": event.model_dump(mode="json"),
+                    "reason": reason,
+                    "pressure": pressure_value,
+                },
+            )
+            response.raise_for_status()
+        except Exception:  # noqa: BLE001 - see _post_defer's own docstring
+            logger.debug("shed post failed for %s", event.event_id, exc_info=True)
 
     async def _post_rollup(rollup: "ladder.Rollup") -> None:
         try:
@@ -598,6 +634,7 @@ def create_server2_app(
                 # Unreachable given ladder.cap()'s own enforcement — see
                 # shed_critical_count's own docstring on _ServerState.
                 state.shed_critical_count += 1
+            await _post_shed(event, reason, _pressure_value(state, now))
 
     _OFF_PATH: frozenset[Decision] = frozenset(
         {Decision.DEFER, Decision.SAMPLE_ROLLUP, Decision.SHED}
@@ -677,6 +714,10 @@ def create_server2_app(
             # A lifetime counter (correctly summable across instances,
             # unlike pressure) — see shed_critical_count's own docstring.
             "shed_critical": float(state.shed_critical_count),
+            # Phase J8 (live-demo fix): so ingress's own dispatch-mode
+            # merged frame can show a real P1/P2 latency number on the
+            # dashboard's Traffic tab instead of a permanent 0.
+            "latency_p99": percentile(state.latency_ms, 0.99),
         }
 
     reporting_client = reporting.ReportingClient(
