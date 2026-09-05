@@ -551,6 +551,39 @@ def create_server2_app(
         except Exception:  # noqa: BLE001 - see _post_defer's own docstring
             logger.debug("shed post failed for %s", event.event_id, exc_info=True)
 
+    async def _resolve_dispatch(event_id: str) -> None:
+        """Real bug, found live (`bench/phase-j-stress.md`'s own section
+        2), fixed here: `SHED` and `SAMPLE_ROLLUP` were the only two
+        off-path outcomes that never told ingress's own `transport.py`
+        this event's dispatch was resolved — `DEFER` already does, via
+        `/defer`'s own handler (Phase J6). Every `SHED`/`SAMPLE_ROLLUP`
+        event therefore sat in `transport.py`'s `_outstanding` table
+        forever and was redispatched every `ack_timeout_ms` (5s)
+        indefinitely — confirmed live: `shed` + `sampled_out` tracked
+        `redispatch_count` almost exactly over a real 5-minute spike.
+
+        Plain `event_ids`-only `/ack` (no `events` field) is the
+        DELIBERATE choice here, not an oversight: `AckBody`'s own
+        docstring says the richer shape (`events`/`decision`/...) makes
+        ingress durably record the completion via `sink.write()` — which
+        would be WRONG for a shed or sampled event (`sink.py`'s own
+        `events_sink` table is "the latest successful DELIVERY," and
+        neither of these delivered anything). This call resolves the
+        transport-level bookkeeping only — exactly the same no-op-on-
+        unknown-id, fire-and-forget shape `_ack` (the STREAM_NOW/
+        MICRO_BATCH path) and `_post_shed`/`_post_defer` already use.
+        """
+        try:
+            response = await resolved_ack_client.post(
+                f"{base_ingress_url}/ack", json={"event_ids": [event_id]},
+            )
+            response.raise_for_status()
+        except Exception:  # noqa: BLE001 - ingress's own redispatch sweep
+            # would otherwise just retry this event again in
+            # ack_timeout_ms, exactly as it already does for a lost
+            # STREAM_NOW ack — no worse off than before this fix existed.
+            logger.debug("dispatch-resolve ack failed for %s", event_id, exc_info=True)
+
     async def _post_rollup(rollup: "ladder.Rollup") -> None:
         try:
             response = await resolved_ack_client.post(
@@ -628,6 +661,11 @@ def create_server2_app(
                 if event.type is EventType.CLICK:
                     state.weighted_click_count += rollup.observed_count * rollup.sample_weight
                 await _post_rollup(rollup)
+            # This EVENT's own dispatch is resolved the instant it is
+            # folded into the reservoir, regardless of whether it also
+            # happened to be the one that closed the window above — see
+            # _resolve_dispatch's own docstring for why this was missing.
+            await _resolve_dispatch(event.event_id)
         elif result is Decision.SHED:
             state.shed_count += 1
             if event.tier is Tier.P1:
@@ -635,6 +673,7 @@ def create_server2_app(
                 # shed_critical_count's own docstring on _ServerState.
                 state.shed_critical_count += 1
             await _post_shed(event, reason, _pressure_value(state, now))
+            await _resolve_dispatch(event.event_id)
 
     _OFF_PATH: frozenset[Decision] = frozenset(
         {Decision.DEFER, Decision.SAMPLE_ROLLUP, Decision.SHED}
