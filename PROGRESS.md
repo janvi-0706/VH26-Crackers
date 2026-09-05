@@ -3215,3 +3215,207 @@ own two integration tests drive traffic directly at server1's/server2's
 `/ingest` (matching every split-topology test since J4), which is what
 lets J6's own "single writer, real WAL file, real redispatch" claims be
 tested honestly today, without assuming J7's own wiring already exists.
+
+## Phase J7 — real dispatch wiring, per-server admission, dashboard topology
+
+**Built**
+
+- `Engine` gains `dispatch_via_transport` (True when `--transport http`):
+  `_ingest()` now calls `transport.submit(server_for_tier, event)` instead
+  of the local queue, and skips starting local workers entirely (nothing
+  is ever locally queued in this mode). Local `metrics.observe_ingest()`
+  is deliberately NOT called for dispatched events (it would inflate a
+  local `in_queue` counter nothing ever dequeues) — `/ws`'s own
+  `_dispatch_merged_frame()` instead builds the frame from
+  `transport.dispatch_stats()` (dispatched) and `reporting.aggregate()`
+  (processed/in_queue/in_flight/sampled/shed) for both servers, and
+  deliberately does NOT go through `metrics.snapshot()` — that call's own
+  internal conservation check compares purely-local counters (0 in this
+  mode) against `deferral.pending_count()` (NOT purely local — both
+  origins), which trips the "critical, does-not-clear" alarm the instant
+  any server2-origin event defers. Found by actually looking at the
+  running dashboard, not assumed: the Conservation panel latched red
+  within seconds of every real `make dev-split` spike.
+- `admission.py`'s own AIMD now reads pressure per tier:
+  `generator.py`'s `EventGenerator` takes a `pressure_source(event_type,
+  now)` callable; Engine injects one that reads server1's own reported
+  pressure for P0, server2's for P1/P2 — never averaged, never each
+  other's (this phase's own instruction). P0 is `critical` in
+  `admission.py` so this never actually gates it, but it's the honestly-
+  attributed signal, not a number that would misleadingly suggest
+  otherwise.
+- Two real bugs found running this against REAL sockets for the first
+  time (`make dev-split`, not an ASGITransport test), neither
+  hypothetical:
+  1. `_server1_pressure()`/`_server2_pressure()` (admission's own feed)
+     failed CLOSED (1.0) with no fragment yet, matching J6's own
+     redispatch-gate reasoning — wrong reasoning for THIS caller: it
+     ratchets every bulk credit bucket's ceiling down hard via AIMD's
+     fast multiplicative decrease for the first `fragment_ttl_ms` of
+     every fresh start, before a real signal exists, then recovers only
+     via the slow additive path (~7+ real seconds to fully recover from
+     rock bottom). Now fails OPEN (0.0), matching the monolith's own
+     `metrics.current_pressure()` cold-start assumption.
+  2. `transport.py`'s own `Batcher._flush_loop` had NO exception guard
+     around its main-loop dispatch calls (only the cancel-time flush did)
+     — a single transient HTTP failure (a real race against server2 not
+     being 100% ready yet, not reproducible against an ASGI test
+     transport) silently killed that server's flush task permanently:
+     every event submitted afterward piled into a queue nothing was ever
+     reading from again, with no crash and no log. This is a latent J3
+     bug that never surfaced before because no test had run the batcher
+     against real sockets under real timing. Fixed with a `_flush()`
+     wrapper that logs and continues — the SAME events stay correctly
+     tracked as dispatched+outstanding either way (`dispatch()` records
+     both before it ever calls `deliver`), so `redispatch_expired()`
+     still recovers a genuinely failed delivery; the fix is just "don't
+     let one failure end the whole loop."
+  3. Server2's own real-deployment cold start (not just a test artifact
+     this time): `decision.pressure()`'s `b` term reads a huge ratio the
+     instant real traffic arrives with `service_ewma` still genuinely at
+     0, misreporting a brand-new pod as saturated before it has served a
+     single event — which admission's AIMD then reacts to. Fixed at the
+     source (`create_server2_app()` seeds `service_ewma.level =
+     per_worker_rate` at construction), not just in tests — matters
+     doubly once HPA (Phase K) creates fresh pods regularly.
+- `server1.py` gains `queue_wait_ms` (ingest -> dequeue only, separate
+  from the existing ingest -> complete `latency_ms`) — the number
+  actually comparable to `bench/contention-before.md`'s own "Total queue
+  wait" figure (187.73ms p99), since that report never included
+  simulated service time either (~130-155ms per P0 event on this stack's
+  own cost model, unrelated to contention, and would otherwise swamp any
+  "did the split help" comparison).
+- `make dev-split` now uses `wait -n; kill 0` instead of a bare `wait` —
+  the first process to exit (crash or otherwise) now tears down the
+  other two immediately, rather than only on Ctrl+C. Also now passes
+  `--persist` (real `history.db`, matching the demo's own K-phase story).
+- `GET /control/topology` (new): both servers' own pressure (never
+  averaged), each server's live instance count (`reporting.instance_
+  count` — meaningful once HPA exists), transport latency, outstanding-
+  dispatch and lifetime redispatch counts (`transport.py` gained a
+  `total_redispatched` counter). Dashboard: new "Topology" tab
+  (`TopologyPanel.tsx`, polls this endpoint at 4Hz) with the two pressure
+  gauges, pod counts, and transport/redispatch stats this phase's own
+  prompt names. `ConservationPanel.tsx` gained a `splitMode` prop
+  (`App.tsx` polls `/control/topology`'s own `mode` field): split mode
+  shows an honest "cross-process, approximate by design" message instead
+  of the monolith's own exact-identity pass/fail latch, which would
+  otherwise misread a real, disclosed architectural property (reporting
+  lag + at-least-once redispatch can transiently double-count a live,
+  in-memory counter) as a critical invariant violation.
+- `tests/test_j7_acceptance.py` (new): drives Engine's own real
+  generator -> admission -> dispatch pipeline (not hand-posted `/ingest`
+  like every split-topology test before this one) against real server1/
+  server2 apps over `httpx.ASGITransport`. Confirms server1 pressure
+  stays below server2's under a 20x spike, server2 shows real saturation
+  (>0.3), and P0's own queue-wait p99 improves on `bench/contention-
+  before.md`'s own total-queue-wait finding.
+
+**Verified**
+
+```
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q tests/test_j7_acceptance.py
+1 passed (stable across repeated runs)
+```
+
+`make dev-split` smoke-tested end to end against real sockets, several
+times (before and after finding the three bugs above): real dispatch
+flowing to both servers, real defer/redispatch/reservoir-sampling
+activity under spike, dashboard Topology tab and Conservation panel both
+verified visually in-browser (at `http://localhost:8000` — `127.0.0.1`
+fails the app's own hardcoded-origin API calls, a testing-only footgun,
+not a bug).
+
+```
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
+1093 passed, 2 known-flaky pre-existing timing tests failed in 518.60s
+```
+
+The two failures are the SAME ones J6's own PROGRESS.md entry already
+found and confirmed pre-existing (host-speed-calibrated thresholds, in
+files this phase never touched).
+
+Not built in this phase, named rather than silently deferred: the
+CROSS-PROCESS conservation identity is reported honestly
+(`/control/topology`, `/control/conservation`) but not forced to balance
+exactly — J1's own "reporting lag" finding stays a real, disclosed
+limitation, not something this phase closes. K-phase's own graceful-drain
+work (K6) is the next real narrowing of it.
+
+## Phase J8 — testing only: chaos/stress against the real split
+
+Testing only, per this phase's own instruction. `bench/stress_j8.py`
+spawns real, separate OS processes for ingress/server1/server2 on real
+sockets (not `httpx.ASGITransport`, unlike every earlier split-topology
+test) — killing one and observing the other two survive is a claim about
+genuinely independent processes an in-process test cannot make. Full
+report: `bench/phase-j-stress.md`. `bench/contention-after.md` is item 1's
+own deliverable.
+
+**Headline findings, real and load-bearing, not assumed:**
+
+- Item 1 (contention.py against the split): P0 head-of-line blocking is
+  zero by construction (server1.py has no lower-tier code path at all) —
+  confirmed live. A real methodology bug was found and fixed along the
+  way: `bench/contention_after.py`'s own loop-lag prober, run
+  concurrently with the throughput measurement, produced 20-36 SECONDS of
+  apparent P0 queue wait, traced to `contention-before.md`'s own
+  already-disclosed prober observer effect (~774k loop turns/sec) being
+  "likely minor" against the monolith's 150 u/s pool but NOT minor
+  against server1's own smaller, standalone 135 u/s pool. Fixed by
+  measuring throughput and loop-lag in two separate passes. Corrected
+  result: P0 latency p50/p95/p99 140/169/173ms, loop-lag p99 5.8us —
+  consistent with the monolith's own numbers.
+- Item 2 (5-minute sustained spike): **P0 p99, transport p99, and
+  outstanding-dispatch-bounded all FAILED** — real, root-caused, not a
+  flaky threshold. `server2.py`'s `SHED` (and 9-of-10 `SAMPLE_ROLLUP`)
+  decisions never resolve their own transport dispatch (no ack, no defer,
+  nothing) — every one sits outstanding forever and gets redispatched
+  every `ack_timeout_ms` indefinitely. By the 5-minute mark: shed
+  27,754 + sampled_out 17,199 ≈ 44,953, matching the observed
+  `redispatch_count` of 43,634. This redispatch storm is the direct,
+  evidence-backed cause of P0's own latency degradation (2.4s p99 by the
+  end of the window) despite server1 itself being proven contention-free
+  in isolation (item 1). `shed_critical` stayed 0 throughout (passed);
+  the exact conservation identity (`dispatched == resolved + outstanding`)
+  held at all 100 samples (passed), though "outstanding growing to 1350
+  and climbing" is a materially different, weaker claim than "the system
+  is draining correctly."
+- Item 3 (kill server2): server1/P0 independence **CONFIRMED** live —
+  zero interruption, the whole point of the split, proven not assumed.
+  Redispatch after restart worked but did NOT return to balance within
+  10 seconds on this run — outstanding_dispatch kept climbing for the
+  entire 20s recovery window observed, directly worsened by the same
+  SHED/SAMPLE_ROLLUP root cause (the backlog server2 died holding already
+  included permanently-outstanding dispatches independent of whether it
+  restarts). A transient reporting-lag identity mismatch (4/20 recovery
+  samples) self-corrected — the already-disclosed J1 finding, not a new
+  one.
+- Item 4 (kill server1): **"ingress applies backpressure to P0" does not
+  hold as literally stated** — `admission.py`'s P0 bucket is
+  unconditionally `critical=True`, never throttled by design (CLAUDE.md
+  hard rule 3's own point). Live confirmation: `outstanding_dispatch` kept
+  climbing the whole time server1 was dead — nothing was throttled,
+  nothing was dropped either (dispatch identity held), everything just
+  piled up as durably-tracked outstanding work awaiting server1's return.
+  `shed_critical` stayed 0 (P0 never reaches server2's ladder regardless).
+  P0 events correctly resumed and redispatched the instant server1 came
+  back.
+- Item 5 (kill ingress): blast radius stated precisely — all new traffic
+  generation stops system-wide instantly (Engine lives in ingress);
+  server1/server2 stay alive and correctly report liveness but flip to
+  not-ready within ~1s (their own health-check loop, working as designed);
+  **any completion a server finishes while ingress is unreachable is
+  silently, permanently lost** — no local durable buffer exists to retry
+  from once ingress returns, a real gap not previously stated this
+  precisely. Recovery is automatic and fast (~1s) once ingress restarts.
+
+**Not fixed in this phase, named for a follow-up, per "testing only":**
+the SHED/SAMPLE_ROLLUP transport-resolution gap (item 2's own root cause)
+and the ingress-outage completion-loss window (item 5). One unrelated,
+explicitly-user-directed fix landed in `app.py`/`server2.py` mid-session
+(a live-demo dashboard emergency — `_dispatch_merged_frame()` was
+leaving offered/admitted/service rate, per-tier latency/queue-depth,
+worker counts, and shed narration all at zero/empty in split mode,
+folded into the J7 commit since it touches the same files) — it does
+NOT resolve the SHED/SAMPLE_ROLLUP transport gap; that finding stands.
