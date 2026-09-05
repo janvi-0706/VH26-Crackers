@@ -2775,3 +2775,82 @@ immediate re-runs — unrelated to this phase's changes (nothing here
 touches `admission.py`, and `--transport` defaults to `direct`, leaving
 `Engine`'s own pipeline byte-for-byte unchanged). **`make dev`** still
 runs the original single-process build unmodified.
+
+## Phase J4 — server1.py: the standalone P0 process
+
+**Built**
+
+- `src/triage/server1.py` (new) — a real, standalone FastAPI process for
+  P0 alone. Ordering: `P0Queue`, a hand-rolled binary heap keyed on
+  `(deadline_ts, seq)` — pure earliest-deadline-first, P0's own original
+  Stage C ordering made literal now that this process holds P0 in total
+  isolation and no longer needs `decision.score()`'s cross-tier
+  value-density weighing against a P1/P2 backlog that cannot structurally
+  exist here. Capacity: worker count and per-worker rate DERIVED from
+  `config/servers.yaml`'s own `server1.capacity_us` (135 u/s) via
+  `servers_config.ServerSpec.workers()` — 6 workers x 22.5 u/s, never a
+  hardcoded count. Endpoints: `POST /ingest` (queues P0 events; rejects
+  draining with 503, rejects any non-P0 tier with 422 — a second,
+  independent enforcement of "server1 only serves P0" alongside the
+  startup assertion below), `POST /drain` (stops accepting new work,
+  polls until the queue and every in-flight event finish or `timeout_s`
+  elapses — server1's own mechanism half of a graceful shutdown; the
+  policy of when to call it is K6's own scope, named not built), `GET
+  /metrics` (local processed/in_queue/in_flight/p50/p95/p99), `GET
+  /healthz` (unconditional liveness), `GET /readyz` (503 until a
+  background loop's own real `GET {ingress}/health` succeeds at least
+  once, and continuously re-verified afterward — a pod that later loses
+  its route to ingress flips back to not-ready rather than continuing to
+  advertise a stale capability). Holds no durable state: every completed
+  event is POSTed to ingress's existing `/ack` (Phase J3's own mechanism);
+  nothing here ever opens a file, and a rescheduled server1 pod loses
+  everything still queued or mid-service — exactly the gap J3's
+  `redispatch_expired()` and K6's graceful drain exist for, named again
+  here rather than silently assumed solved.
+- **Two independent startup assertions**, per this phase's own
+  instruction: batching must be disabled, and no tier other than P0 may
+  be declared for this process — both raise `RuntimeError` immediately at
+  `create_server1_app()`, on top of (not instead of) `servers_config.py`'s
+  own structural validation from Phase J2, which already refuses to even
+  LOAD a `servers.yaml` with either wrong. A third assertion, scaling must
+  be `"fixed"`, is likewise enforced twice and is the subject of its own
+  ADR (below) rather than a bare comment, per this phase's own
+  instruction ("that belongs in an ADR").
+- `docs/adr/0012-server1-fixed-scaling-not-hpa.md` (new) — why P0 is
+  never autoscaled: a realistic pod cold start on this stack (~45s) is
+  longer than the calibrated spike this project protects against, so HPA
+  would add capacity only after the SLA-relevant window has already
+  closed — the wrong mechanism for a latency-bound tier, not a slower
+  version of the right one. Names the real alternative this project
+  already relies on instead (CLAUDE.md hard rule 3's own "throttle the
+  source," `admission.py`'s AIMD gate) and states the cut plainly: a
+  larger real spike needs a larger fixed number chosen up front and
+  re-verified, not a live scale-out this ADR rules out on this stack.
+- `Makefile` — `server1` now runs the real, dedicated `triage.server1`
+  (superseding Phase J3's generic `server_app.py --name server1` stand-in
+  for this specific server); `make dev-split` (new) runs ingress
+  (`--transport http`), server1, and server2 together in one command, one
+  shell, with `trap 'kill 0'` so Ctrl+C tears down all three. `make dev`
+  is untouched — the single-process fallback keeps working exactly as
+  before, confirmed by not modifying `app.py` at all in this phase.
+- `tests/test_server1.py` (new, 16 tests) — `P0Queue`'s own EDF ordering
+  and tie-breaking; both independent startup assertions (batching,
+  tier-set) plus the scaling assertion; worker count/rate derivation
+  matches `servers_config.py`'s own formula; a full `/ingest` ->
+  serve -> `/ack` round trip and the second-layer non-P0 rejection, both
+  over `httpx.ASGITransport` (a genuine HTTP cycle, no real socket,
+  matching Phase J3's own established pattern); `/drain`'s wait-and-reject
+  behaviour; `/healthz`'s unconditional 200; `/readyz`'s not-ready-until-
+  confirmed startup behaviour AND its flip back to not-ready when ingress
+  later becomes unreachable (a stub client that succeeds once, then
+  always fails); and **this phase's own load test, verbatim**: a real,
+  paced, wall-clock stream of P0-only traffic at the calibrated 20x-spike
+  aggregate rate (~108.2 u/s, `config/tiers.yaml`'s own calibration
+  constant, against server1's own 135 u/s capacity — the same ~80%
+  utilisation `tests/test_servers_config.py` already checks from the
+  config side) for 6 real seconds, drained, and asserted p99 end-to-end
+  latency under 200ms.
+
+**`make test` — full suite, clean: 1068 passed** (1052 before this phase +
+16 new). `make dev` still runs the original single-process build,
+untouched by this phase.
