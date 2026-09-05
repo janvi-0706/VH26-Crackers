@@ -17,7 +17,7 @@ endif
 
 export PYTHONPATH := src
 
-.PHONY: dev fake test bench config
+.PHONY: dev fake test bench config dev-http server1 server2
 
 # Run the real pipeline: generator -> classifier -> queue -> workers -> sink,
 # FastAPI serving /health, /control/*, and /ws on :8000.
@@ -30,6 +30,28 @@ dev:
 fake:
 	@echo "Using interpreter: $(PY)"
 	$(PY) -m triage.app --fake
+
+# Phase J3: ingress with real HTTP transport (dispatch/ack/redispatch,
+# metrics-fragment reporting) instead of `dev`'s own in-process loopback.
+# Run alongside `make server1` and `make server2` in two other terminals —
+# `dev-http` alone still processes every event itself locally (see
+# app.py's own top docstring: this phase does not yet reroute Engine's
+# pipeline through transport.py), so the three together are what actually
+# demonstrates the split's wire protocol end to end.
+dev-http:
+	@echo "Using interpreter: $(PY)"
+	$(PY) -m triage.app --transport http
+
+# The two downstream servers config/servers.yaml names — real, runnable
+# FastAPI apps (triage.server_app), each deriving its own worker count and
+# per-worker rate from its own declared capacity (servers_config.py).
+server1:
+	@echo "Using interpreter: $(PY)"
+	$(PY) -m triage.server_app --name server1
+
+server2:
+	@echo "Using interpreter: $(PY)"
+	$(PY) -m triage.server_app --name server2
 
 # Print the tier table and re-check the three calibration invariants
 config:

@@ -16,6 +16,21 @@ Stage D: `Engine` also owns the deferred-buffer drainer's lifecycle
 (started alongside the worker pool, stopped alongside it) — the actual
 decision-making (score, pressure, batch vs defer) lives in queue.py and
 worker.py; this file just starts and stops the background tasks.
+
+Phase J3: this process IS "ingress" in the three-process topology
+docs/PHASE-J-INSPECTION.md names — `/ack` and `/metrics/report` below are
+its receiving half of transport.py/reporting.py's own wire protocol, real
+regardless of `--transport`. `--transport` itself only chooses which
+`transport.py` configuration is active (`direct`: a same-process loopback
+deliver, the demo fallback this phase's own prompt asks for; `http`: a
+real pooled `httpx.AsyncClient`, the batcher, and the background
+redispatch sweep) — it does NOT yet reroute `Engine._ingest()`'s own
+generate -> classify -> queue -> worker pipeline through
+`transport.submit()`. That is real, separate scope for a later prompt:
+this phase's own instruction is "implement transport.py and reporting.py
+over HTTP," not "make Engine dispatch through them," and CLAUDE.md's own
+working-style rule ("if you think a later feature is needed now, say so
+and wait") is why that wiring is named here rather than done silently.
 """
 
 from __future__ import annotations
@@ -33,7 +48,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import decision, deferral, ledger, metrics, sink
+from . import decision, deferral, ledger, metrics, reporting, sink, transport
 from .classifier import Classifier
 from .config import Config, load_config
 from .contracts import Event, EventType, MetricsFrame
@@ -337,14 +352,71 @@ def _fake_mode_error(action: str) -> JSONResponse:
     )
 
 
-def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
+class AckBody(BaseModel):
+    """`POST /ack`'s own wire shape — a server never knows ingress's own
+    internal `dispatch_id` (see transport.py's own docstring on
+    `ack_by_event_ids`), only the `event_id`s it actually finished."""
+
+    event_ids: list[str]
+
+
+class MetricsReportBody(BaseModel):
+    """`POST /metrics/report`'s own wire shape — one server instance's own
+    fragment, per reporting.py's `MetricsFragment`."""
+
+    server: str
+    instance_id: str
+    pushed_ts: float
+    counters: dict[str, float] = {}
+
+
+def _make_direct_deliver() -> transport.DeliverFn:
+    """The `--transport=direct` demo fallback's own `deliver`: no HTTP, and
+    no separate process that could die independently of ingress — CLAUDE.md
+    hard rule 1's single failure domain already applies in this mode, so a
+    "delivered" batch is unconditionally acked back immediately rather than
+    waiting on a real downstream completion that, in this mode, is not a
+    separate thing to wait for.
+
+    This governs transport.py's own ambient state for whatever calls
+    `transport.dispatch()`/`submit()` (today: tests, and an operator
+    driving it directly) — it does NOT reroute `Engine._ingest()`'s own
+    pipeline, which keeps processing every event locally regardless of
+    `--transport`, exactly as it did before this phase. See this module's
+    own top docstring for why that wiring is named as separate scope
+    rather than done here.
+    """
+
+    async def _deliver(server: str, events: list[Event]) -> None:
+        await transport.ack_by_event_ids([e.event_id for e in events])
+
+    return _deliver
+
+
+def create_app(
+    *, fake: bool = False, seed: int | None = None, transport_mode: str = "direct"
+) -> FastAPI:
     """Build one FastAPI app in either mode. Kept as a factory (rather than a
-    single module-level app) so tests can construct independent instances."""
+    single module-level app) so tests can construct independent instances.
+
+    `transport_mode` ("direct" or "http") governs transport.py's own
+    ambient configuration for this process acting as ingress — see this
+    module's own top docstring and `_make_direct_deliver`'s own docstring
+    for exactly what it does and does not affect."""
+
+    if transport_mode not in ("direct", "http"):
+        raise ValueError(f"unknown transport_mode: {transport_mode!r}")
 
     fake_source = FakeSource(seed=seed) if fake else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if not fake:
+            if transport_mode == "http":
+                transport.configure_http()
+                await transport.start_http()
+            else:
+                transport.configure(_make_direct_deliver())
         if fake:
             yield
             return
@@ -355,17 +427,56 @@ def create_app(*, fake: bool = False, seed: int | None = None) -> FastAPI:
             yield
         finally:
             await engine.stop()
+            if transport_mode == "http":
+                await transport.stop_http()
 
     app = FastAPI(title="PULSE", lifespan=lifespan)
     app.state.mode = "fake" if fake else "real"
+    app.state.transport_mode = transport_mode
 
     @app.get("/health")
     async def health() -> dict[str, object]:
         return {
             "status": "ok",
             "mode": app.state.mode,
+            "transport": app.state.transport_mode,
             "uptime_s": None if fake else round(metrics.uptime_seconds(), 1),
         }
+
+    @app.post("/ack")
+    async def ack_endpoint(body: AckBody) -> JSONResponse:
+        """A server's own completion signal — see transport.py's own
+        docstring. Not fake-mode-gated: it only ever touches transport.py's
+        ambient state, which is harmless (a no-op on unknown event_ids) to
+        call regardless of engine mode."""
+        await transport.ack_by_event_ids(body.event_ids)
+        return JSONResponse({"status": "ok"})
+
+    @app.post("/metrics/report")
+    async def metrics_report_endpoint(body: MetricsReportBody) -> JSONResponse:
+        """One server instance's own fragment — see reporting.py's own
+        docstring on why this is push, not poll. Not fake-mode-gated for
+        the same reason /ack is not."""
+        reporting.push(
+            reporting.MetricsFragment(
+                server=body.server,
+                instance_id=body.instance_id,
+                pushed_ts=body.pushed_ts,
+                counters=body.counters,
+            )
+        )
+        return JSONResponse({"status": "ok"})
+
+    @app.get("/control/transport-latency")
+    async def get_transport_latency() -> JSONResponse:
+        """Dispatch-to-ack latency, milliseconds — separate from
+        metrics.py's own queue-wait number, per this phase's own
+        instruction (a payment's 200ms SLA leaves only ~60ms of queue
+        budget once transport and simulated service time are subtracted).
+        A new, small, dedicated endpoint rather than a MetricsFrame field
+        — contracts.py is frozen, and GET /control/costmodel already
+        established this exact precedent (Stage I)."""
+        return JSONResponse(transport.latency_percentiles())
 
     @app.post("/control/rate")
     async def control_rate(body: RateBody) -> JSONResponse:
@@ -564,11 +675,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--transport", choices=["direct", "http"], default="direct",
+        help=(
+            "direct (default): same-process loopback, the demo fallback — "
+            "make dev's own unchanged behaviour. http: real pooled HTTP "
+            "dispatch/ack/redispatch against separately-run server1/server2 "
+            "processes (triage.server_app) — see app.py's own top docstring "
+            "for exactly what this does and does not wire up yet."
+        ),
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
 
-    uvicorn.run(create_app(fake=args.fake, seed=args.seed), host=args.host, port=args.port)
+    uvicorn.run(
+        create_app(fake=args.fake, seed=args.seed, transport_mode=args.transport),
+        host=args.host, port=args.port,
+    )
 
 
 if __name__ == "__main__":

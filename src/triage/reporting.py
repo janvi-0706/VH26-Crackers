@@ -2,64 +2,53 @@
 local counters are, once "the pipeline" is no longer one process that can
 just read its own module-level state.
 
-Owner: Lane D (Phase J2).
+Owner: Lane D (Phase J2 interface, Phase J3 real HTTP).
 
 Servers PUSH; ingress never polls. docs/PHASE-J-INSPECTION.md (section 4)
 already named why: server2 can be 1-3 pods behind a Kubernetes Service
 (`config/servers.yaml`'s own `scaling: hpa`), and a poll against that
 Service reaches ONE random pod, never all of them — there is no way to
-poll "every server2 instance" through a Service by construction. A push
-has no such problem: each instance independently sends its own fragment on
-its own schedule (`config/servers.yaml`'s `metrics.push_interval_ms`), and
-ingress simply keeps whatever it has most recently heard from each one.
+poll "every server2 instance" through a Service by construction.
 
-This module is the receiving, aggregating side only — interface only, per
-this phase's own instruction. It does not decide what a server puts in a
-fragment (that is wherever `metrics.py`'s per-tier state ends up living
-post-split, per Phase J1's own inspection) and it does not send anything
-anywhere (there is nothing to send until J3 gives server1/server2 an
-actual process boundary to push across) — it defines the fragment shape,
-and what ingress does with a stream of them: keep the latest one per
-(server, instance), aggregate the live ones into per-server or system-wide
-totals, and age out an instance that has stopped reporting.
+The receiving/aggregating side (`FragmentStore`, `push`/`fragments`/
+`aggregate`/`instance_count`) is unchanged from Phase J2 — same class, same
+functions, same tests. Phase J3 adds the other end of the wire:
 
-Why per-INSTANCE, not per-server: `docs/PHASE-J-INSPECTION.md` section 4
-already worked out that aggregating `processed`/`in_queue`/`in_flight`/
-`sampled_out`/`shed` across N live server2 pods means summing N separate
-numbers, not overwriting one — a fragment keyed only by `"server2"` would
-have each new pod's push silently clobber the last one's contribution
-instead of adding to it. `instance_id` is this module's own answer to that:
-whatever value uniquely identifies the reporting process (a pod name, once
-one exists) is opaque to this module — it is never parsed, only used as a
-dictionary key.
-
-Why `fragment_ttl_ms`, not "trust every fragment forever": the same
-section of the inspection doc named the risk directly — an instance that
-died mid-processing (rescheduled by Kubernetes, or crashed outright) stops
-pushing, and its LAST fragment must eventually stop being counted, or a
-dead pod's stale `in_flight` count would sit in the aggregate forever,
-silently and permanently unbalancing whatever conservation check reads
-it. `aggregate()` below only ever sums fragments younger than
-`fragment_ttl_ms` as of the moment it is called — an instance's
-contribution simply disappears from the total `fragment_ttl_ms`
-milliseconds after its last push, with no separate "instance died" signal
-required. This is a real, known tradeoff, not a hidden one: a genuinely
-live instance whose push happens to be delayed past the TTL (a slow
-network tick, not a death) will ALSO be silently dropped for that one
-aggregation, exactly the "reporting lag looks like loss" problem the
-inspection document flagged and did not solve — `fragment_ttl_ms: 1000`
-against a `push_interval_ms: 250` cadence (four pushes' worth of grace)
-is `config/servers.yaml`'s own answer to keeping that false-drop rate low,
-not a proof it is zero.
+  ReportingClient        a background loop a server runs, calling a
+                         caller-supplied `collect()` on its own
+                         `push_interval_ms` cadence (`config/servers.yaml`)
+                         and POSTing the result to `{ingress_url}/metrics/
+                         report`.
+  default_instance_id()  `POD_NAME` (a real Kubernetes pod identity, once
+                         one exists) if set, else a fresh UUID — this
+                         phase's own instruction, and the reason
+                         `FragmentStore` keys by `(server, instance_id)`
+                         rather than `server` alone in the first place
+                         (Phase J2's own docstring already worked out why
+                         a multi-pod server2 needs that).
+  fragment_from_payload  turns a decoded `POST /metrics/report` JSON body
+                         into a `MetricsFragment` — the one place that
+                         mapping is written, so app.py's real endpoint and
+                         every test's own minimal stand-in for ingress
+                         agree on it by construction rather than by
+                         convention.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
+import httpx
+
 from .servers_config import load_servers_config
+
+logger = logging.getLogger(__name__)
 
 # The counters this project's own conservation equation and dashboard
 # already track per tier (docs/PHASE-J-INSPECTION.md section 4's own
@@ -73,6 +62,14 @@ from .servers_config import load_servers_config
 KNOWN_COUNTER_KEYS: tuple[str, ...] = (
     "processed", "in_queue", "in_flight", "sampled_out", "shed",
 )
+
+
+def default_instance_id() -> str:
+    """`POD_NAME` if this is actually running as a Kubernetes pod (that
+    env var is the standard way a pod's own downward API exposes its
+    name to the container); a fresh UUID otherwise, for local/demo runs
+    where there is no pod at all. This phase's own instruction, verbatim."""
+    return os.environ.get("POD_NAME") or str(uuid.uuid4())
 
 
 @dataclass(frozen=True)
@@ -91,6 +88,23 @@ class MetricsFragment:
     instance_id: str
     pushed_ts: float
     counters: dict[str, float] = field(default_factory=dict)
+
+
+def fragment_from_payload(payload: dict) -> MetricsFragment:
+    """The wire shape a `POST /metrics/report` body arrives in, decoded
+    into a `MetricsFragment`. A plain dict in, not a Pydantic model — see
+    this module's own docstring on why."""
+    return MetricsFragment(
+        server=str(payload["server"]),
+        instance_id=str(payload["instance_id"]),
+        pushed_ts=float(payload["pushed_ts"]),
+        counters={k: float(v) for k, v in payload.get("counters", {}).items()},
+    )
+
+
+def handle_metrics_report_payload(payload: dict) -> None:
+    """What `POST /metrics/report`'s own handler actually calls."""
+    push(fragment_from_payload(payload))
 
 
 class FragmentStore:
@@ -168,6 +182,97 @@ class FragmentStore:
     def reset(self) -> None:
         """Tests only."""
         self._latest.clear()
+
+
+# --------------------------------------------------------------------------
+# The push side — a server's own background loop.
+# --------------------------------------------------------------------------
+
+
+class ReportingClient:
+    """A background loop one server instance runs: every
+    `push_interval_ms`, call `collect()` for this instance's own current
+    counters and POST them to `{ingress_url}/metrics/report`.
+
+    A push failure (ingress briefly unreachable, a transient network
+    error) is logged and otherwise swallowed, never raised out of the
+    loop — a missed push simply means this instance's own fragment ages
+    out `fragment_ttl_ms` after its LAST successful push rather than
+    immediately; that is the intended, documented behaviour (this
+    module's own top docstring), not a bug this class needs to work
+    around by retrying individual pushes. The next scheduled push tries
+    again on its own.
+    """
+
+    def __init__(
+        self,
+        *,
+        server: str,
+        ingress_url: str,
+        collect: Callable[[], dict[str, float]],
+        push_interval_ms: float | None = None,
+        instance_id: str | None = None,
+        client: httpx.AsyncClient | None = None,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        self._server = server
+        self._instance_id = instance_id or default_instance_id()
+        self._ingress_url = ingress_url.rstrip("/")
+        self._collect = collect
+        self._interval_seconds = (
+            push_interval_ms
+            if push_interval_ms is not None
+            else load_servers_config().metrics.push_interval_ms
+        ) / 1000.0
+        self._now = now
+        self._client = client or httpx.AsyncClient(timeout=5.0)
+        self._owns_client = client is None
+        self._task: asyncio.Task[None] | None = None
+        self._stop: asyncio.Event | None = None
+
+    @property
+    def instance_id(self) -> str:
+        return self._instance_id
+
+    def start(self) -> None:
+        self._stop = asyncio.Event()
+        self._task = asyncio.create_task(self._loop(), name=f"pulse-report-{self._server}")
+
+    async def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def _loop(self) -> None:
+        assert self._stop is not None
+        while not self._stop.is_set():
+            await self.push_once()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+    async def push_once(self) -> None:
+        """One push, callable directly (tests use this to avoid waiting
+        out a real `push_interval_ms` in the loop)."""
+        payload = {
+            "server": self._server,
+            "instance_id": self._instance_id,
+            "pushed_ts": self._now(),
+            "counters": self._collect(),
+        }
+        try:
+            response = await self._client.post(
+                f"{self._ingress_url}/metrics/report", json=payload
+            )
+            response.raise_for_status()
+        except Exception:  # noqa: BLE001 - a missed push just ages out at ingress
+            logger.debug("metrics fragment push failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------

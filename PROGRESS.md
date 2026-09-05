@@ -2678,3 +2678,100 @@ still runs the single-process build exactly as before.
 **`make test` — full suite, clean: 1047 passed** (999 before this phase +
 48 new across the three new test files). **`make dev`** starts the
 unchanged single-process build; `src/triage/app.py` was not touched.
+
+## Phase J3 — transport.py and reporting.py over real HTTP
+
+**Built**
+
+- `src/triage/transport.py` (extended, not rewritten) — `dispatch`/`ack`/
+  `outstanding`/`redispatch_expired` keep the exact Phase J2 signatures
+  and contracts; every J2 test still passes unmodified. New:
+  `HttpDeliverer` (one pooled `httpx.AsyncClient` per this phase's own
+  instruction — "one pooled client, not a connection per batch" — POSTing
+  a JSON batch to `{base_url}/ingest`); `Batcher` (accumulates individual
+  `submit()`ed events per server, flushing at `batch_size` (20) events or
+  `batch_window_ms` (10) elapsed, whichever comes first, one background
+  task per server so server1's own cadence never waits on server2's); a
+  background redispatch sweep (every 50ms, calls `redispatch_expired()`);
+  `Transport.ack_by_event_ids()` (a server only ever knows the `event_id`s
+  it finished, never ingress's own internal `dispatch_id` — resolved via
+  a new reverse index); and `Transport.latency_percentiles()` — dispatch-
+  to-ack latency, p50/p95/p99, tracked separately from `metrics.py`'s own
+  queue-wait number per this phase's own instruction (a payment's 200ms
+  SLA leaves only ~60ms of queue budget once transport and simulated
+  service time are subtracted). `configure()` (direct/in-process, Phase
+  J2's original seam) is unchanged and is exactly what `--transport=direct`
+  now uses.
+- `src/triage/reporting.py` (extended) — the J2 receiving/aggregating side
+  (`FragmentStore`, `push`/`fragments`/`aggregate`/`instance_count`) is
+  unchanged. New: `default_instance_id()` (`POD_NAME` env var, falling
+  back to a fresh UUID locally, exactly as specified); `ReportingClient`
+  (a background loop a server runs, POSTing its own fragment to
+  `{ingress_url}/metrics/report` every `push_interval_ms`, swallowing a
+  push failure rather than raising — a missed push just ages out at
+  ingress, which is this module's own already-documented, intended
+  behaviour, not something to retry around); `fragment_from_payload`/
+  `handle_metrics_report_payload` (the one place a decoded wire body
+  becomes a `MetricsFragment`, shared by app.py's real endpoint and every
+  test's own minimal stand-in for ingress, so the two can never disagree
+  about the mapping).
+- `src/triage/server_app.py` (new) — a real, runnable FastAPI app per
+  server (`create_server_app(spec, ...)`), deriving its own worker count
+  and per-worker rate from `servers_config.ServerSpec.workers()` (never a
+  hardcoded shared count, per Phase J2's own rule), simulating each
+  event's cost-model service time (the same mechanism `worker.py` already
+  uses), then POSTing an ack per event back to ingress. Explicitly, and
+  named as such rather than silently done: the sink write inside `/ingest`
+  is still a direct, same-process call to `sink.py` — moving that
+  specific write over the wire to ingress (`docs/PHASE-J-INSPECTION.md`
+  section 3's own durability rule) is real, separate scope this phase's
+  own prompt did not ask for ("implement transport.py and reporting.py
+  over HTTP" names neither sink-forwarding nor `worker.py`'s own decision
+  engine). Runnable via `python -m triage.server_app --name server1`.
+- `src/triage/app.py` — two new endpoints, always active regardless of
+  `--transport` (they only ever touch transport.py/reporting.py's own
+  ambient state): `POST /ack` and `POST /metrics/report`, both wire-format
+  passthroughs to the `handle_*` functions above. `GET /control/
+  transport-latency` (a new, small, dedicated endpoint, matching Stage
+  I's own `/control/costmodel` precedent — `contracts.py` is frozen, so
+  this number does not go on `MetricsFrame`). A new `--transport
+  {direct,http}` CLI flag (default `direct`, unchanged from before this
+  phase) governs which `transport.py` configuration this process runs
+  under: `direct` wires a same-process loopback `deliver` that
+  unconditionally self-acks (CLAUDE.md hard rule 1's single failure
+  domain already applies — there is no separate process for an ack to
+  ever be missing FROM); `http` wires `configure_http()` + `start_http()`
+  (the real client, batcher, and redispatch sweep). Explicitly NOT done in
+  this phase, named rather than silently skipped: `Engine._ingest()`'s own
+  generate -> classify -> queue -> worker pipeline still processes every
+  event locally regardless of `--transport` — rerouting it through
+  `transport.submit()` to genuinely dispatch to separate server1/server2
+  processes is real, separate scope for a later prompt (CLAUDE.md's own
+  working-style rule: "if you think a later feature is needed now, say so
+  and wait").
+- `Makefile` — `make dev-http` (ingress with `--transport http`) and
+  `make server1`/`make server2` (the two downstream processes), alongside
+  the unchanged `make dev`.
+- `tests/test_transport_http.py` (new, 5 tests) — all against
+  `httpx.ASGITransport` (a genuine HTTP request/response cycle, no real
+  socket — the same "deterministic on any machine" reasoning CLAUDE.md
+  hard rule 2 already applies to simulated service time): a full
+  dispatch/ack round trip; **the prompt's own test verbatim** — dispatch
+  1000 events, the consumer "dies" (receives the batch, never processes
+  or acks it), `redispatch_expired()` after `ack_timeout_ms` resends
+  exactly the 1000 still-outstanding events to the now-live consumer,
+  sink ends at exactly 1000 rows, zero duplicates; 10,000 events end to
+  end with zero loss and p99 transport latency under 10ms; a stopped
+  `ReportingClient` ages out of `reporting.aggregate()` within
+  `fragment_ttl_ms` (1 second), with a control test proving a still-live
+  reporter does NOT age out even past that same interval.
+
+**`make test` — full suite, clean: 1052 passed** (1047 before this phase +
+5 new). One known-flaky, pre-existing timing test
+(`test_a_real_gap_opens_between_offered_and_admitted_under_sustained_spike`,
+already named in this file's own Phase J0 entry as timer-sensitive under
+contention) failed once on a loaded machine and passed clean on two
+immediate re-runs — unrelated to this phase's changes (nothing here
+touches `admission.py`, and `--transport` defaults to `direct`, leaving
+`Engine`'s own pipeline byte-for-byte unchanged). **`make dev`** still
+runs the original single-process build unmodified.
