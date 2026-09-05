@@ -43,15 +43,15 @@ export function PressureGaugePanel({ latest }: { latest: MetricsFrame | null }) 
 
   return (
     <Panel title="Pressure" cols={2} accent={hasData ? zone : "neutral"}>
-      <div className="flex h-full flex-col items-center justify-center gap-6">
+      <div className="flex h-full flex-col items-center justify-center gap-3">
         <div
-          className={`font-mono text-8xl font-black leading-none tabular-nums ${
+          className={`font-mono text-5xl font-bold leading-none tabular-nums ${
             hasData ? ZONE_TEXT[zone] : "text-ink-faint"
           }`}
         >
           {hasData ? clamped.toFixed(2) : "—"}
         </div>
-        <div className="relative h-5 w-4/5 overflow-hidden rounded-full bg-surface-raised">
+        <div className="relative h-2 w-4/5 overflow-hidden rounded-full bg-surface-raised">
           <div
             className={`h-full rounded-full transition-[width] duration-150 ${
               hasData ? ZONE_FILL[zone] : "bg-ink-faint"
@@ -66,7 +66,7 @@ export function PressureGaugePanel({ latest }: { latest: MetricsFrame | null }) 
             />
           ))}
         </div>
-        <div className="text-xl font-bold uppercase tracking-widest text-ink-muted">
+        <div className="text-xs font-semibold uppercase tracking-widest text-ink-muted">
           {hasData ? ZONE_LABEL[zone] : "waiting for data"}
         </div>
       </div>

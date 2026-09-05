@@ -21,16 +21,16 @@ export function LadderPanel({ latest }: { latest: MetricsFrame | null }) {
 
   return (
     <Panel title="Ladder rung by tier" cols={2}>
-      <div className="flex h-full flex-col items-center justify-center gap-8">
+      <div className="flex h-full flex-col items-center justify-center gap-3">
         {TIERS.map((tier) => {
           const rung = latest?.ladder_rung[tier] ?? 0;
           const label = RUNG_LABEL[rung] ?? `rung ${rung}`;
           const style = RUNG_STYLE[rung] ?? "border-surface-border text-ink-faint";
           return (
-            <div key={tier} className="flex w-4/5 items-center justify-between gap-4 px-1">
-              <span className="font-mono text-2xl font-bold text-ink-muted">{tier}</span>
+            <div key={tier} className="flex w-full items-center justify-between gap-3 px-2">
+              <span className="font-mono text-sm font-bold text-ink-muted">{tier}</span>
               <span
-                className={`rounded-full border-2 px-5 py-2 text-lg font-bold uppercase tracking-wide ${
+                className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-wide ${
                   hasData ? style : "border-surface-border text-ink-faint"
                 }`}
               >

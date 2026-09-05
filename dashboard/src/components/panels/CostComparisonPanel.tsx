@@ -52,20 +52,20 @@ export function CostComparisonPanel({ latest }: { latest: MetricsFrame | null })
       cols={4}
       headline={ratio > 0 ? `${ratio.toFixed(1)}x` : "—"}
     >
-      <div className="flex h-full flex-col items-center justify-center gap-10">
+      <div className="flex h-full flex-col items-center justify-center gap-5">
         <div className="w-full text-center">
-          <div className="font-mono text-7xl font-black leading-none tabular-nums text-good">
+          <div className="font-mono text-4xl font-bold leading-none tabular-nums text-good">
             ${actualUsd.toFixed(4)}
           </div>
-          <div className="mt-2 text-lg font-bold uppercase tracking-widest text-ink-muted">
+          <div className="mt-1.5 text-xs font-semibold uppercase tracking-widest text-ink-muted">
             our fixed 6 workers
           </div>
         </div>
         <div className="w-full text-center">
-          <div className="font-mono text-7xl font-black leading-none tabular-nums text-bad">
+          <div className="font-mono text-4xl font-bold leading-none tabular-nums text-bad">
             ${naiveUsd.toFixed(4)}
           </div>
-          <div className="mt-2 text-lg font-bold uppercase tracking-widest text-ink-muted">
+          <div className="mt-1.5 text-xs font-semibold uppercase tracking-widest text-ink-muted">
             naive, linearly scaled
           </div>
         </div>

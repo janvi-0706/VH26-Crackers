@@ -147,7 +147,8 @@ export function CostModelPanel() {
             </button>
           ))}
         </div>
-        <div className="min-h-0 flex-1">
+        <div className="flex min-h-0 flex-1 items-center justify-center">
+        <div className="h-full max-h-[380px] w-full">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -12 }}>
               <CartesianGrid stroke="#232a3b" strokeDasharray="3 3" vertical={false} />
@@ -195,6 +196,7 @@ export function CostModelPanel() {
               />
             </LineChart>
           </ResponsiveContainer>
+        </div>
         </div>
       </div>
     </Panel>

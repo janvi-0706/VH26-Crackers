@@ -48,48 +48,52 @@ export function RatesPanel({ history }: { history: MetricsFrame[] }) {
       cols={4}
       headline={latest ? `gap ${formatRate(Math.max(0, latest.offered_rate - latest.admitted_rate))}` : "—"}
     >
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -12 }}>
-          <CartesianGrid stroke="#232a3b" strokeDasharray="3 3" vertical={false} />
-          <XAxis
-            dataKey="t"
-            tickFormatter={formatSecondsAgo}
-            stroke="#5b6478"
-            fontSize={11}
-            tickLine={false}
-          />
-          <YAxis
-            stroke="#5b6478"
-            fontSize={11}
-            tickLine={false}
-            width={44}
-            tickFormatter={(v: number) => formatRate(v)}
-          />
-          <Tooltip
-            contentStyle={{
-              background: "#12161f",
-              border: "1px solid #232a3b",
-              borderRadius: 8,
-              fontSize: 12,
-            }}
-            labelFormatter={(t) => `${formatSecondsAgo(t as number)} ago`}
-            formatter={(value: number, name: string) => [formatRate(value), name]}
-          />
-          <Legend wrapperStyle={{ fontSize: 12, color: "#8b93a7" }} />
-          {(["offered", "admitted", "service"] as const).map((key) => (
-            <Line
-              key={key}
-              type="monotone"
-              dataKey={key}
-              name={key}
-              stroke={SERIES_COLOR[key]}
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-            />
-          ))}
-        </LineChart>
-      </ResponsiveContainer>
+      <div className="flex h-full items-center justify-center">
+        <div className="h-full max-h-[380px] w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={points} margin={{ top: 4, right: 8, bottom: 0, left: -12 }}>
+              <CartesianGrid stroke="#232a3b" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="t"
+                tickFormatter={formatSecondsAgo}
+                stroke="#5b6478"
+                fontSize={11}
+                tickLine={false}
+              />
+              <YAxis
+                stroke="#5b6478"
+                fontSize={11}
+                tickLine={false}
+                width={44}
+                tickFormatter={(v: number) => formatRate(v)}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: "#12161f",
+                  border: "1px solid #232a3b",
+                  borderRadius: 8,
+                  fontSize: 12,
+                }}
+                labelFormatter={(t) => `${formatSecondsAgo(t as number)} ago`}
+                formatter={(value: number, name: string) => [formatRate(value), name]}
+              />
+              <Legend wrapperStyle={{ fontSize: 12, color: "#8b93a7" }} />
+              {(["offered", "admitted", "service"] as const).map((key) => (
+                <Line
+                  key={key}
+                  type="monotone"
+                  dataKey={key}
+                  name={key}
+                  stroke={SERIES_COLOR[key]}
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
     </Panel>
   );
 }
