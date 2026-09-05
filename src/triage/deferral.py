@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Callable
 
 from .contracts import Event, Tier
+from .pg_compat import is_postgres
 
 DEFERRED_BUFFER_DDL = """
 CREATE TABLE IF NOT EXISTS deferred_buffer (
@@ -50,6 +51,39 @@ CREATE TABLE IF NOT EXISTS deferred_buffer (
     deadline_ts REAL NOT NULL,
     deferred_ts REAL NOT NULL,
     ready_at REAL NOT NULL,
+    defer_reason TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'local' CHECK (origin IN ('local', 'server2'))
+);
+CREATE INDEX IF NOT EXISTS idx_deferred_ready_priority
+    ON deferred_buffer (ready_at, tier, deadline_ts, seq);
+CREATE INDEX IF NOT EXISTS idx_deferred_partition_seq
+    ON deferred_buffer (partition_key, seq);
+CREATE INDEX IF NOT EXISTS idx_deferred_deadline
+    ON deferred_buffer (deadline_ts);
+CREATE INDEX IF NOT EXISTS idx_deferred_origin_ready
+    ON deferred_buffer (origin, ready_at);
+"""
+
+# Postgres (Supabase) mirror of DEFERRED_BUFFER_DDL — see pg_compat.py's
+# own top docstring for the hand-written-sibling reasoning. `defer_id
+# INTEGER PRIMARY KEY` relies on SQLite's own implicit rowid-alias
+# autoincrement (`defer()` never supplies it) — `BIGSERIAL PRIMARY KEY`
+# is the real Postgres equivalent.
+DEFERRED_BUFFER_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS deferred_buffer (
+    defer_id BIGSERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    dedup_key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    partition_key TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P1', 'P2')),
+    deadline_ts DOUBLE PRECISION NOT NULL,
+    deferred_ts DOUBLE PRECISION NOT NULL,
+    ready_at DOUBLE PRECISION NOT NULL,
     defer_reason TEXT NOT NULL,
     event_json TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
@@ -143,7 +177,9 @@ class DeferralStore:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(DEFERRED_BUFFER_DDL)
+        self.connection.executescript(
+            DEFERRED_BUFFER_DDL_POSTGRES if is_postgres(self.connection) else DEFERRED_BUFFER_DDL
+        )
         self.connection.commit()
 
         self._pending_count = self._count_rows()

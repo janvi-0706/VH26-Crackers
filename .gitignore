@@ -33,3 +33,7 @@ npm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Secrets — never commit
+.env
+.env.*

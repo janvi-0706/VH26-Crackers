@@ -43,8 +43,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from . import deferral, ledger, sink
+from .pg_compat import is_postgres, open_connection
 
 logger = logging.getLogger(__name__)
 
@@ -58,26 +60,42 @@ logger = logging.getLogger(__name__)
 BUSY_TIMEOUT_MS = 5000
 
 
-def open_history_db(path: str | Path) -> sqlite3.Connection:
+def open_history_db(path: str | Path) -> Any:
     """Open (or create) the one shared connection every durable table in
-    this process writes through. `check_same_thread=False` matches every
-    other SQLite connection already in this codebase (sink.py, ledger.py,
+    this process writes through, from whatever `path` actually names.
+
+    `path` may be a local filesystem path (SQLite, this module's own
+    original behaviour) OR a `postgres://`/`postgresql://` URL (Supabase,
+    or any Postgres) — `pg_compat.open_connection()`'s own dispatch by
+    scheme. This function does NOT read `DATABASE_URL`/`.env` itself and
+    never silently overrides an explicit `path` with one — a test (or any
+    caller) that explicitly asks for a specific local SQLite file must
+    get exactly that file, regardless of what happens to be sitting in
+    the ambient environment. `app.py`'s own `--persist` startup code is
+    where `pg_compat.database_url()` is actually consulted, to decide
+    WHICH string to pass in here in the first place — see that call site
+    for the real opt-in logic.
+
+    `check_same_thread=False` (SQLite path only) matches every other
+    SQLite connection already in this codebase (sink.py, ledger.py,
     deferral.py) — this project's own single-event-loop, single-process
     model (CLAUDE.md hard rule 1) means "same thread" was never the real
     safety property anyway; what actually matters is that every write
     happens on the one asyncio event loop, which none of these modules'
-    own callers ever violate.
+    own callers ever violate. WAL mode and `busy_timeout` are SQLite-only
+    concepts (this module's own top docstring covers why they exist) —
+    skipped entirely for a Postgres connection, which has no equivalent
+    PRAGMA and needs none (Supabase's own server handles concurrent
+    readers without this process asking it to).
     """
-    path = Path(path)
-    if str(path) != ":memory:":
-        path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path), check_same_thread=False)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    connection = open_connection(str(path))
+    if not is_postgres(connection):
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     return connection
 
 
-def wire_ambient_stores(connection: sqlite3.Connection) -> None:
+def wire_ambient_stores(connection: Any) -> None:
     """Point sink.py/ledger.py/deferral.py's own ambient defaults at ONE
     shared connection instead of each module's own separate `:memory:`
     default. Called once, at real-mode ingress startup with `--persist` —

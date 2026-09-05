@@ -20,6 +20,12 @@ dev = [
     "pytest-asyncio>=0.23",
     "httpx>=0.27",  # transport for FastAPI's TestClient
 ]
+# Only needed when DATABASE_URL points at a real Postgres/Supabase
+# instance (pg_compat.py imports psycopg2 lazily, inside PGConnection
+# itself, specifically so the base install/demo never needs this).
+postgres = [
+    "psycopg2-binary>=2.9",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

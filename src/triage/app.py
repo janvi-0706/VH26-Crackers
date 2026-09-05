@@ -70,7 +70,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import decision, deferral, history_db, ledger, metrics, reporting, sink, transport
+from . import decision, deferral, history_db, ledger, metrics, pg_compat, reporting, sink, transport
 from .classifier import Classifier
 from .config import Config, load_config
 from .contracts import Decision, DecisionTrace, Event, EventType, MetricsFrame, ShedRecord, Tier
@@ -830,9 +830,17 @@ def create_app(
         server2_drain_task: asyncio.Task[None] | None = None
         if not fake:
             if persist:
-                history_connection = history_db.open_history_db(
-                    load_servers_config().ingress.history_db
-                )
+                # DATABASE_URL (.env or the real environment — see
+                # pg_compat.database_url()'s own precedence) wins when set:
+                # the history database lives in Supabase for this run.
+                # Otherwise fall back to config/servers.yaml's own local
+                # SQLite path. This decision belongs HERE, not inside
+                # history_db.open_history_db() itself — that function
+                # must always open exactly what it is told, never
+                # override an explicit caller argument based on ambient
+                # environment (see its own docstring).
+                history_target = pg_compat.database_url() or load_servers_config().ingress.history_db
+                history_connection = history_db.open_history_db(history_target)
                 history_db.wire_ambient_stores(history_connection)
             if transport_mode == "http":
                 transport.configure_http()

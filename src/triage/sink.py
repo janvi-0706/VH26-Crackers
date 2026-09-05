@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .contracts import SCHEMA_VERSION, Event
 from .ladder import Rollup
+from .pg_compat import is_postgres
 
 EVENTS_SINK_DDL = """
 CREATE TABLE IF NOT EXISTS events_sink (
@@ -49,6 +50,35 @@ CREATE INDEX IF NOT EXISTS idx_events_sink_committed_ts
     ON events_sink (committed_ts);
 """
 
+# Postgres (Supabase) mirror of EVENTS_SINK_DDL — see pg_compat.py's own
+# top docstring for why this is a hand-written sibling, not an automatic
+# translation. `TEXT PRIMARY KEY` needs no change (the app always supplies
+# `idempotency_key` itself); `REAL` becomes `DOUBLE PRECISION` (SQLite's
+# own REAL is always 8-byte, matching Postgres's DOUBLE PRECISION, not
+# Postgres's own 4-byte REAL).
+EVENTS_SINK_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS events_sink (
+    idempotency_key TEXT PRIMARY KEY,
+    dedup_key TEXT NOT NULL,
+    latest_event_id TEXT NOT NULL,
+    latest_seq INTEGER NOT NULL,
+    partition_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    payload_json TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    first_ingest_ts DOUBLE PRECISION NOT NULL,
+    committed_ts DOUBLE PRECISION NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1)
+);
+CREATE INDEX IF NOT EXISTS idx_events_sink_dedup_key
+    ON events_sink (dedup_key);
+CREATE INDEX IF NOT EXISTS idx_events_sink_partition_seq
+    ON events_sink (partition_key, latest_seq);
+CREATE INDEX IF NOT EXISTS idx_events_sink_committed_ts
+    ON events_sink (committed_ts);
+"""
+
 ROLLUPS_DDL = """
 CREATE TABLE IF NOT EXISTS rollups (
     rollup_id TEXT PRIMARY KEY,
@@ -61,6 +91,30 @@ CREATE TABLE IF NOT EXISTS rollups (
     seq_low INTEGER NOT NULL,
     seq_high INTEGER NOT NULL CHECK (seq_high >= seq_low),
     created_ts REAL NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rollups_type_window
+    ON rollups (event_type, window_start, window_end);
+CREATE INDEX IF NOT EXISTS idx_rollups_seq_coverage
+    ON rollups (seq_low, seq_high);
+CREATE INDEX IF NOT EXISTS idx_rollups_window
+    ON rollups (window_start DESC, window_end DESC);
+"""
+
+# Postgres (Supabase) mirror of ROLLUPS_DDL — same reasoning as
+# EVENTS_SINK_DDL_POSTGRES above.
+ROLLUPS_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS rollups (
+    rollup_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    window_start DOUBLE PRECISION NOT NULL,
+    window_end DOUBLE PRECISION NOT NULL CHECK (window_end > window_start),
+    sample_weight DOUBLE PRECISION NOT NULL CHECK (sample_weight >= 1.0),
+    observed_count INTEGER NOT NULL CHECK (observed_count >= 0),
+    subtype_counts TEXT NOT NULL,
+    seq_low INTEGER NOT NULL,
+    seq_high INTEGER NOT NULL CHECK (seq_high >= seq_low),
+    created_ts DOUBLE PRECISION NOT NULL,
     schema_version INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rollups_type_window
@@ -103,6 +157,32 @@ CREATE INDEX IF NOT EXISTS idx_sla_outcomes_source_ts
     ON sla_outcomes (source, recorded_ts DESC);
 """
 
+# Postgres (Supabase) mirror of SLA_OUTCOMES_DDL. `outcome_id INTEGER
+# PRIMARY KEY` relies on SQLite's own implicit rowid-alias autoincrement
+# (write_outcome() never supplies it) — `BIGSERIAL PRIMARY KEY` is the
+# real Postgres equivalent, not a text substitution pg_compat.py could
+# have done automatically (see that module's own top docstring).
+SLA_OUTCOMES_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS sla_outcomes (
+    outcome_id BIGSERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    event_type TEXT NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    met INTEGER NOT NULL CHECK (met IN (0, 1)),
+    latency_ms DOUBLE PRECISION NOT NULL,
+    recorded_ts DOUBLE PRECISION NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('ingress', 'server1', 'server2'))
+);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_tier_met_ts
+    ON sla_outcomes (tier, met, recorded_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_event_id
+    ON sla_outcomes (event_id);
+CREATE INDEX IF NOT EXISTS idx_sla_outcomes_source_ts
+    ON sla_outcomes (source, recorded_ts DESC);
+"""
+
 
 class SQLiteSink:
     """Persist the latest successful delivery for each business operation.
@@ -127,9 +207,10 @@ class SQLiteSink:
         self.initialize()
 
     def initialize(self) -> None:
-        self.connection.executescript(EVENTS_SINK_DDL)
-        self.connection.executescript(ROLLUPS_DDL)
-        self.connection.executescript(SLA_OUTCOMES_DDL)
+        pg = is_postgres(self.connection)
+        self.connection.executescript(EVENTS_SINK_DDL_POSTGRES if pg else EVENTS_SINK_DDL)
+        self.connection.executescript(ROLLUPS_DDL_POSTGRES if pg else ROLLUPS_DDL)
+        self.connection.executescript(SLA_OUTCOMES_DDL_POSTGRES if pg else SLA_OUTCOMES_DDL)
         self.connection.commit()
 
     def write(self, event: Event) -> bool:

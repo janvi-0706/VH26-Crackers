@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .contracts import Decision, DecisionTrace, Tier
+from .pg_compat import is_postgres
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,31 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
         ('STREAM_NOW', 'MICRO_BATCH', 'DEFER', 'SAMPLE_ROLLUP', 'SHED')),
     reason TEXT NOT NULL,
     pressure REAL NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    prev_hash TEXT NOT NULL,
+    row_hash TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ledger_seq
+    ON audit_ledger (seq);
+CREATE INDEX IF NOT EXISTS idx_audit_ledger_tier_decision_ts
+    ON audit_ledger (tier, decision, recorded_ts DESC);
+"""
+
+# Postgres (Supabase) mirror of AUDIT_LEDGER_DDL — see pg_compat.py's own
+# top docstring for the hand-written-sibling reasoning. `ledger_id
+# INTEGER PRIMARY KEY` needs no BIGSERIAL here (unlike decision_traces
+# below): `record()` always supplies `ledger_id` explicitly from its own
+# `_next_id` counter, never relying on SQLite's implicit autoincrement —
+# `BIGINT PRIMARY KEY` is the exact Postgres equivalent of that.
+AUDIT_LEDGER_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS audit_ledger (
+    ledger_id BIGINT PRIMARY KEY,
+    recorded_ts DOUBLE PRECISION NOT NULL,
+    seq INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN
+        ('STREAM_NOW', 'MICRO_BATCH', 'DEFER', 'SAMPLE_ROLLUP', 'SHED')),
+    reason TEXT NOT NULL,
+    pressure DOUBLE PRECISION NOT NULL,
     tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
     prev_hash TEXT NOT NULL,
     row_hash TEXT NOT NULL UNIQUE
@@ -144,6 +170,31 @@ CREATE TABLE IF NOT EXISTS decision_traces (
     reason TEXT NOT NULL,
     pressure REAL NOT NULL,
     value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_recent
+    ON decision_traces (recorded_ts DESC, trace_id DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_tier_decision_ts
+    ON decision_traces (tier, decision, recorded_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_traces_event_id
+    ON decision_traces (event_id);
+"""
+
+# Postgres (Supabase) mirror of DECISION_TRACES_DDL. `trace_id INTEGER
+# PRIMARY KEY` relies on SQLite's implicit autoincrement (record_trace()
+# never supplies it) — `BIGSERIAL PRIMARY KEY` is the real equivalent.
+DECISION_TRACES_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS decision_traces (
+    trace_id BIGSERIAL PRIMARY KEY,
+    recorded_ts DOUBLE PRECISION NOT NULL,
+    seq INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    tier TEXT NOT NULL CHECK (tier IN ('P0', 'P1', 'P2')),
+    decision TEXT NOT NULL CHECK (decision IN
+        ('STREAM_NOW', 'MICRO_BATCH', 'DEFER', 'SAMPLE_ROLLUP', 'SHED')),
+    reason TEXT NOT NULL,
+    pressure DOUBLE PRECISION NOT NULL,
+    value DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decision_traces_recent
     ON decision_traces (recorded_ts DESC, trace_id DESC);
@@ -247,8 +298,9 @@ class SQLiteLedger:
                 Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(AUDIT_LEDGER_DDL)
-        self.connection.executescript(DECISION_TRACES_DDL)
+        pg = is_postgres(self.connection)
+        self.connection.executescript(AUDIT_LEDGER_DDL_POSTGRES if pg else AUDIT_LEDGER_DDL)
+        self.connection.executescript(DECISION_TRACES_DDL_POSTGRES if pg else DECISION_TRACES_DDL)
         self.connection.commit()
 
         self._last_hash = self._load_last_hash()
