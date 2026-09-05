@@ -1,0 +1,106 @@
+# PULSE — the three-process topology (Phase J). Read by
+# triage.servers_config, alongside config/tiers.yaml (unchanged, still the
+# single source of truth for the event taxonomy itself).
+#
+# This file describes CAPACITY, not worker counts. 135 u/s (server1) and
+# 15 u/s/pod (server2) do not divide evenly into any shared "N equal
+# workers" template the way the single-process build's 6 x 25 u/s did —
+# on purpose, so a real capacity number can be assigned to each process
+# without being distorted to fit a worker count picked for a different
+# process. triage.servers_config derives each server's own worker count
+# and per-worker rate FROM its capacity, independently, rather than the
+# other way around (see that module's own docstring).
+#
+# capacity_us / capacity_us_per_pod are in the same unit as
+# tiers.yaml's own cost column: work-units/sec, this project's one
+# invented currency for simulated service time (CLAUDE.md hard rule 2).
+
+ingress:
+  port: 8000
+  # Where the durable state Phase J's own inspection (docs/PHASE-J-
+  # INSPECTION.md, section 3) says must live in exactly one place actually
+  # lives once ingress is a real, separate process. Not created or opened
+  # by anything in this phase — J2 is interface-only.
+  history_db: data/history.db
+
+server1:
+  port: 8001
+  tiers: [P0]
+  # Fixed, not derived from spike demand with headroom to spare the way
+  # server2's ceiling is (see server2's own comment) — P0's whole
+  # protection story is "P0 demand at spike (~108.2 u/s, tiers.yaml's own
+  # calibration constant) sits comfortably under capacity", and 135 u/s
+  # keeps that at ~80% utilisation, matching the ~72% headroom the current
+  # single-process 150 u/s pool already runs at (108.2/150) closely enough
+  # that P0's demonstrated behaviour does not change character across the
+  # split.
+  capacity_us: 135
+  # No MICRO_BATCH for P0 in the split topology — batching amortises a
+  # fixed per-batch overhead across multiple events (decision.batch_cost's
+  # own arithmetic), which trades a small latency cost for throughput.
+  # P0's entire SLA budget (200ms for payment) is the one thing this whole
+  # project refuses to trade against; CLAUDE.md hard rule 3 already forbids
+  # ever batching P0 in the current single-process build (decide() returns
+  # STREAM_NOW for P0 unconditionally, before pressure is even consulted)
+  # — this field makes that a config-level fact about server1 as a whole
+  # process, not only a per-decision guarantee.
+  batching: false
+  # Never autoscaled — see the calibration tests in
+  # tests/test_servers_config.py for exactly why this has to stay fixed:
+  # P0 must never compete for capacity that HPA could take away or add
+  # back on a schedule outside this project's own control.
+  scaling: fixed
+
+server2:
+  port: 8002
+  tiers: [P1, P2]
+  # Per-pod, not total — server2 is the one process HPA is allowed to
+  # scale (below), so its capacity is expressed as "what one pod provides"
+  # and the live total is min_pods..max_pods times this number.
+  capacity_us_per_pod: 15
+  # MICRO_BATCH is real amortised savings for P1/P2 (decision.batch_cost's
+  # own worked numbers: a 4-item inventory batch is ~54% cheaper than
+  # streaming each individually) with no P0-style SLA reason to forbid it
+  # — P1's own SLA (5s) and P2's (30-60s) both have real slack to spend on
+  # a fixed per-batch overhead the way P0's 200ms/500ms do not.
+  batching: true
+  scaling: hpa
+  min_pods: 1
+  # 3, not more: at 3 pods server2's own ceiling is 45 u/s
+  # (capacity_us_per_pod x max_pods), and 135 + 45 = 180 u/s total system
+  # capacity against ~288 u/s of total demand at a 20x spike
+  # (tiers.yaml's own calibration constant) — a 1.6x oversubscription that
+  # stays real regardless of how aggressively HPA scales server2 within
+  # this ceiling. See tests/test_servers_config.py's own docstring on
+  # test_server2_max_pods_caps_total_capacity_so_the_spike_stays_
+  # oversubscribed for why this specific number is load-bearing, not a
+  # rounded-off convenience: a higher ceiling here would let HPA
+  # eventually catch up to the spike, and the whole reason this project's
+  # decision engine has anything to do would quietly stop being true.
+  max_pods: 3
+
+# Batched HTTP between the three processes (docs/PHASE-J-INSPECTION.md,
+# section 3, on why this can't be one call per event on P0's own hot
+# path). Interface-only in this phase — triage.transport implements the
+# dispatch/ack/timeout SHAPE described below against direct, in-process
+# calls; an actual HTTP client lands in J3 without this module's own
+# public functions changing.
+transport:
+  batch_size: 20
+  batch_window_ms: 10
+  timeout_ms: 500
+  # How long ingress waits for an ack before treating a dispatch as lost
+  # and re-sending it. Idempotency keys (docs/DATA_MODEL.md's own identity
+  # model, unchanged by this phase) are what make a redundant re-dispatch
+  # safe rather than a double-charge: sink.py's own upsert-by-
+  # idempotency_key absorbs a genuine duplicate completion for free.
+  ack_timeout_ms: 5000
+
+# How often each server pushes its own metrics fragment to ingress
+# (triage.reporting), and how long ingress trusts a fragment it has not
+# heard a fresher one for. Push, not poll — docs/PHASE-J-INSPECTION.md
+# section 4 already names why: a Kubernetes Service in front of server2's
+# (possibly 3) pods hands a poll to a random one, never all of them.
+metrics:
+  push_interval_ms: 250
+  fragment_ttl_ms: 1000

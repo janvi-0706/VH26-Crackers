@@ -2604,3 +2604,77 @@ question (pressure's home, ledger write-ordering under two writers,
 deferral-forwarding's actual shape, live control-value propagation for
 mode/weights) is flagged in the document itself as unresolved rather than
 picked implicitly by how the inspection was written.
+
+## Phase J2 — boundaries and config, behaviour unchanged
+
+Smallest interfaces only, per this prompt's own instruction — no plugin
+system, no service registry. `src/triage/app.py` is untouched; `make dev`
+still runs the single-process build exactly as before.
+
+**Built**
+
+- `config/servers.yaml` (new) — the three-process topology: ingress
+  (port, `history_db` path), server1 (P0, `capacity_us: 135`, fixed,
+  never batched), server2 (P1/P2, `capacity_us_per_pod: 15`, hpa,
+  `min_pods: 1`, `max_pods: 3`, batched), plus `transport` (batch size 20,
+  10ms window, 500ms call timeout, 5000ms ack timeout) and `metrics`
+  (250ms push interval, 1000ms fragment TTL) sections, exactly as
+  specified.
+- `src/triage/servers_config.py` (new) — the loader, mirroring
+  `config.py`'s own `load_config()` pattern (cached, `PULSE_SERVERS_
+  CONFIG` env override, structural validation that fails loudly rather
+  than silently mis-provisioning: server1 must be `fixed`, the two
+  servers must partition every `Tier` with no gaps or overlap, a `fixed`
+  server must not declare `capacity_us_per_pod` and vice versa). The
+  prompt's own instruction — "do not express the split as a count of
+  equal workers, 135/15 does not divide into six" — is `derive_workers()`:
+  given a server's own capacity and a reference per-worker rate (borrowed
+  from `tiers.yaml`'s existing `worker_capacity_ups`, 25 u/s, not
+  re-declared), it computes the smallest whole worker count whose combined
+  rate exactly reconstructs that capacity — 6 workers x 22.5 u/s for
+  server1, 1 worker x 15 u/s per pod for server2 — independently derived,
+  never forced to share a count.
+- `tests/test_servers_config.py` (new, 22 tests) — the three load-bearing
+  assertions the prompt names verbatim (`server1.capacity_us == 135` at
+  ~80% P0 utilisation against the real calibrated spike demand;
+  `server1.scaling == "fixed"`; `server2.max_pods == 3`, checked against
+  the actual system ceiling of 180 u/s and the real ~1.6x oversubscription
+  it leaves against ~288 u/s of total spike demand — its own docstring
+  states plainly why this is "the test that protects the entire
+  experiment"), plus worker-derivation and structural-validation coverage.
+- `src/triage/transport.py` (new) — `dispatch`/`ack`/`outstanding`/
+  `redispatch_expired`, exactly the four functions specified. Implemented
+  against the current in-process build as a constructor-injected `deliver`
+  callable (matching `WorkerPool`'s own `sink_write`/`defer` injection
+  precedent) rather than a hardcoded destination — the ambient default
+  raises loudly if used before `configure()` wires up a real delivery
+  function, rather than silently dropping events. Dispatch records a
+  timestamp per batch; `ack` supports partial acknowledgement (removing
+  specific `event_ids` from a batch, not just clearing the whole thing);
+  `redispatch_expired` re-sends whatever remains unacked past
+  `ack_timeout_ms` as a brand-new dispatch, so a late ack against the
+  superseded old `dispatch_id` is correctly a no-op. HTTP is explicitly
+  named as J3's own swap-in for `deliver` — this module's four functions
+  and their tests do not change when that happens.
+- `tests/test_transport.py` (new, 16 tests) — dispatch/ack/partial-ack/
+  timeout/redispatch, a fake clock for deterministic timeout testing, and
+  the ambient `configure()`/`reset_default()` seam.
+- `src/triage/reporting.py` (new) — the metrics-fragment push/aggregate
+  interface: `MetricsFragment(server, instance_id, pushed_ts, counters)`,
+  `push()`, `fragments()`, `aggregate()`, `instance_count()`. Keyed by
+  `(server, instance_id)` specifically because
+  `docs/PHASE-J-INSPECTION.md` section 4 already worked out that a
+  multi-pod server2 needs its instances SUMMED, not overwritten — keying
+  by server alone would let each new pod's push clobber the last one's
+  contribution. `fragment_ttl_ms` answers that same document's staleness
+  question: an instance that stops pushing (dead, rescheduled) ages out
+  of the aggregate on its own, with the known, stated tradeoff that a
+  merely-slow-but-alive push is indistinguishable from a dead one once it
+  passes the same TTL.
+- `tests/test_reporting.py` (new, 15 tests) — push/replace/out-of-order,
+  multi-instance summation, per-key partial reporting, TTL expiry via a
+  fake clock, and the ambient default.
+
+**`make test` — full suite, clean: 1047 passed** (999 before this phase +
+48 new across the three new test files). **`make dev`** starts the
+unchanged single-process build; `src/triage/app.py` was not touched.
