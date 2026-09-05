@@ -143,6 +143,10 @@ def test_verify_chain_reports_the_first_break_not_a_later_one():
 
 
 def test_export_csv_has_a_header_and_one_row_per_record():
+    """Header text is the friendly `CSV_HEADER_LABELS` (Phase J8's own
+    live-demo readability fix — a raw Unix `recorded_ts` float meant
+    nothing to a person opening this in a spreadsheet), not the raw,
+    DB-facing `CSV_COLUMNS` names `verify_chain()` still reads by."""
     store = SQLiteLedger()
     for i in range(3):
         store.record(i, Decision.DEFER, f"reason {i}", 0.6, Tier.P1, now=1000.0 + i)
@@ -150,10 +154,13 @@ def test_export_csv_has_a_header_and_one_row_per_record():
     reader = csv.reader(io.StringIO(text))
     rows = list(reader)
     assert rows[0] == [
-        "ledger_id", "recorded_ts", "seq", "decision", "reason",
-        "pressure", "tier", "prev_hash", "row_hash",
+        "Entry ID", "Recorded At (UTC)", "Event Sequence", "Decision", "Reason",
+        "System Pressure", "Priority Tier", "Previous Row Hash", "Row Hash",
     ]
     assert len(rows) == 4  # header + 3 records
+    # recorded_ts is reformatted to a readable UTC string, not the raw
+    # Unix float — same column, same position, just a human-readable value.
+    assert rows[1][1] == "1970-01-01 00:16:40.000000 UTC"  # 1000.0s since epoch
 
 
 def test_export_csv_of_an_empty_ledger_is_just_the_header():

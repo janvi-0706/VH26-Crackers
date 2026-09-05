@@ -46,6 +46,7 @@ import logging
 import sqlite3
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -80,6 +81,43 @@ CSV_COLUMNS = (
     "ledger_id", "recorded_ts", "seq", "decision", "reason",
     "pressure", "tier", "prev_hash", "row_hash",
 )
+
+# `CSV_COLUMNS` above is the raw, DB-facing column order — unchanged, and
+# never itself exposed to a human reader: `verify_chain()`/`rows()` read
+# by these exact names, and changing them would be a real schema change,
+# not a presentation one. `CSV_HEADER_LABELS` is `export_csv()`'s own,
+# separate, purely cosmetic header row — same 9 columns, same order, same
+# underlying values (the hash columns are untouched, still the literal
+# hex `verify_chain()` can re-derive), just named for a human opening this
+# in a spreadsheet rather than for a program reading the SQLite schema.
+CSV_HEADER_LABELS: dict[str, str] = {
+    "ledger_id": "Entry ID",
+    "recorded_ts": "Recorded At (UTC)",
+    "seq": "Event Sequence",
+    "decision": "Decision",
+    "reason": "Reason",
+    "pressure": "System Pressure",
+    "tier": "Priority Tier",
+    "prev_hash": "Previous Row Hash",
+    "row_hash": "Row Hash",
+}
+
+
+def _csv_cell(column: str, value: Any) -> Any:
+    """`export_csv()`'s own per-cell formatting — presentation only, never
+    fed back into `_canonical_bytes()`/`verify_chain()` (those read
+    straight from `self.rows()`, the real SQLite row, not from this CSV).
+    `recorded_ts` is the one column reformatted: a raw Unix float
+    (`1788592932.06...`) means nothing to a person opening this in a
+    spreadsheet, and Excel/Sheets will not recognise it as a date on its
+    own — an ISO-8601 UTC string sorts identically (lexicographic order
+    matches chronological order) and is immediately readable. Every other
+    column's own value is untouched, including both hash columns."""
+    if column == "recorded_ts":
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S.%f UTC"
+        )
+    return value
 
 # Phase J6: the durable half of decision_traces, per docs/DATA_MODEL.md
 # section 4 — that DDL has named this table since Stage E's own data-model
@@ -334,12 +372,15 @@ class SQLiteLedger:
         """The whole durable ledger, CSV, header first — GET /audit.csv's
         own body. `csv.writer` handles quoting a `reason` string that
         happens to contain a comma or a newline; hand-joining columns with
-        `,` would not."""
+        `,` would not. Header text and the `recorded_ts` cell's own
+        formatting are `CSV_HEADER_LABELS`/`_csv_cell()`'s own job —
+        cosmetic only; the column ORDER and every other value are exactly
+        `CSV_COLUMNS`/`self.rows()`, unchanged."""
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(CSV_COLUMNS)
+        writer.writerow(CSV_HEADER_LABELS[col] for col in CSV_COLUMNS)
         for row in self.rows():
-            writer.writerow(row[col] for col in CSV_COLUMNS)
+            writer.writerow(_csv_cell(col, row[col]) for col in CSV_COLUMNS)
         return buffer.getvalue()
 
     def close(self) -> None:

@@ -810,7 +810,7 @@ def test_get_audit_csv_returns_the_real_ledger_content():
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/csv")
     lines = resp.text.strip().splitlines()
-    assert lines[0] == "ledger_id,recorded_ts,seq,decision,reason,pressure,tier,prev_hash,row_hash"
+    assert lines[0] == "Entry ID,Recorded At (UTC),Event Sequence,Decision,Reason,System Pressure,Priority Tier,Previous Row Hash,Row Hash"
     assert len(lines) > 1, "a real spike must have produced at least one ledger row"
 
 
@@ -819,7 +819,7 @@ def test_get_audit_csv_works_even_in_fake_mode():
     with TestClient(app) as client:
         resp = client.get("/audit.csv")
     assert resp.status_code == 200
-    assert resp.text.strip().splitlines()[0].startswith("ledger_id,")
+    assert resp.text.strip().splitlines()[0].startswith("Entry ID,")
 
 
 def test_get_audit_trace_returns_a_real_trace_by_event_id():
