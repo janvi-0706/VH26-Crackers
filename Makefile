@@ -42,12 +42,12 @@ dev-http:
 	@echo "Using interpreter: $(PY)"
 	$(PY) -m triage.app --transport http
 
-# Phase J4: the real three-process split, all in one command — ingress
+# Phase J5: the real three-process split, all in one command — ingress
 # (--transport http, :8000), server1 (the dedicated, hardened P0-only
-# process, :8001), and server2 (still J3's own generic downstream stand-in
-# until a dedicated server2.py exists, :8002). `make dev` above is
-# untouched and keeps working exactly as before — this is the split
-# ALONGSIDE that fallback, not a replacement for it.
+# process, :8001), and server2 (the dedicated P1/P2 process, :8002, with
+# its own decision engine, pressure, ladder, CoDel, and micro-batching).
+# `make dev` above is untouched and keeps working exactly as before — this
+# is the split ALONGSIDE that fallback, not a replacement for it.
 #
 # One shell (the backslash line continuations matter: `trap`/`wait` must
 # see the same job table), ingress started first and given a moment to
@@ -63,23 +63,23 @@ dev-split:
 	$(PY) -m triage.app --transport http & \
 	sleep 1; \
 	$(PY) -m triage.server1 & \
-	$(PY) -m triage.server_app --name server2 & \
+	$(PY) -m triage.server2 & \
 	wait
 
 # The two downstream servers config/servers.yaml names — real, runnable
 # FastAPI apps, each deriving its own worker count and per-worker rate
-# from its own declared capacity (servers_config.py). server1 is Phase
-# J4's own dedicated, hardened module (P0 only, no batching/CoDel/ladder/
-# deferral, EDF ordering, /drain, /readyz gated on ingress); server2 is
-# still J3's generic stand-in (triage.server_app) until a dedicated
-# server2.py exists.
+# from its own declared capacity (servers_config.py). server1 (Phase J4)
+# is P0 only, no batching/CoDel/ladder/deferral, EDF ordering, /drain,
+# /readyz gated on ingress. server2 (Phase J5) is P1/P2, with its own
+# decision engine, pressure, ladder, CoDel, and micro-batching — stateless
+# and horizontally scalable, so Kubernetes can run one to three of these.
 server1:
 	@echo "Using interpreter: $(PY)"
 	$(PY) -m triage.server1
 
 server2:
 	@echo "Using interpreter: $(PY)"
-	$(PY) -m triage.server_app --name server2
+	$(PY) -m triage.server2
 
 # Print the tier table and re-check the three calibration invariants
 config:

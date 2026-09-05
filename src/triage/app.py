@@ -56,6 +56,7 @@ from .costmodel import CostModel
 from .dedup import Deduplicator
 from .fake_metrics import FakeSource
 from .generator import EventGenerator, GeneratedEvent
+from .ladder import Rollup as LadderRollup
 from .queue import EventQueue, Mode as QueueMode
 from .worker import WorkerPool
 
@@ -370,6 +371,36 @@ class MetricsReportBody(BaseModel):
     counters: dict[str, float] = {}
 
 
+class DeferBody(BaseModel):
+    """`POST /defer`'s own wire shape — Phase J5's server2 has no local
+    deferral buffer (docs/PHASE-J-INSPECTION.md section 3: the deferred
+    buffer is durable, ingress-owned state); this is how a deferred event
+    actually reaches the store that owns it. `event` is the full event
+    payload (whatever `Event.model_dump(mode="json")` produces), validated
+    against the frozen contract here, at the one place it re-enters a
+    process that holds the real `deferral.py` store."""
+
+    event: dict
+    reason: str
+
+
+class RollupBody(BaseModel):
+    """`POST /rollup`'s own wire shape — one finished reservoir window
+    (`ladder.Rollup`'s own fields), durably persisted here via
+    `sink.write_rollup()`. Phase J5's server2 keeps the OPEN, in-progress
+    window local (legitimate per-instance state — see `ladder.py`'s own
+    docstring); only a finished window ever crosses this wire."""
+
+    event_type: str
+    window_start: float
+    window_end: float
+    sample_weight: float
+    observed_count: int
+    subtype_counts: dict[str, int]
+    seq_low: int
+    seq_high: int
+
+
 def _make_direct_deliver() -> transport.DeliverFn:
     """The `--transport=direct` demo fallback's own `deliver`: no HTTP, and
     no separate process that could die independently of ingress — CLAUDE.md
@@ -466,6 +497,45 @@ def create_app(
             )
         )
         return JSONResponse({"status": "ok"})
+
+    @app.post("/defer")
+    async def defer_endpoint(body: DeferBody) -> JSONResponse:
+        """Phase J5's server2 POSTs a DEFER decision here instead of
+        buffering it locally — see DeferBody's own docstring. Not
+        fake-mode-gated: it only touches `deferral.py`'s own already-
+        ambient store, the same store `/control/reset` already knows how
+        to leave alone/clear regardless of which mode produced the row.
+        Re-dispatching a deferred event once server2's own reported
+        pressure drops is real, separate scope this endpoint does not
+        implement — see server2.py's own top docstring."""
+        try:
+            event = Event.model_validate(body.event)
+        except Exception as exc:  # noqa: BLE001 - a malformed payload is a
+            # caller bug, not a pipeline fault; report it, don't 500.
+            return JSONResponse({"error": f"invalid event: {exc}"}, status_code=422)
+        try:
+            deferral.defer(event, body.reason)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        return JSONResponse({"status": "ok"})
+
+    @app.post("/rollup")
+    async def rollup_endpoint(body: RollupBody) -> JSONResponse:
+        """Phase J5's server2 POSTs a finished reservoir window here — see
+        RollupBody's own docstring. Not fake-mode-gated, same reasoning as
+        /defer above."""
+        rollup = LadderRollup(
+            event_type=body.event_type,
+            window_start=body.window_start,
+            window_end=body.window_end,
+            sample_weight=body.sample_weight,
+            observed_count=body.observed_count,
+            subtype_counts=body.subtype_counts,
+            seq_low=body.seq_low,
+            seq_high=body.seq_high,
+        )
+        rollup_id = sink.write_rollup(rollup)
+        return JSONResponse({"status": "ok", "rollup_id": rollup_id})
 
     @app.get("/control/transport-latency")
     async def get_transport_latency() -> JSONResponse:

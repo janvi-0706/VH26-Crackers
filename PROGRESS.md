@@ -2854,3 +2854,166 @@ runs the original single-process build unmodified.
 **`make test` — full suite, clean: 1068 passed** (1052 before this phase +
 16 new). `make dev` still runs the original single-process build,
 untouched by this phase.
+
+## Phase J5 — server2.py: the standalone P1/P2 process
+
+**Built**
+
+- `src/triage/server2.py` (new) — a real, standalone FastAPI process for
+  P1/P2, stateless and horizontally scalable per this phase's own
+  instruction (Kubernetes runs one to three of these and kills them
+  without warning): every piece of live control-loop state — the queue,
+  the pressure EWMAs, the CoDel controller, the reservoir samplers — is a
+  plain instance attribute, constructed fresh per process, never shared
+  or coordinated across pods. Pressure is computed entirely from this
+  instance's own local signals (never touching `metrics.py`'s ambient,
+  monolith/ingress-owned registry) and never averaged across instances,
+  per this phase's own instruction — `docs/PHASE-J-INSPECTION.md` section
+  4's own "no single owner post-split" finding for `current_pressure()`
+  is answered here as "each instance owns its own."
+  - `P1P2Queue` — `queue.py`'s own settled/pending score-cached design
+    (same O(n)-per-dequeue-vs-resort-caching argument that module's own
+    docstring makes), restricted to the two tiers this process ever
+    holds (P0 never reaches it — rejected at `/ingest` before an event is
+    ever queued), with the same P2-aging-guard exception. Deliberately
+    does not import `metrics.py`: pure scheduling, no side effects.
+  - Local pressure/CoDel/reservoir state, each a plain per-instance
+    object: `_Ewma` (duplicated from `metrics.py`'s own private class,
+    not imported — that one is ambient, ingress-owned state), one
+    `codel.CoDelController()`, and one `ladder.ReservoirSampler()` per P2
+    type (click, log) — all real classes this codebase already exposes
+    for exactly this purpose, just constructed locally instead of reused
+    from their ambient module-level defaults.
+  - Routing: `decision.decide()` (capacity = this instance's own derived
+    per-worker rate, 15 u/s for one pod — never the monolith's 25 u/s),
+    `ladder.escalate()` for P2 only, then `ladder.cap()` on every result
+    regardless — the second, independent "assert ladder caps hold"
+    enforcement this phase's own instruction names, on top of `/ingest`'s
+    own 422 rejection of any P0 event (the first).
+  - DEFER and a finished reservoir window are POSTed to ingress's
+    `/defer`/`/rollup` (built ahead of this file, in app.py, specifically
+    naming Phase J5 as their caller) — this process holds no local
+    deferral buffer or durable rollup store. A completed event
+    (STREAM_NOW/MICRO_BATCH) is POSTed to ingress's existing `/ack`
+    (Phase J3's own mechanism), matching server1.py's own precedent
+    exactly: nothing here ever opens a file.
+  - Named, not silently accepted, in the module's own top docstring:
+    (1) a stateless server2 cannot implement worker.py's own redefer trap
+    (`deferral.was_deferred()`) — an event redispatched by ingress's
+    future drainer after its slack has already gone negative will DEFER
+    again under `decide()`'s own unchanged rule, potentially forever;
+    closing this needs ingress itself to mark an already-deferred-once
+    event before redispatch, real separate scope. (2) a failed `/defer`
+    or `/rollup` POST has no local buffer to fall back to and the event
+    or window is genuinely lost — the same class of gap server1.py's own
+    `/ack` already accepts, just with no redispatch sweep on either of
+    these two specific wires. (3) no worker-crash checkpoint/recovery
+    (`checkpoint.py`) and no decision-trace forwarding to `ledger.py` —
+    both ingress-owned per `docs/PHASE-J-INSPECTION.md`, neither with a
+    forwarding endpoint this phase's own prompt asked for.
+  - `POST /ingest` (queues P1/P2 events; 503 while draining; 422 on any
+    P0 event — the ladder-cap assertion's runtime half), `POST /drain`
+    (waits for the queue and every in-flight event, matching server1.py's
+    own mechanism), `GET /metrics` (worker count/rate, queue depth per
+    tier, pressure, ladder rung per tier, deferred/sampled/shed/rollup
+    counts, true vs weighted click count, latency percentiles), `GET
+    /healthz` (unconditional), `GET /readyz` (gated on a live ingress
+    `/health` check, re-verified continuously — identical to server1.py).
+- `docs/PHASE-J-INSPECTION.md`'s own open question on "deferral-
+  forwarding's actual shape" is answered for the DEFER direction (server2
+  -> ingress, via the already-built `/defer` endpoint); the reverse
+  direction (ingress's drainer -> server2, once pressure falls) remains
+  unbuilt and is named as such, not assumed.
+- `Makefile` — `server2` now runs the real, dedicated `triage.server2`
+  (superseding Phase J3's generic `server_app.py --name server2` stand-in
+  for this specific server, the same supersession Phase J4 already did
+  for server1); `dev-split` updated to match. `make dev` is untouched.
+- `tests/test_server2.py` (new, 24 tests) — `P1P2Queue`'s own P1-over-P2
+  priority and P2 aging-guard behaviour; all three startup assertions
+  (tiers must be exactly {P1, P2}, batching must be enabled, scaling must
+  be `hpa`) plus worker count/rate derivation (1 worker x 15 u/s,
+  matching `servers_config.py`'s own formula); `/ingest`'s P0 rejection;
+  STREAM_NOW/MICRO_BATCH/DEFER/SAMPLE_ROLLUP/SHED each exercised end to
+  end over `httpx.ASGITransport` with the resulting `/ack`, `/defer`, or
+  `/rollup` POST verified against a real minimal ingress stand-in; the
+  ladder-cap assertion itself (P1 never sheds even at pressure 0.99, P2
+  hard-sheds only when CoDel is not already sampling); `/drain`,
+  `/healthz`, `/readyz`; three independent `create_server2_app()`
+  instances against one shared ingress stand-in, traffic round-robined
+  across them (standing in for a real Kubernetes Service, per
+  `reporting.py`'s own docstring on why a Service reaches one random pod,
+  never all three), proving no event is lost or double-acked across
+  three genuinely uncoordinated instances.
+  - **This phase's own load-test line — "reaches SAMPLE_ROLLUP on P2,
+    weighted click count within 5% of true count, zero P1 loss" — split
+    across two tests, each engineered for the property it actually
+    proves, after two earlier designs were found, empirically, not to
+    hold up:** a first version paced individual `/ingest` calls to the
+    exact calibrated 20x-spike rate (mirroring server1.py's own load
+    test) and was timing-flaky under a loaded host; a second version sent
+    the whole burst as one batched call and found the opposite failure —
+    since server2's own `/ingest` handler has no internal `await` point,
+    the backlog lands atomically and then drains monotonically, so
+    pressure and sojourn only ever fall from there. The real, deeper
+    finding underneath both: `decide()`'s own pressure-driven DEFER is
+    near-instant in an in-process `ASGITransport` test (no real network
+    latency on the `/defer` round trip), so an oversubscribed queue can
+    drain "for free" faster than real sojourn ever builds past CoDel's
+    own 500ms target — telling us about this test harness's own
+    network-latency fidelity, not about server2's real routing logic.
+    - `test_server2_reaches_sample_rollup_and_tracks_click_count_via_real_codel_latch`
+      queues 220 real P2 CLICK events directly with staggered, already-
+      elapsed `ingest_ts` values (bypassing only the HTTP round trip —
+      `decide()`, `ladder.escalate()`, and CoDel's own real `update()`
+      all still run, for real, against real `Event` objects) before the
+      lifespan spins up the one worker. The first few dequeues' already-
+      elevated sojourn closes CoDel's own 100ms interval within a couple
+      of real `STREAM_NOW` sleeps, latching sampling; every dequeue after
+      that funnels through `ladder.escalate()`'s real override into
+      SAMPLE_ROLLUP regardless of what `decide()` would have said on its
+      own. Asserts real `/rollup` POSTs reached ingress, and that
+      `weighted_click_count` lands within 5% of `true_click_count` — `n`
+      (220) is sized so the one honest, bounded loss this setup still has
+      (`ladder.RESERVOIR_N - 1` = 9 events left in a trailing, still-open
+      window when the run ends) stays comfortably under that line
+      (9/220 ≈ 4.1%), matching `RESERVOIR_N`'s own comment on exactly
+      this bound.
+    - `test_server2_under_spike_loses_no_p1_and_tracks_click_count` keeps
+      the real, continuously-arriving, un-paced individual-`/ingest`
+      stream (reliably oversubscribing one pod's own 15 u/s regardless of
+      exact host speed — real per-request async overhead is still orders
+      of magnitude faster than one worker's own real per-event service
+      time) for the property that setup CAN prove honestly: every P1
+      event sent ends up either acked or deferred, never shed or silently
+      dropped, under real, sustained 12x oversubscription
+      (`config/servers.yaml`'s own `max_pods` comment).
+  - A real, documented cold-start finding along the way (not assumed):
+    back-to-back individual `/ingest` calls with no natural inter-arrival
+    gap can observe a nonzero arrival rate before `service_ewma` has ever
+    recorded a single completion, which `decision.pressure()`'s own `b`
+    term (arrival/service, service floored at `EPS`) explodes to 1.0
+    from — the identical cold-start trap `tests/test_app.py`'s own
+    `test_weighted_click_count_is_within_5_percent_of_true_click_count_under_sampling`
+    already documents and works around with a real wall-clock warm-up
+    sleep; these tests warm-start `service_ewma` directly instead, since
+    a real generator/classifier paces individual events with a natural
+    gap this synthetic test traffic does not have.
+
+**Verified**
+
+```
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q tests/test_server2.py
+24 passed in 10.3s   (stable across 4 consecutive runs)
+
+$ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
+1092 passed in 539.22s   (1068 before this phase + 24 new)
+```
+
+Ladder caps hold and no P0 event can be routed here — asserted twice
+(startup: `tiers == {P1, P2}`; runtime: `/ingest` 422s any P0 event) and
+exercised directly: a P1 event never sheds even at pressure 0.99 (only
+ever STREAM_NOW/MICRO_BATCH/DEFER — `MAX_RUNG[P1] == DEFER`), and a P2
+event only hard-sheds once pressure crosses `HARD_SHED_PRESSURE` AND
+CoDel is not already sampling (`ladder.escalate()`'s own precedence,
+unchanged, exercised through server2's real routing path rather than
+only against `ladder.py`'s own unit tests).
