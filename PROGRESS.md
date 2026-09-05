@@ -2547,3 +2547,60 @@ promise about what a process split will achieve, and not a claim that
 every cost of that split (IPC, serialization, a second
 audit-ledger-consistency problem) has been accounted for, both stated
 explicitly in the report's own closing section.
+
+## Phase J1 — inspection (before the process split itself)
+
+Inspection only, per this prompt's own explicit instruction — `src/` is
+untouched (confirmed via `git status --short src/` before and after);
+`docs/PHASE-J-INSPECTION.md` is the only file this prompt produces.
+
+**Built**
+
+- `docs/PHASE-J-INSPECTION.md` (new) — a 23-item table of every module
+  assuming single-process shared memory (module-level registries in
+  `metrics.py`, `ledger.py`, `deferral.py`, `sink.py`, `codel.py`,
+  `ladder.py`, `decision.py`; per-Engine shared instances in `admission.py`,
+  `dedup.py`, `costmodel.py`, `checkpoint.py`), each mapped to its
+  post-split destination (ingress / Server 1 / Server 2) and reasoned from
+  the actual code, not from the architecture diagram alone. Confirms all
+  five current tables (`audit_ledger`, `deferred_buffer`, `events_sink`,
+  `rollups`, `in_flight_checkpoint`) stay in ingress's one SQLite file
+  except `in_flight_checkpoint`, which correctly becomes two separate
+  process-local (non-durable, non-shared) tables — one per server — since
+  its own docstring already scopes it to "one `asyncio.Task` dying while
+  the process survives," not to a shared or durable concern.
+- **The conservation equation, traced counter-by-counter**: `ingested` and
+  `deferred_pending` are already ingress-resident by construction (the
+  latter was already sourced live from the durable store, not a resettable
+  counter, specifically so `/control/reset` couldn't desync it — a design
+  choice made for a different reason that turns out to already be right
+  for this split); `processed`/`in_queue`/`in_flight` split by tier
+  (Server 1 for P0, Server 2 for P1/P2, summed at ingress, summed again
+  across every live Server 2 instance if scaled); `sampled_out`/`shed` are
+  Server-2-only (never P0, never ingress). Surfaces two problems neither
+  this prompt nor any prior stage has solved: (1) aggregating five
+  network-reported counters from N+2 processes can leave the equation
+  transiently "wrong" purely from reporting lag, with no way yet to tell
+  that apart from a real loss; (2) `current_pressure()` — read by
+  admission (ingress), scoring (Server 2), and routing (Server 2), fed by
+  signals scattered across all three processes — has no single owner
+  post-split, named as the single hardest open item in the whole document
+  rather than answered.
+- **Traced precisely what a Server-2 pod dying mid-`serve()` loses**: the
+  in-flight `checkpoint.begin()` row lived only in that pod's own memory
+  and recovers nothing once the whole process (not just one
+  `asyncio.Task`) is gone — the event was already destructively dequeued,
+  was never durably buffered (DEFER is the only path that persists an
+  event, and this one wasn't on it), and is lost silently, with the
+  conservation equation itself either overcounting `in_flight` forever or
+  quietly absorbing the loss depending on how ingress ages out a dead
+  instance's last report — named explicitly as the gap J3's dispatch
+  tracking (durable, ingress-side "in flight, unacknowledged" tracking)
+  and K6's graceful drain (narrowing, not closing, the window) exist to
+  close, not solved here.
+
+No design decision from `docs/adr/` was overridden or assumed; every open
+question (pressure's home, ledger write-ordering under two writers,
+deferral-forwarding's actual shape, live control-value propagation for
+mode/weights) is flagged in the document itself as unresolved rather than
+picked implicitly by how the inspection was written.
