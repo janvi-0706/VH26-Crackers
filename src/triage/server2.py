@@ -359,13 +359,40 @@ def _compute_pressure(state: _ServerState) -> float:
     """decision.pressure(), fed entirely from this instance's own local
     signals — no cross-instance input anywhere, per this phase's own
     instruction that ingress reports every instance's pressure separately
-    and never averages them."""
+    and never averages them.
+
+    `service_rate` is floored at this instance's own real, known capacity
+    (`per_worker_rate * worker_count`) rather than passed through raw — a
+    real, live-found bug, not a hypothetical: `service_ewma` is only ever
+    fed on an actual STREAM_NOW/MICRO_BATCH completion
+    (`.observe_amount(event.cost, now)`), and once pressure rises enough
+    that FEW events still take that path, completions become rare enough
+    that each new observation's own `amount / dt` (one small event's cost
+    over a now-long gap since the last completion) reads as a tiny
+    implied rate, dragging the EWMA toward zero — confirmed live:
+    `service_ewma.with_trend` was traced falling 15.0 -> 9.8 -> 2.3 ->
+    0.0 within a few seconds of a real spike easing off, at LOW real
+    arrival, with the queue completely empty the entire time. Once
+    `service_rate` reads near zero, `decision.pressure()`'s own `b` term
+    (`arrival/service`, `service` floored only at `EPS` =1e-6 by that
+    frozen function) explodes for ANY nonzero arrival, no matter how
+    small — pinning pressure at 1.0, which routes even MORE traffic away
+    from STREAM_NOW, which starves `service_ewma` of the very
+    observations that would let it recover: a genuine, self-sustaining
+    lock-in, not a value that settles back down on its own. The floor
+    here is not `decision.pressure()`'s own EPS-floor logic overridden —
+    that shared, frozen function is untouched — it is server2.py's own
+    HONEST claim about what `service_rate` actually MEANS as an input to
+    it: "this instance's real, known, spec'd throughput capacity," never
+    an artifact of how recently a completion happened to occur.
+    """
     worker_util = min(state.in_flight / max(state.worker_count, 1), 1.0)
+    capacity_ups = state.per_worker_rate * max(state.worker_count, 1)
     signals = decision.PressureSignals(
         qdepth=float(len(state.queue)),
         qmax=QDEPTH_SATURATION,
         arrival_rate_ewma_with_trend=state.arrival_ewma.with_trend,
-        service_rate=state.service_ewma.with_trend,
+        service_rate=max(state.service_ewma.with_trend, capacity_ups),
         p95_sojourn=percentile(state.queue_wait_ms, 0.95) / 1000.0,
         sla_reference=state.sla_reference,
         worker_util=worker_util,
