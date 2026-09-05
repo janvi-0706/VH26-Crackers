@@ -657,7 +657,20 @@ def _dispatch_merged_frame(now: float | None = None) -> MetricsFrame:
     server2_workers_per_pod, _ = servers_cfg.server2.workers(reference_worker_rate_ups=ref_rate)
     server2_instances = max(1, reporting.instance_count("server2"))
     frame.worker_count = server1_workers + server2_workers_per_pod * server2_instances
-    frame.active_workers = frame.in_flight
+    # Phase J8 (live-demo fix, chaos wiring): each server's own /metrics
+    # now reports `active_worker_count` — how many of ITS OWN worker tasks
+    # are actually alive right now, real-cancellation-aware (see server1.py/
+    # server2.py's own `_kill_one_worker`/`_on_worker_done` docstrings).
+    # Summing the two is the real cross-process analogue of "how many
+    # worker cells should be lit right now", correctly dipping by exactly
+    # one for the brief window between a real POST /chaos/kill-worker and
+    # that worker's own automatic respawn — `frame.in_flight` (busy-ness)
+    # answers a different question and was never the right source for
+    # this, even though the numbers often coincide at rest.
+    frame.active_workers = int(
+        s1.get("active_worker_count", server1_workers)
+        + s2.get("active_worker_count", server2_workers_per_pod * server2_instances)
+    )
     frame.recent_sheds = list(_recent_dispatch_sheds)
 
     return frame
@@ -1181,9 +1194,38 @@ def create_app(
         """Cancel one live worker task for real. `worker_id: null` means
         the pool had no live worker to kill (called before start or after
         stop) rather than an error — killing nothing is a valid, if
-        uninteresting, outcome."""
+        uninteresting, outcome.
+
+        Split mode (`transport_mode == "http"`): real traffic is served by
+        server1/server2, not by this process's own local Engine — the
+        local pool sits idle in this mode (nothing is ever queued/served
+        here), so killing a worker in it was a real bug, not a smaller
+        version of the intended effect: the dashboard's worker-pool grid
+        (fed by server1+server2's own real counts) would never show
+        anything happen at all. Forwarded instead to server2's own real
+        `/chaos/kill-worker` — server2 is the tier this project's whole
+        pressure/ladder/CoDel story is actually about, and the one the
+        dashboard's own Chaos tab is built to make interesting to watch
+        recover."""
         if fake:
             return _fake_mode_error("chaos: kill-worker")
+        if transport_mode == "http":
+            import httpx
+
+            cfg = load_servers_config()
+            url = f"http://127.0.0.1:{cfg.server2.port}/chaos/kill-worker"
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    response = await client.post(url)
+                response.raise_for_status()
+                return JSONResponse(response.json())
+            except Exception as exc:  # noqa: BLE001 - server2 unreachable is a
+                # real, reportable outcome for a chaos button, not a 500
+                # that looks like ingress itself is broken.
+                return JSONResponse(
+                    {"worker_id": None, "error": f"server2 unreachable: {exc}"},
+                    status_code=502,
+                )
         worker_id = await app.state.engine.chaos_kill_worker()
         return JSONResponse({"worker_id": worker_id})
 

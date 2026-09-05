@@ -480,6 +480,20 @@ class Batcher:
 
 
 async def _redispatch_sweep_loop(stop_event: asyncio.Event) -> None:
+    """Real bug, found live under a Postgres connection drop mid-demo:
+    `redispatch_expired()` -> `dispatch()` -> `deliver()` can raise (a
+    downstream HTTP failure, or — as observed — a completely unrelated
+    delivery-side error surfacing here), and an unguarded exception out of
+    THIS loop's body kills the whole `asyncio.create_task()` silently:
+    nothing awaits or logs it, so the sweep — the one thing this whole
+    architecture relies on to notice and recover a downstream server that
+    died with events still in flight (this module's own top docstring) —
+    simply stops forever, on the very first transient failure, with no
+    visible symptom except `outstanding_dispatch` climbing unboundedly and
+    `redispatch_count` never moving again. A background sweep loop must
+    survive any single iteration's failure the same way a server's own
+    request handlers already do — logged and retried next tick, never
+    silently fatal."""
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=REDISPATCH_SWEEP_INTERVAL_SECONDS)
@@ -487,7 +501,10 @@ async def _redispatch_sweep_loop(stop_event: asyncio.Event) -> None:
             pass
         if stop_event.is_set():
             return
-        await redispatch_expired()
+        try:
+            await redispatch_expired()
+        except Exception:  # noqa: BLE001 - see this function's own docstring
+            logger.exception("redispatch sweep iteration failed; will retry next tick")
 
 
 # --------------------------------------------------------------------------

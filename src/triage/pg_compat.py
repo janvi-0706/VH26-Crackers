@@ -176,10 +176,15 @@ class PGConnection:
     why that is enough for every existing call site in this codebase."""
 
     def __init__(self, url: str) -> None:
+        self._url = url
+        self._connect()
+        self.row_factory: Any = None
+
+    def _connect(self) -> None:
         import psycopg2
         import psycopg2.extras
 
-        self._conn = psycopg2.connect(url, connect_timeout=10)
+        self._conn = psycopg2.connect(self._url, connect_timeout=10)
         self._conn.cursor_factory = psycopg2.extras.RealDictCursor
         # A real, found-not-assumed bug: Postgres's own default
         # `extra_float_digits` setting does not guarantee a `double
@@ -201,14 +206,29 @@ class PGConnection:
         with self._conn.cursor() as _cur:
             _cur.execute("SET extra_float_digits = 3")
         self._conn.commit()
-        # sqlite3.Connection exposes this as a settable attribute; nothing
-        # here ever reads it back (RealDictCursor is set unconditionally,
-        # above), but every existing store's own `__init__` still does
-        # `self.connection.row_factory = sqlite3.Row` unconditionally —
-        # this just needs to accept that assignment without raising.
-        self.row_factory: Any = None
+
+    def _reconnect_if_dead(self) -> None:
+        """Real bug, found live: Supabase's own pooler (`aws-0-...-pooler.
+        supabase.com:6543`, its `transaction`-mode pgbouncer) closes an
+        idle server-side connection out from under this process without
+        warning — every subsequent `.execute()` then raised
+        `psycopg2.InterfaceError: connection already closed`, forever,
+        because nothing here ever checked. Confirmed live: 12,700+
+        consecutive `/ack` calls 500'd this way over one demo run, which
+        in turn meant `transport.py` never resolved a single dispatch,
+        which is the entire reason `outstanding_dispatch` climbed
+        unboundedly and pressure looked permanently pinned — a Postgres
+        connectivity blip masquerading as a triage-logic bug. `closed`
+        (an int, 0 while open) is psycopg2's own liveness flag — checked
+        before every statement, not caught reactively after a failure, so
+        a dead connection is replaced before it ever gets a chance to
+        raise."""
+        if self._conn.closed:
+            logger.warning("history.db Postgres connection was closed; reconnecting")
+            self._connect()
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> _PGCursorAdapter:
+        self._reconnect_if_dead()
         cur = self._conn.cursor()
         cur.execute(_PLACEHOLDER_RE.sub("%s", sql), tuple(params))
         return _PGCursorAdapter(cur)
@@ -219,6 +239,7 @@ class PGConnection:
         statements (no PL/pgSQL `$$` blocks appear anywhere in this
         codebase's own DDL) in one call, which is all any `..._DDL`
         constant here ever needs."""
+        self._reconnect_if_dead()
         cur = self._conn.cursor()
         cur.execute(sql)
 

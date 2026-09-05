@@ -348,6 +348,12 @@ class _ServerState:
     rollups_persisted_count: int = 0
     true_click_count: int = 0
     weighted_click_count: float = 0.0
+    # Real, dashboard-visible chaos: how many times POST /chaos/kill-worker
+    # has actually cancelled a live worker task on THIS process — see
+    # `_kill_one_worker`'s own docstring for why this, not the ingress-only
+    # monolith engine, is now what the dashboard's Kill Worker button
+    # reaches in split mode.
+    workers_killed_count: int = 0
     ladder_rung: dict[str, int] = field(
         default_factory=lambda: {Tier.P1.value: 0, Tier.P2.value: 0}
     )
@@ -749,6 +755,55 @@ def create_server2_app(
             except Exception:  # noqa: BLE001 - one bad event must not kill the worker
                 logger.exception("worker-%d failed on %s", worker_id, event.event_id)
 
+    _worker_tasks: list[asyncio.Task[None]] = []
+    _stopping = False
+
+    def _spawn_worker(worker_id: int) -> asyncio.Task[None]:
+        """Mirrors `worker.py`'s own `WorkerPool._spawn`/`_on_worker_done`
+        pattern (the monolith's real "kill it, it comes back" chaos story)
+        — real cancellation via `/chaos/kill-worker` looks, from this
+        process's own perspective, identical to an unplanned crash, and
+        both get the same automatic respawn under the SAME worker_id, so
+        `state.worker_count` (what ingress's own merged dashboard frame
+        adds server1+server2's counts from) never silently, permanently
+        shrinks just because a chaos click landed here once."""
+        task = asyncio.create_task(_worker(worker_id), name=f"pulse-server2-worker-{worker_id}")
+        task.add_done_callback(lambda t, wid=worker_id: _on_worker_done(wid, t))
+        return task
+
+    def _on_worker_done(worker_id: int, task: asyncio.Task[None]) -> None:
+        if _stopping:
+            return
+        if task.cancelled():
+            logger.warning("server2 worker-%d killed; respawning", worker_id)
+        else:
+            logger.error("server2 worker-%d died (%r); respawning", worker_id, task.exception())
+        _worker_tasks[worker_id] = _spawn_worker(worker_id)
+
+    def _kill_one_worker() -> int | None:
+        """`POST /chaos/kill-worker`'s real mechanism for server2: cancel
+        one live worker task outright — the same real `.cancel()` a
+        genuine crash would deliver, not a simulated counter increment.
+        Real, not simulated, so the dashboard's merged worker-pool grid
+        (`app.py`'s own `_dispatch_merged_frame`, summing server1 +
+        server2's live `active_workers`) genuinely shows one fewer active
+        cell for the brief window between cancellation and
+        `_on_worker_done`'s own respawn — exactly the visible "worker
+        died, worker came back" story `worker.py`'s own kill_worker
+        already tells in the monolith, now real in split mode too instead
+        of silently killing an ingress-local Engine worker that split
+        mode's own real traffic never reaches."""
+        if not _worker_tasks:
+            return None
+        worker_id = 0
+        for i, task in enumerate(_worker_tasks):
+            if not task.done():
+                worker_id = i
+                break
+        _worker_tasks[worker_id].cancel()
+        state.workers_killed_count += 1
+        return worker_id
+
     async def _check_ingress_once() -> bool:
         try:
             response = await resolved_ack_client.get(f"{base_ingress_url}/health")
@@ -796,10 +851,10 @@ def create_server2_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        worker_tasks = [
-            asyncio.create_task(_worker(i), name=f"pulse-server2-worker-{i}")
-            for i in range(max(1, state.worker_count))
-        ]
+        nonlocal _stopping
+        _worker_tasks.extend(
+            _spawn_worker(i) for i in range(max(1, state.worker_count))
+        )
         health_check_task = asyncio.create_task(
             _ingress_health_loop(), name="pulse-server2-ingress-healthcheck"
         )
@@ -807,10 +862,11 @@ def create_server2_app(
         try:
             yield
         finally:
-            for task in worker_tasks:
+            _stopping = True
+            for task in _worker_tasks:
                 task.cancel()
-            if worker_tasks:
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            if _worker_tasks:
+                await asyncio.gather(*_worker_tasks, return_exceptions=True)
             health_check_task.cancel()
             await asyncio.gather(health_check_task, return_exceptions=True)
             await reporting_client.stop()
@@ -874,6 +930,15 @@ def create_server2_app(
             },
             "in_flight": state.in_flight,
             "draining": state.draining,
+            # How many of this process's own worker tasks are actually
+            # alive right now — `worker_count` is the declared capacity;
+            # this can dip below it for the brief window between a real
+            # `/chaos/kill-worker` cancellation and `_on_worker_done`'s own
+            # respawn, which is exactly the signal the dashboard's merged
+            # worker-pool grid (`app.py`'s own `_dispatch_merged_frame`)
+            # needs to show a cell actually go dark.
+            "active_worker_count": sum(1 for t in _worker_tasks if not t.done()),
+            "workers_killed": state.workers_killed_count,
             "pressure": round(_pressure_value(state, time.time()), 4),
             "ladder_rung": dict(state.ladder_rung),
             "deferred": state.deferred_count,
@@ -889,6 +954,17 @@ def create_server2_app(
                 "p99": round(percentile(latencies, 0.99), 3),
             },
         }
+
+    @app.post("/chaos/kill-worker")
+    async def chaos_kill_worker() -> JSONResponse:
+        """Real cancellation of one of THIS process's own live worker
+        tasks — see `_kill_one_worker`'s own docstring for why split mode
+        needs its own real target instead of the ingress-only monolith
+        Engine pool the dashboard button used to reach unconditionally.
+        `worker_id: null` means there was no live worker to kill (called
+        before startup finished), matching the monolith's own contract."""
+        worker_id = _kill_one_worker()
+        return JSONResponse({"worker_id": worker_id})
 
     @app.get("/healthz")
     async def healthz() -> dict:

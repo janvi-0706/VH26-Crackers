@@ -135,6 +135,12 @@ class _ServerState:
     # contention" claim rather than one polluted by an unavoidable,
     # unchanged service-time constant.
     queue_wait_ms: list[float] = field(default_factory=list)
+    # Real, dashboard-visible chaos: how many times POST /chaos/kill-worker
+    # has actually cancelled a live worker task on THIS process — see
+    # server2.py's own `_kill_one_worker` docstring for why this, not the
+    # ingress-only monolith engine, is what split mode's Kill Worker
+    # button must reach.
+    workers_killed_count: int = 0
 
 
 def _assert_server1_is_correctly_provisioned(spec: ServerSpec) -> None:
@@ -236,6 +242,43 @@ def create_server1_app(
                 del state.latency_ms[: len(state.latency_ms) - LATENCY_WINDOW]
             await _ack(event)
 
+    _worker_tasks: list[asyncio.Task[None]] = []
+    _stopping = False
+
+    def _spawn_worker(worker_id: int) -> asyncio.Task[None]:
+        """Mirrors `worker.py`'s own `WorkerPool._spawn`/`_on_worker_done`
+        pattern — see server2.py's own `_spawn_worker` docstring for why
+        real cancellation must respawn under the same worker_id rather
+        than silently, permanently shrinking `state.worker_count`."""
+        task = asyncio.create_task(_worker(worker_id), name=f"pulse-server1-worker-{worker_id}")
+        task.add_done_callback(lambda t, wid=worker_id: _on_worker_done(wid, t))
+        return task
+
+    def _on_worker_done(worker_id: int, task: asyncio.Task[None]) -> None:
+        if _stopping:
+            return
+        if task.cancelled():
+            logger.warning("server1 worker-%d killed; respawning", worker_id)
+        else:
+            logger.error("server1 worker-%d died (%r); respawning", worker_id, task.exception())
+        _worker_tasks[worker_id] = _spawn_worker(worker_id)
+
+    def _kill_one_worker() -> int | None:
+        """`POST /chaos/kill-worker`'s real mechanism for server1 — see
+        server2.py's own `_kill_one_worker` docstring for the full
+        reasoning (identical here: P0's own worker pool deserves the same
+        real kill/respawn story, not a monolith-only illusion)."""
+        if not _worker_tasks:
+            return None
+        worker_id = 0
+        for i, task in enumerate(_worker_tasks):
+            if not task.done():
+                worker_id = i
+                break
+        _worker_tasks[worker_id].cancel()
+        state.workers_killed_count += 1
+        return worker_id
+
     async def _check_ingress_once() -> bool:
         try:
             response = await resolved_ack_client.get(f"{base_ingress_url}/health")
@@ -285,10 +328,10 @@ def create_server1_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        worker_tasks = [
-            asyncio.create_task(_worker(i), name=f"pulse-server1-worker-{i}")
-            for i in range(max(1, state.worker_count))
-        ]
+        nonlocal _stopping
+        _worker_tasks.extend(
+            _spawn_worker(i) for i in range(max(1, state.worker_count))
+        )
         health_check_task = asyncio.create_task(
             _ingress_health_loop(), name="pulse-server1-ingress-healthcheck"
         )
@@ -296,10 +339,11 @@ def create_server1_app(
         try:
             yield
         finally:
-            for task in worker_tasks:
+            _stopping = True
+            for task in _worker_tasks:
                 task.cancel()
-            if worker_tasks:
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            if _worker_tasks:
+                await asyncio.gather(*_worker_tasks, return_exceptions=True)
             health_check_task.cancel()
             await asyncio.gather(health_check_task, return_exceptions=True)
             await reporting_client.stop()
@@ -367,6 +411,11 @@ def create_server1_app(
             "in_queue": len(state.queue),
             "in_flight": state.in_flight,
             "draining": state.draining,
+            # See server2.py's own /metrics docstring on this field: how
+            # many of this process's own worker tasks are actually alive
+            # right now, vs. `worker_count`'s declared capacity.
+            "active_worker_count": sum(1 for t in _worker_tasks if not t.done()),
+            "workers_killed": state.workers_killed_count,
             "latency_ms": {
                 "p50": round(percentile(latencies, 0.50), 3),
                 "p95": round(percentile(latencies, 0.95), 3),
@@ -378,6 +427,14 @@ def create_server1_app(
                 "p99": round(percentile(queue_waits, 0.99), 3),
             },
         }
+
+    @app.post("/chaos/kill-worker")
+    async def chaos_kill_worker() -> JSONResponse:
+        """Real cancellation of one of THIS process's own live worker
+        tasks — see server2.py's own `chaos_kill_worker` docstring for why
+        split mode needs its own real target."""
+        worker_id = _kill_one_worker()
+        return JSONResponse({"worker_id": worker_id})
 
     @app.get("/healthz")
     async def healthz() -> dict:
